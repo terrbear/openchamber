@@ -1,6 +1,6 @@
-.PHONY: package dev
+.PHONY: package
 
-dev:
+run:
 	bun run dev
 
 # Detect platform and set appropriate bundle types

@@ -49,7 +49,7 @@ export const toast = {
   ...sonnerToast,
   success: (message: string | React.ReactNode, data?: ExternalToast) => {
     return sonnerToast.success(message, {
-      duration: Infinity,
+      duration: 5000,
       ...data,
       action: data?.action || {
         label: 'OK',
@@ -59,7 +59,7 @@ export const toast = {
   },
   info: (message: string | React.ReactNode, data?: ExternalToast) => {
     return sonnerToast.info(message, {
-      duration: Infinity,
+      duration: 5000,
       ...data,
       action: data?.action || {
         label: 'OK',
@@ -69,7 +69,7 @@ export const toast = {
   },
   error: (message: string | React.ReactNode, data?: ExternalToast) => {
     return sonnerToast.error(message, {
-      duration: Infinity,
+      duration: 8000,
       ...data,
       action: data?.action || {
         label: 'Copy',
@@ -79,7 +79,7 @@ export const toast = {
   },
   warning: (message: string | React.ReactNode, data?: ExternalToast) => {
     return sonnerToast.warning(message, {
-      duration: Infinity,
+      duration: 8000,
       ...data,
       action: data?.action || {
         label: 'Copy',

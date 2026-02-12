@@ -120,7 +120,7 @@ interface ProjectIconProps {
   onSelectProject: (id: string) => void;
   onContextMenu: (e: React.MouseEvent) => void;
   dragAttributes?: React.HTMLAttributes<HTMLButtonElement>;
-  dragListeners?: any;
+  dragListeners?: Record<string, unknown>;
 }
 
 const ProjectIcon = React.memo<ProjectIconProps>(({ projectId, badge, label, projectPath, isActive, isIdle, hasNotification, notificationKind, notificationCenterKind, onSelectProject, onContextMenu, dragAttributes, dragListeners }) => {
@@ -247,7 +247,7 @@ ProjectIcon.displayName = 'ProjectIcon';
 /**
  * Sortable wrapper for ProjectIcon that adds drag-and-drop functionality
  */
-interface SortableProjectIconProps extends Omit<ProjectIconProps, 'dragAttributes' | 'dragListeners'> {}
+type SortableProjectIconProps = Omit<ProjectIconProps, 'dragAttributes' | 'dragListeners'>;
 
 const SortableProjectIcon = React.memo<SortableProjectIconProps>((props) => {
   const {

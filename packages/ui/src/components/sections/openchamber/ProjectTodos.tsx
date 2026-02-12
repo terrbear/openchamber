@@ -66,12 +66,10 @@ interface TodoItemProps {
   onToggleStatus: () => void;
   onStartEdit: () => void;
   dragAttributes?: React.HTMLAttributes<HTMLDivElement>;
-  dragListeners?: any;
+  dragListeners?: Record<string, unknown>;
 }
 
 const TodoItem = React.memo<TodoItemProps>(({
-  todoId,
-  projectId,
   content,
   status,
   priority,
@@ -144,7 +142,7 @@ const TodoItem = React.memo<TodoItemProps>(({
 });
 TodoItem.displayName = 'TodoItem';
 
-interface SortableTodoItemProps extends Omit<TodoItemProps, 'dragAttributes' | 'dragListeners'> {}
+type SortableTodoItemProps = Omit<TodoItemProps, 'dragAttributes' | 'dragListeners'>;
 
 const SortableTodoItem = React.memo<SortableTodoItemProps>((props) => {
   const {

@@ -204,7 +204,8 @@ export const useConnectionsStore = create<ConnectionsStore>()(
       }
 
       // Clean up health state
-      const { [id]: _removed, ...nextConnectionHealth } = current.connectionHealth;
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { [id]: _, ...nextConnectionHealth } = current.connectionHealth;
 
       set({ connections: nextConnections, activeConnectionId: nextActiveId, connectionHealth: nextConnectionHealth });
       persistConnections(nextConnections, nextActiveId);

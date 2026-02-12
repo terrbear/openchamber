@@ -1,5 +1,5 @@
 import { createOpencodeClient, OpencodeClient } from "@opencode-ai/sdk/v2";
-import type { FilesAPI, RuntimeAPIs, Connection } from "../api/types";
+import type { FilesAPI, RuntimeAPIs } from "../api/types";
 import { getDesktopHomeDirectory } from "../desktop";
 import { useConnectionsStore } from '@/stores/useConnectionsStore';
 import type {

@@ -45,11 +45,9 @@ import {
   RiCloseLine,
   RiDeleteBinLine,
   RiErrorWarningLine,
-  RiFileCopyLine,
   RiFolderAddLine,
   RiGitBranchLine,
   RiGitPullRequestLine,
-  RiLinkUnlinkM,
 
   RiGithubLine,
 
@@ -548,8 +546,6 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
   const [editTitle, setEditTitle] = React.useState('');
   const [editingProjectId, setEditingProjectId] = React.useState<string | null>(null);
   const [editProjectTitle, setEditProjectTitle] = React.useState('');
-  const [copiedSessionId, setCopiedSessionId] = React.useState<string | null>(null);
-  const copyTimeout = React.useRef<number | null>(null);
   const [expandedParents, setExpandedParents] = React.useState<Set<string>>(new Set());
   const [directoryStatus, setDirectoryStatus] = React.useState<Map<string, 'unknown' | 'exists' | 'missing'>>(
     () => new Map(),
@@ -653,8 +649,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
   const currentSessionId = useSessionStore((state) => state.currentSessionId);
   const setCurrentSession = useSessionStore((state) => state.setCurrentSession);
   const updateSessionTitle = useSessionStore((state) => state.updateSessionTitle);
-  const shareSession = useSessionStore((state) => state.shareSession);
-  const unshareSession = useSessionStore((state) => state.unshareSession);
+  const messages = useSessionStore((state) => state.messages);
   const sessionMemoryState = useSessionStore((state) => state.sessionMemoryState);
   const sessionStatus = useSessionStore((state) => state.sessionStatus);
   const sessionAttentionStates = useSessionStore((state) => state.sessionAttentionStates);
@@ -865,13 +860,6 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
     });
   }, [sortedSessions, projects, directoryStatus]);
 
-  React.useEffect(() => {
-    return () => {
-      if (copyTimeout.current) {
-        clearTimeout(copyTimeout.current);
-      }
-    };
-  }, []);
 
 
   const emptyState = (
@@ -951,46 +939,54 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
 
   const handleShareSession = React.useCallback(
     async (session: Session) => {
-      const result = await shareSession(session.id);
-      if (result && result.share?.url) {
-        toast.success('Session shared', {
-          description: 'You can copy the link from the menu.',
+      try {
+        // Load messages if not already in memory
+        let sessionMessages = messages.get(session.id);
+        if (!sessionMessages || sessionMessages.length === 0) {
+          const allMessages = await opencodeClient.getSessionMessages(session.id);
+          sessionMessages = allMessages;
+        }
+
+        const payload = {
+          session: {
+            id: session.id,
+            title: session.title,
+            created: session.time?.created,
+          },
+          messages: (sessionMessages || []).map((m) => ({
+            role: m.info.role,
+            content: m.parts,
+            metadata: {
+              id: m.info.id,
+              created: m.info.time?.created,
+              model: (m.info as Record<string, unknown>).model,
+            },
+          })),
+        };
+
+        const response = await fetch('/api/share', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
         });
-      } else {
+
+        if (!response.ok) {
+          throw new Error(`Share failed: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        if (data?.url) {
+          await navigator.clipboard.writeText(data.url);
+          toast.success('Link copied to clipboard');
+        } else {
+          throw new Error('No URL in response');
+        }
+      } catch (error) {
+        console.error('Failed to share session:', error);
         toast.error('Unable to share session');
       }
     },
-    [shareSession],
-  );
-
-  const handleCopyShareUrl = React.useCallback((url: string, sessionId: string) => {
-    navigator.clipboard
-      .writeText(url)
-      .then(() => {
-        setCopiedSessionId(sessionId);
-        if (copyTimeout.current) {
-          clearTimeout(copyTimeout.current);
-        }
-        copyTimeout.current = window.setTimeout(() => {
-          setCopiedSessionId(null);
-          copyTimeout.current = null;
-        }, 2000);
-      })
-      .catch(() => {
-        toast.error('Failed to copy URL');
-      });
-  }, []);
-
-  const handleUnshareSession = React.useCallback(
-    async (sessionId: string) => {
-      const result = await unshareSession(sessionId);
-      if (result) {
-        toast.success('Session unshared');
-      } else {
-        toast.error('Unable to unshare session');
-      }
-    },
-    [unshareSession],
+    [messages],
   );
 
   const collectDescendants = React.useCallback(
@@ -1908,39 +1904,10 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                       <RiPencilAiLine className="mr-1 h-4 w-4" />
                       Rename
                     </DropdownMenuItem>
-                    {!session.share ? (
-                      <DropdownMenuItem onClick={() => handleShareSession(session)} className="[&>svg]:mr-1">
+                    <DropdownMenuItem onClick={() => handleShareSession(session)} className="[&>svg]:mr-1">
                         <RiShare2Line className="mr-1 h-4 w-4" />
                         Share
                       </DropdownMenuItem>
-                    ) : (
-                      <>
-                        <DropdownMenuItem
-                          onClick={() => {
-                            if (session.share?.url) {
-                              handleCopyShareUrl(session.share.url, session.id);
-                            }
-                          }}
-                          className="[&>svg]:mr-1"
-                        >
-                          {copiedSessionId === session.id ? (
-                            <>
-                              <RiCheckLine className="mr-1 h-4 w-4" style={{ color: 'var(--status-success)' }} />
-                              Copied
-                            </>
-                          ) : (
-                            <>
-                              <RiFileCopyLine className="mr-1 h-4 w-4" />
-                              Copy link
-                            </>
-                          )}
-                        </DropdownMenuItem>
-                        <DropdownMenuItem onClick={() => handleUnshareSession(session.id)} className="[&>svg]:mr-1">
-                          <RiLinkUnlinkM className="mr-1 h-4 w-4" />
-                          Unshare
-                        </DropdownMenuItem>
-                      </>
-                    )}
                     <DropdownMenuItem
                       className="text-destructive focus:text-destructive [&>svg]:mr-1"
                       onClick={() => handleDeleteSession(session)}
@@ -1976,10 +1943,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       toggleParent,
       handleSessionSelect,
       handleShareSession,
-      handleCopyShareUrl,
-      handleUnshareSession,
       handleDeleteSession,
-      copiedSessionId,
       mobileVariant,
       openMenuSessionId,
     ],

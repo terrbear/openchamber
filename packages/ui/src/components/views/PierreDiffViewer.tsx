@@ -11,7 +11,6 @@ import { getDefaultTheme } from '@/lib/theme/themes';
 
 import { toast } from '@/components/ui';
 import { useSessionStore } from '@/stores/useSessionStore';
-import { useUIStore } from '@/stores/useUIStore';
 import { useDeviceInfo } from '@/lib/device';
 import { cn } from '@/lib/utils';
 import { useInlineCommentDraftStore, type InlineCommentDraft } from '@/stores/useInlineCommentDraftStore';
@@ -153,7 +152,6 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
   const lightTheme = themeContext?.availableThemes.find(t => t.metadata.id === themeContext.lightThemeId) ?? getDefaultTheme(false);
   const darkTheme = themeContext?.availableThemes.find(t => t.metadata.id === themeContext.darkThemeId) ?? getDefaultTheme(true);
 
-  useUIStore();
   const { isMobile } = useDeviceInfo();
   
   const addDraft = useInlineCommentDraftStore((state) => state.addDraft);
@@ -171,6 +169,13 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
   const [commentText, setCommentText] = useState('');
   const [editingDraftId, setEditingDraftId] = useState<string | null>(null);
 
+  // Refs that mirror state — used inside callbacks so they stay stable
+  // without adding state to dependency arrays (which would cause full Pierre re-renders).
+  const selectionRef = useRef(selection);
+  selectionRef.current = selection;
+  const editingDraftIdRef = useRef(editingDraftId);
+  editingDraftIdRef.current = editingDraftId;
+
   // Use a ref to track if we're currently applying a selection programmatically
   // to avoid loop with onLineSelected callback
   const isApplyingSelectionRef = useRef(false);
@@ -183,9 +188,9 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
     }
     
     // Mobile tap-to-extend: if selection exists and new tap is on same side, extend range
-    if (isMobile && selection && range && range.side === selection.side) {
-      const start = Math.min(selection.start, range.start);
-      const end = Math.max(selection.end, range.end);
+    if (isMobile && selectionRef.current && range && range.side === selectionRef.current.side) {
+      const start = Math.min(selectionRef.current.start, range.start);
+      const end = Math.max(selectionRef.current.end, range.end);
       setSelection({ ...range, start, end });
       return;
     }
@@ -194,13 +199,11 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
     
     // Clear editing state when selection changes user-driven
     if (range) {
-      // Don't clear if we're just updating the selection for the same draft?
-      // For now, simple behavior: new selection = new comment flow
-      if (!editingDraftId) {
+      if (!editingDraftIdRef.current) {
         setCommentText('');
       }
     }
-  }, [editingDraftId, isMobile, selection]);
+  }, [isMobile]);
 
   const handleCancelComment = useCallback(() => {
     setCommentText('');
@@ -406,6 +409,14 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
   }, [darkResolvedTheme, diffThemeKey, isDark, lightResolvedTheme]);
 
 
+  // Keep a stable callback ref for onLineSelected so that `options` doesn't
+  // change identity every time selection/editingDraftId changes.
+  const handleSelectionChangeRef = useRef(handleSelectionChange);
+  handleSelectionChangeRef.current = handleSelectionChange;
+  const stableOnLineSelected = useCallback((range: SelectedLineRange | null) => {
+    handleSelectionChangeRef.current(range);
+  }, []);
+
   const options = useMemo(() => ({
     theme: {
       dark: darkTheme.metadata.id,
@@ -421,10 +432,10 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
     disableFileHeader: true,
     enableLineSelection: true,
     enableHoverUtility: false,
-    onLineSelected: handleSelectionChange,
+    onLineSelected: stableOnLineSelected,
     unsafeCSS: WEBKIT_SCROLL_FIX_CSS,
     renderAnnotation,
-  }), [darkTheme.metadata.id, isDark, lightTheme.metadata.id, renderSideBySide, wrapLines, handleSelectionChange, renderAnnotation]);
+  }), [darkTheme.metadata.id, isDark, lightTheme.metadata.id, renderSideBySide, wrapLines, stableOnLineSelected, renderAnnotation]);
 
 
   const lineAnnotations = useMemo(() => {
@@ -470,6 +481,8 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
   }, [allDrafts, getSessionKey, fileName, editingDraftId, selection]);
 
   // Imperative render (like upstream OpenCode): avoids `parseDiffFromFile` on main thread.
+  // IMPORTANT: This effect only depends on content/layout/theme changes — NOT annotations.
+  // Annotation updates are handled incrementally via setLineAnnotations() below.
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
@@ -516,7 +529,21 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
       }
       container.innerHTML = '';
     };
-  }, [diffThemeKey, fileName, language, modified, options, original, workerPool, lineAnnotations]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- lineAnnotations excluded: updated incrementally below
+  }, [diffThemeKey, fileName, language, modified, options, original, workerPool]);
+
+  // Incrementally update annotations without full re-render.
+  // This runs when selection/drafts change (frequently) and avoids tearing down
+  // the entire diff DOM just to add/remove a comment input.
+  useEffect(() => {
+    const instance = diffInstanceRef.current;
+    if (!instance) return;
+
+    instance.setLineAnnotations(lineAnnotations as DiffLineAnnotation<unknown>[]);
+
+    // Portals need a React re-render to pick up the new DOM targets.
+    requestAnimationFrame(() => forceUpdate());
+  }, [lineAnnotations]);
 
   useEffect(() => {
     const instance = diffInstanceRef.current;
@@ -545,7 +572,8 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
     }
   }, [selection]);
 
-  // MutationObserver to trigger re-renders when annotation DOM nodes are added/removed
+  // MutationObserver to trigger portal re-renders when annotation DOM nodes
+  // are injected by Pierre (which happen asynchronously after setLineAnnotations).
   useEffect(() => {
     const container = diffContainerRef.current;
     if (!container) return;
@@ -557,7 +585,9 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
       const diffsContainer = container.querySelector('diffs-container');
       if (!diffsContainer) return;
 
-      // Watch for annotation nodes being added/removed
+      // Watch for annotation nodes being added/removed.
+      // Only observe childList (not subtree on shadow root) to avoid
+      // firing on every line node during the initial diff render.
       observer = new MutationObserver((mutations) => {
         const hasAnnotationChanges = mutations.some(m => 
           Array.from(m.addedNodes).some(n => 
@@ -569,7 +599,6 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
         );
 
         if (hasAnnotationChanges) {
-          // Debounce with RAF to batch multiple mutations
           if (rafId) cancelAnimationFrame(rafId);
           rafId = requestAnimationFrame(() => {
             forceUpdate();
@@ -578,15 +607,19 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
         }
       });
 
-      // Observe both shadow root and light DOM
+      // Observe direct children of the diffs-container and its shadow root.
+      // Use subtree only on the light DOM container (not shadow root) to keep
+      // the observer scope narrow and avoid O(n) checks during diff render.
       if (diffsContainer.shadowRoot) {
         observer.observe(diffsContainer.shadowRoot, { childList: true, subtree: true });
       }
       observer.observe(diffsContainer, { childList: true, subtree: true });
     };
 
-    // Delay setup to allow Pierre to initialize
-    const timeoutId = setTimeout(setupObserver, 100);
+    // Delay setup to skip the initial Pierre render burst.
+    // Pierre's render() creates all diff DOM synchronously/in-workers,
+    // so 500ms is enough to let the initial render settle.
+    const timeoutId = setTimeout(setupObserver, 500);
 
     return () => {
       clearTimeout(timeoutId);

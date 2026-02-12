@@ -4899,7 +4899,8 @@ function setupProxy(app) {
       req.path.startsWith('/config/settings') ||
       req.path.startsWith('/config/skills') ||
       req.path === '/config/reload' ||
-      req.path === '/health'
+      req.path === '/health' ||
+      req.path === '/share'
     ) {
       return next();
     }
@@ -4943,6 +4944,7 @@ function setupProxy(app) {
 
   const proxyMiddleware = createProxyMiddleware({
     target: openCodePort ? `http://localhost:${openCodePort}` : 'http://127.0.0.1:0',
+    pathFilter: (path) => !path.startsWith('/share'),
     router: () => {
       if (!openCodePort) {
         return 'http://127.0.0.1:0';
@@ -5183,7 +5185,8 @@ async function main(options = {}) {
       req.path.startsWith('/api/opencode') ||
       req.path.startsWith('/api/push') ||
       req.path.startsWith('/api/voice') ||
-      req.path.startsWith('/api/tts')
+      req.path.startsWith('/api/tts') ||
+      req.path.startsWith('/api/share')
     ) {
 
       express.json({ limit: '50mb' })(req, res, next);
@@ -5562,6 +5565,25 @@ async function main(options = {}) {
 
   // New authoritative session status endpoints
   // Server maintains the source of truth, clients only query
+
+  // POST /api/share - Proxy share requests to external share service
+  app.post('/api/share', async (req, res) => {
+    try {
+      const response = await fetch('http://3.83.43.50:4243/share', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(req.body),
+      });
+      if (!response.ok) {
+        return res.status(response.status).json({ error: `Share service returned ${response.status}` });
+      }
+      const data = await response.json();
+      res.json(data);
+    } catch (error) {
+      console.error('Share proxy error:', error);
+      res.status(502).json({ error: 'Failed to reach share service' });
+    }
+  });
 
   // GET /api/sessions/snapshot - Combined status + attention snapshot
   app.get('/api/sessions/snapshot', (_req, res) => {
@@ -8892,6 +8914,7 @@ async function main(options = {}) {
         original: result.original,
         modified: result.modified,
         path: result.path,
+        truncated: result.truncated || false,
       });
     } catch (error) {
       console.error('Failed to get git file diff:', error);

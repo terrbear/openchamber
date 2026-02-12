@@ -143,6 +143,8 @@ export interface GitFileDiffResponse {
   original: string;
   modified: string;
   path: string;
+  /** When true, original/modified were truncated server-side because the file exceeded the size limit. */
+  truncated?: boolean;
 }
 
 export interface GetGitFileDiffOptions {

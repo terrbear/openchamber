@@ -437,6 +437,7 @@ export interface ProjectEntry {
   sidebarCollapsed?: boolean;
   badge?: string;
   group?: string;
+  connectionId?: string;
 }
 
 export interface SettingsPayload {

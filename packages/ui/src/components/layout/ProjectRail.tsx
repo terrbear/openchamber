@@ -315,11 +315,6 @@ export const ProjectRail: React.FC = () => {
   
   // Remove confirmation dialog state
   const [removeConfirmProjectId, setRemoveConfirmProjectId] = React.useState<string | null>(null);
-  
-  // Hide rail when there are 0 or 1 projects
-  if (projects.length <= 1) {
-    return null;
-  }
 
   // Check if any session in a project directory needs attention
   const hasAttentionByPath = React.useMemo(() => {
@@ -631,6 +626,11 @@ export const ProjectRail: React.FC = () => {
     if (!activeDraggedProjectId) return null;
     return projectsWithBadges.find((p) => p.id === activeDraggedProjectId);
   }, [activeDraggedProjectId, projectsWithBadges]);
+
+  // Hide rail when there are 0 or 1 projects
+  if (projects.length <= 1) {
+    return null;
+  }
 
   return (
     <>

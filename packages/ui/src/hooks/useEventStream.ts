@@ -1591,6 +1591,7 @@ export const useEventStream = () => {
     bootstrapState,
     effectiveDirectory,
     updateSessionStatus,
+    resolveSessionDirectoryForStatus,
   ]);
 
   const shouldHoldConnection = React.useCallback(() => {

@@ -5,7 +5,7 @@ import {
   RiAlertLine,
   RiCloseLine,
 } from '@remixicon/react';
-import { useNotificationCenterStore, getUnreadCount } from '@/stores/useNotificationCenterStore';
+import { useNotificationCenterStore } from '@/stores/useNotificationCenterStore';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { useProjectsStore } from '@/stores/useProjectsStore';
 import { cn } from '@/lib/utils';

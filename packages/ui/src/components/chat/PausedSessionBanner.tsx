@@ -73,7 +73,7 @@ export const PausedSessionBanner: React.FC<PausedSessionBannerProps> = ({ sessio
                         <span className="typography-meta text-muted-foreground">{relativeTime}</span>
                     </div>
                     {contextSummary && (
-                        <div className="typography-ui-body text-muted-foreground truncate">
+                        <div className="typography-meta text-muted-foreground truncate">
                             {contextSummary}
                         </div>
                     )}

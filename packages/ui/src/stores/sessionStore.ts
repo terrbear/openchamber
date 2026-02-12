@@ -12,16 +12,7 @@ import { triggerSessionStatusPoll } from "@/hooks/useServerSessionStatus";
 import type { ProjectEntry } from "@/lib/api/types";
 import { checkIsGitRepository } from "@/lib/gitApi";
 import { streamDebugEnabled } from "@/stores/utils/streamDebug";
-
-export interface PausedSessionInfo {
-    pausedAt: number;
-    lastUserMessageId: string;
-    lastUserMessageText: string;
-    providerID: string;
-    modelID: string;
-    agentName: string | undefined;
-    contextSummary: string;
-}
+import type { PausedSessionInfo } from "./types/sessionTypes";
 
 interface SessionState {
     sessions: Session[];
@@ -1534,6 +1525,12 @@ export const useSessionStore = create<SessionStore>()(
                     const modelID = sessionModelSelection?.modelId || '';
                     const agentName = contextStore.getSessionAgentSelection(sessionId) || undefined;
 
+                    // Validate provider/model are non-empty
+                    if (!providerID || !modelID) {
+                        console.warn('Cannot pause session: missing provider or model selection');
+                        return;
+                    }
+
                     // Build context summary from last assistant message
                     const assistantMessages = messages.filter(m => m.info.role === 'assistant');
                     let contextSummary = '';
@@ -1576,7 +1573,12 @@ export const useSessionStore = create<SessionStore>()(
                     }
 
                     // Call abortCurrentOperation
-                    await messageStore.abortCurrentOperation(sessionId);
+                    try {
+                        await messageStore.abortCurrentOperation(sessionId);
+                    } catch (error) {
+                        console.error('Failed to abort operation during pause:', error);
+                        throw error;
+                    }
 
                     // Store paused session info
                     set((state) => {
@@ -1604,12 +1606,16 @@ export const useSessionStore = create<SessionStore>()(
                         return;
                     }
 
-                    // Remove from paused sessions
-                    set((state) => {
-                        const nextPausedSessions = new Map(state.pausedSessions);
-                        nextPausedSessions.delete(sessionId);
-                        return { pausedSessions: nextPausedSessions };
-                    });
+                    // Validate pausedInfo has required fields
+                    if (!pausedInfo.lastUserMessageText || !pausedInfo.providerID || !pausedInfo.modelID) {
+                        console.warn('Cannot resume session: corrupted pause data. Cleaning up.');
+                        set((state) => {
+                            const nextPausedSessions = new Map(state.pausedSessions);
+                            nextPausedSessions.delete(sessionId);
+                            return { pausedSessions: nextPausedSessions };
+                        });
+                        return;
+                    }
 
                     // Prepend context summary to message
                     let messageText = pausedInfo.lastUserMessageText;
@@ -1622,13 +1628,26 @@ export const useSessionStore = create<SessionStore>()(
                     const messageStore = useMessageStore.getState();
 
                     // Send message with captured provider/model/agent
-                    await messageStore.sendMessage(
-                        messageText,
-                        pausedInfo.providerID,
-                        pausedInfo.modelID,
-                        pausedInfo.agentName,
-                        sessionId
-                    );
+                    try {
+                        await messageStore.sendMessage(
+                            messageText,
+                            pausedInfo.providerID,
+                            pausedInfo.modelID,
+                            pausedInfo.agentName,
+                            sessionId
+                        );
+
+                        // Only remove from paused sessions after send succeeds
+                        set((state) => {
+                            const nextPausedSessions = new Map(state.pausedSessions);
+                            nextPausedSessions.delete(sessionId);
+                            return { pausedSessions: nextPausedSessions };
+                        });
+                    } catch (error) {
+                        console.error('Failed to resume session:', error);
+                        // Preserve paused state on failure so user can retry
+                        throw error;
+                    }
                 },
 
                 unpauseSession: (sessionId: string) => {

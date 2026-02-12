@@ -1,5 +1,5 @@
 import { createOpencodeClient, OpencodeClient } from "@opencode-ai/sdk/v2";
-import type { FilesAPI, RuntimeAPIs, Connection } from "../api/types";
+import type { FilesAPI, RuntimeAPIs } from "../api/types";
 import { getDesktopHomeDirectory } from "../desktop";
 import { useConnectionsStore } from '@/stores/useConnectionsStore';
 import type {
@@ -2162,7 +2162,7 @@ class OpencodeService {
    * @param options - Optional listing options
    * @returns Array of filesystem entries
    */
-  async listRemoteDirectory(connectionId: string, path: string, options?: { respectGitignore?: boolean }): Promise<FilesystemEntry[]> {
+  async listRemoteDirectory(connectionId: string, path: string): Promise<FilesystemEntry[]> {
     const client = this.resolveClient(connectionId);
     
     try {
@@ -2203,7 +2203,7 @@ class OpencodeService {
   async listLocalDirectory(directoryPath: string | null | undefined, options?: { respectGitignore?: boolean; connectionId?: string }): Promise<FilesystemEntry[]> {
     // Route to remote when connectionId is provided and not 'local'
     if (options?.connectionId && options.connectionId !== 'local') {
-      return this.listRemoteDirectory(options.connectionId, directoryPath || '', options);
+      return this.listRemoteDirectory(options.connectionId, directoryPath || '');
     }
 
     const desktopFiles = getDesktopFilesApi();

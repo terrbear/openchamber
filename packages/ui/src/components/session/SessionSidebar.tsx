@@ -639,6 +639,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       return new Map();
     }
   });
+  const [showArchivedView, setShowArchivedView] = React.useState(false);
   const projectHeaderSentinelRefs = React.useRef<Map<string, HTMLDivElement | null>>(new Map());
   const ignoreIntersectionUntil = React.useRef<number>(0);
   const persistCollapsedProjectsTimer = React.useRef<number | null>(null);
@@ -1214,17 +1215,21 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       availableWorktrees: WorktreeMetadata[],
       projectRootBranch: string | null,
       projectIsRepo: boolean,
+      showArchivedViewFilter: boolean,
     ) => {
       const normalizedProjectRoot = normalizePath(projectRoot ?? null);
       
-      // Filter out archived sessions
+      // Filter sessions based on archived view mode
       const filteredSessions = projectSessions.filter((session) => {
         const sessionDirectory = normalizePath((session as Session & { directory?: string | null }).directory ?? null);
         if (!sessionDirectory) {
-          return true;
+          return !showArchivedViewFilter; // Unarchived by default when no directory
         }
         const archivedSet = archivedSessionsByDirectory.get(sessionDirectory);
-        return !archivedSet || !archivedSet.has(session.id);
+        const isArchived = archivedSet && archivedSet.has(session.id);
+        
+        // Show only archived sessions when in archived view, otherwise show only active sessions
+        return showArchivedViewFilter ? isArchived : !isArchived;
       });
       
       const sortedProjectSessions = [...filteredSessions].sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0));
@@ -1529,13 +1534,14 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
         worktreesForProject,
         projectRootBranches.get(project.id) ?? null,
         Boolean(projectRepoStatus.get(project.id)),
+        showArchivedView,
       );
       return {
         project,
         groups,
       };
     });
-  }, [normalizedProjects, getSessionsForProject, buildGroupedSessions, availableWorktreesByProject, projectRootBranches, projectRepoStatus]);
+  }, [normalizedProjects, getSessionsForProject, buildGroupedSessions, availableWorktreesByProject, projectRootBranches, projectRepoStatus, showArchivedView]);
 
   const visibleProjectSections = React.useMemo(() => {
     if (projectSections.length === 0) {
@@ -2594,6 +2600,22 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                 </TooltipTrigger>
                 <TooltipContent side="bottom" sideOffset={4}><p>New multi-run</p></TooltipContent>
               </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    onClick={() => setShowArchivedView((prev) => !prev)}
+                    className={cn(
+                      headerActionButtonClass,
+                      showArchivedView && 'text-primary'
+                    )}
+                    aria-label="Archived sessions"
+                  >
+                    <RiArchiveLine className="h-4.5 w-4.5" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" sideOffset={4}><p>Archived sessions</p></TooltipContent>
+              </Tooltip>
               </div>
               ) : null}
             </div>
@@ -2727,68 +2749,81 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                   >
                     {!isCollapsed ? (
                       <div className="space-y-[0.6rem] py-1">
+                        {showArchivedView && (
+                          <div className="pl-1 pb-1 pt-0">
+                            <p className="text-sm font-semibold text-muted-foreground">Archived</p>
+                          </div>
+                        )}
                         {section.groups.length > 0 ? (
-                          <DndContext
-                            sensors={sensors}
-                            collisionDetection={closestCenter}
-                            onDragStart={(event) => {
-                              setActiveDraggedGroupId(String(event.active.id));
-                              const width = (event.active.rect.current.initial?.width ?? null);
-                              setActiveDraggedGroupWidth(typeof width === 'number' ? width : null);
-                            }}
-                            onDragCancel={() => {
-                              setActiveDraggedGroupId(null);
-                              setActiveDraggedGroupWidth(null);
-                            }}
-                            onDragEnd={(event) => {
-                              const { active, over } = event;
-                              setActiveDraggedGroupId(null);
-                              setActiveDraggedGroupWidth(null);
-                              if (!over || active.id === over.id) {
-                                return;
-                              }
-                              const oldIndex = orderedGroups.findIndex((item) => item.id === active.id);
-                              const newIndex = orderedGroups.findIndex((item) => item.id === over.id);
-                              if (oldIndex === -1 || newIndex === -1 || oldIndex === newIndex) {
-                                return;
-                              }
-                              const next = arrayMove(orderedGroups, oldIndex, newIndex).map((item) => item.id);
-                              setGroupOrderByProject((prev) => {
-                                const map = new Map(prev);
-                                map.set(projectKey, next);
-                                return map;
-                              });
-                            }}
-                          >
-                            <SortableContext
-                              items={orderedGroups.map((group) => group.id)}
-                              strategy={verticalListSortingStrategy}
-                            >
-                              {orderedGroups.map((group) => {
-                                const groupKey = `${projectKey}:${group.id}`;
-                                return (
-                                  <SortableGroupItem key={group.id} id={group.id}>
-                                    {renderGroupSessions(group, groupKey, projectKey)}
-                                  </SortableGroupItem>
-                                );
-                              })}
-                            </SortableContext>
-                            <DragOverlay modifiers={[centerDragOverlayUnderPointer]} dropAnimation={null}>
-                              {activeDraggedGroupId ? (
-                                (() => {
-                                  const dragGroup = orderedGroups.find((group) => group.id === activeDraggedGroupId);
-                                  if (!dragGroup) {
-                                    return null;
+                          <>
+                            {section.groups.every((group) => group.sessions.length === 0) && showArchivedView ? (
+                              <div className="py-1 text-left typography-micro text-muted-foreground pl-1">
+                                No archived sessions
+                              </div>
+                            ) : (
+                              <DndContext
+                                sensors={sensors}
+                                collisionDetection={closestCenter}
+                                onDragStart={(event) => {
+                                  setActiveDraggedGroupId(String(event.active.id));
+                                  const width = (event.active.rect.current.initial?.width ?? null);
+                                  setActiveDraggedGroupWidth(typeof width === 'number' ? width : null);
+                                }}
+                                onDragCancel={() => {
+                                  setActiveDraggedGroupId(null);
+                                  setActiveDraggedGroupWidth(null);
+                                }}
+                                onDragEnd={(event) => {
+                                  const { active, over } = event;
+                                  setActiveDraggedGroupId(null);
+                                  setActiveDraggedGroupWidth(null);
+                                  if (!over || active.id === over.id) {
+                                    return;
                                   }
-                                  const showBranchIcon = !dragGroup.isMain || Boolean(isRepo);
-                                  return <GroupDragOverlay label={dragGroup.label} showBranchIcon={showBranchIcon} width={activeDraggedGroupWidth ?? undefined} />;
-                                })()
-                              ) : null}
-                            </DragOverlay>
-                          </DndContext>
+                                  const oldIndex = orderedGroups.findIndex((item) => item.id === active.id);
+                                  const newIndex = orderedGroups.findIndex((item) => item.id === over.id);
+                                  if (oldIndex === -1 || newIndex === -1 || oldIndex === newIndex) {
+                                    return;
+                                  }
+                                  const next = arrayMove(orderedGroups, oldIndex, newIndex).map((item) => item.id);
+                                  setGroupOrderByProject((prev) => {
+                                    const map = new Map(prev);
+                                    map.set(projectKey, next);
+                                    return map;
+                                  });
+                                }}
+                              >
+                                <SortableContext
+                                  items={orderedGroups.map((group) => group.id)}
+                                  strategy={verticalListSortingStrategy}
+                                >
+                                  {orderedGroups.map((group) => {
+                                    const groupKey = `${projectKey}:${group.id}`;
+                                    return (
+                                      <SortableGroupItem key={group.id} id={group.id}>
+                                        {renderGroupSessions(group, groupKey, projectKey)}
+                                      </SortableGroupItem>
+                                    );
+                                  })}
+                                </SortableContext>
+                                <DragOverlay modifiers={[centerDragOverlayUnderPointer]} dropAnimation={null}>
+                                  {activeDraggedGroupId ? (
+                                    (() => {
+                                      const dragGroup = orderedGroups.find((group) => group.id === activeDraggedGroupId);
+                                      if (!dragGroup) {
+                                        return null;
+                                      }
+                                      const showBranchIcon = !dragGroup.isMain || Boolean(isRepo);
+                                      return <GroupDragOverlay label={dragGroup.label} showBranchIcon={showBranchIcon} width={activeDraggedGroupWidth ?? undefined} />;
+                                    })()
+                                  ) : null}
+                                </DragOverlay>
+                              </DndContext>
+                            )}
+                          </>
                         ) : (
                           <div className="py-1 text-left typography-micro text-muted-foreground">
-                            No sessions yet.
+                            {showArchivedView ? 'No archived sessions' : 'No sessions yet.'}
                           </div>
                         )}
                       </div>

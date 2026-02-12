@@ -2193,7 +2193,7 @@ class OpencodeService {
           isFile: item.type === 'file',
           isSymbolicLink: false,
         }))
-        .filter((item): item is FilesystemEntry => item.name !== '');
+        .filter((item) => item.name !== '');
     } catch (error) {
       console.error('Failed to list remote directory contents:', error);
       throw error;

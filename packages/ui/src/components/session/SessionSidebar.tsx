@@ -760,24 +760,24 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
 
   // Cleanup stale archived session IDs
   React.useEffect(() => {
-    const validSessionIds = new Set(sessions.map((s) => s.id));
-    let hasChanges = false;
-    const next = new Map<string, Set<string>>();
-    
-    archivedSessionsByDirectory.forEach((sessionIds, directory) => {
-      const validIds = Array.from(sessionIds).filter((id) => validSessionIds.has(id));
-      if (validIds.length !== sessionIds.size) {
-        hasChanges = true;
-      }
-      if (validIds.length > 0) {
-        next.set(directory, new Set(validIds));
-      }
-    });
+    setArchivedSessionsByDirectory((prev) => {
+      const validSessionIds = new Set(sessions.map((s) => s.id));
+      let hasChanges = false;
+      const next = new Map<string, Set<string>>();
+      
+      prev.forEach((sessionIds, directory) => {
+        const validIds = Array.from(sessionIds).filter((id) => validSessionIds.has(id));
+        if (validIds.length !== sessionIds.size) {
+          hasChanges = true;
+        }
+        if (validIds.length > 0) {
+          next.set(directory, new Set(validIds));
+        }
+      });
 
-    if (hasChanges) {
-      setArchivedSessionsByDirectory(next);
-    }
-  }, [sessions, archivedSessionsByDirectory]);
+      return hasChanges ? next : prev;
+    });
+  }, [sessions]);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -1148,7 +1148,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
         },
       });
     },
-    [],
+    [], // toast and setState are stable
   );
 
   const handleOpenDirectoryDialog = React.useCallback(() => {

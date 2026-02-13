@@ -12,6 +12,7 @@ import { triggerSessionStatusPoll } from "@/hooks/useServerSessionStatus";
 import type { ProjectEntry } from "@/lib/api/types";
 import { checkIsGitRepository } from "@/lib/gitApi";
 import { streamDebugEnabled } from "@/stores/utils/streamDebug";
+import type { PausedSessionInfo } from "./types/sessionTypes";
 
 interface SessionState {
     sessions: Session[];
@@ -24,6 +25,7 @@ interface SessionState {
     worktreeMetadata: Map<string, WorktreeMetadata>;
     availableWorktrees: WorktreeMetadata[];
     availableWorktreesByProject: Map<string, WorktreeMetadata[]>;
+    pausedSessions: Map<string, PausedSessionInfo>;
 }
 
 interface SessionActions {
@@ -47,6 +49,10 @@ interface SessionActions {
     setSessionDirectory: (sessionId: string, directory: string | null) => void;
     updateSession: (session: Session) => void;
     removeSessionFromStore: (sessionId: string) => void;
+    pauseSession: (sessionId: string) => Promise<void>;
+    resumeSession: (sessionId: string) => Promise<void>;
+    unpauseSession: (sessionId: string) => void;
+    isSessionPaused: (sessionId: string) => boolean;
 }
 
 type SessionStore = SessionState & SessionActions;
@@ -375,6 +381,7 @@ export const useSessionStore = create<SessionStore>()(
                 worktreeMetadata: new Map(),
                 availableWorktrees: [],
                 availableWorktreesByProject: new Map(),
+                pausedSessions: new Map(),
 
                 loadSessions: async () => {
                     set({ isLoading: true, error: null });
@@ -1479,6 +1486,185 @@ export const useSessionStore = create<SessionStore>()(
                         };
                     });
                 },
+
+                pauseSession: async (sessionId: string) => {
+                    if (!sessionId) {
+                        return;
+                    }
+
+                    // Import stores dynamically to avoid circular dependency
+                    const { useMessageStore } = await import('./messageStore');
+                    const { useContextStore } = await import('./contextStore');
+
+                    const messageStore = useMessageStore.getState();
+                    const contextStore = useContextStore.getState();
+
+                    // Find last user message
+                    const messages = messageStore.messages.get(sessionId) || [];
+                    const userMessages = messages.filter(m => m.info.role === 'user');
+                    if (userMessages.length === 0) {
+                        return;
+                    }
+
+                    const lastUserMessage = userMessages[userMessages.length - 1];
+                    const lastUserMessageId = lastUserMessage.info.id;
+
+                    // Extract text from last user message
+                    const textParts = lastUserMessage.parts.filter(p => p.type === 'text');
+                    const lastUserMessageText = textParts
+                        .map(p => {
+                            const part = p as { text?: string; content?: string };
+                            return part.text || part.content || '';
+                        })
+                        .join('\n')
+                        .trim();
+
+                    // Get provider/model/agent from context store
+                    const sessionModelSelection = contextStore.getSessionModelSelection(sessionId);
+                    const providerID = sessionModelSelection?.providerId || '';
+                    const modelID = sessionModelSelection?.modelId || '';
+                    const agentName = contextStore.getSessionAgentSelection(sessionId) || undefined;
+
+                    // Validate provider/model are non-empty
+                    if (!providerID || !modelID) {
+                        console.warn('Cannot pause session: missing provider or model selection');
+                        return;
+                    }
+
+                    // Build context summary from last assistant message
+                    const assistantMessages = messages.filter(m => m.info.role === 'assistant');
+                    let contextSummary = '';
+                    if (assistantMessages.length > 0) {
+                        const lastAssistantMessage = assistantMessages[assistantMessages.length - 1];
+                        const parts = lastAssistantMessage.parts || [];
+
+                        // Look for running/pending tool parts
+                        const workingParts = parts.filter(part => {
+                            if (part.type === 'tool') {
+                                const toolPart = part as { state?: { status?: string } };
+                                return toolPart.state?.status === 'running' || toolPart.state?.status === 'pending';
+                            }
+                            return false;
+                        });
+
+                        // Extract partial text output
+                        const textParts = parts.filter(p => p.type === 'text');
+                        let textSummary = textParts
+                            .map(p => {
+                                const part = p as { text?: string; content?: string };
+                                return part.text || part.content || '';
+                            })
+                            .join('\n')
+                            .trim()
+                            .slice(0, 500);
+
+                        if (workingParts.length > 0) {
+                            const toolNames = workingParts.map(p => {
+                                const toolPart = p as { name?: string };
+                                return toolPart.name || 'tool';
+                            }).join(', ');
+                            contextSummary = `Working on: ${toolNames}`;
+                            if (textSummary) {
+                                contextSummary += `\nPartial output: ${textSummary}`;
+                            }
+                        } else if (textSummary) {
+                            contextSummary = `Partial output: ${textSummary}`;
+                        }
+                    }
+
+                    // Call abortCurrentOperation
+                    try {
+                        await messageStore.abortCurrentOperation(sessionId);
+                    } catch (error) {
+                        console.error('Failed to abort operation during pause:', error);
+                        throw error;
+                    }
+
+                    // Store paused session info
+                    set((state) => {
+                        const nextPausedSessions = new Map(state.pausedSessions);
+                        nextPausedSessions.set(sessionId, {
+                            pausedAt: Date.now(),
+                            lastUserMessageId,
+                            lastUserMessageText,
+                            providerID,
+                            modelID,
+                            agentName,
+                            contextSummary,
+                        });
+                        return { pausedSessions: nextPausedSessions };
+                    });
+                },
+
+                resumeSession: async (sessionId: string) => {
+                    if (!sessionId) {
+                        return;
+                    }
+
+                    const pausedInfo = get().pausedSessions.get(sessionId);
+                    if (!pausedInfo) {
+                        return;
+                    }
+
+                    // Validate pausedInfo has required fields
+                    if (!pausedInfo.lastUserMessageText || !pausedInfo.providerID || !pausedInfo.modelID) {
+                        console.warn('Cannot resume session: corrupted pause data. Cleaning up.');
+                        set((state) => {
+                            const nextPausedSessions = new Map(state.pausedSessions);
+                            nextPausedSessions.delete(sessionId);
+                            return { pausedSessions: nextPausedSessions };
+                        });
+                        return;
+                    }
+
+                    // Prepend context summary to message
+                    let messageText = pausedInfo.lastUserMessageText;
+                    if (pausedInfo.contextSummary) {
+                        messageText = `Continue from where you left off. When paused, you were: ${pausedInfo.contextSummary}\n\n${pausedInfo.lastUserMessageText}`;
+                    }
+
+                    // Import messageStore dynamically
+                    const { useMessageStore } = await import('./messageStore');
+                    const messageStore = useMessageStore.getState();
+
+                    // Send message with captured provider/model/agent
+                    try {
+                        await messageStore.sendMessage(
+                            messageText,
+                            pausedInfo.providerID,
+                            pausedInfo.modelID,
+                            pausedInfo.agentName,
+                            sessionId
+                        );
+
+                        // Only remove from paused sessions after send succeeds
+                        set((state) => {
+                            const nextPausedSessions = new Map(state.pausedSessions);
+                            nextPausedSessions.delete(sessionId);
+                            return { pausedSessions: nextPausedSessions };
+                        });
+                    } catch (error) {
+                        console.error('Failed to resume session:', error);
+                        // Preserve paused state on failure so user can retry
+                        throw error;
+                    }
+                },
+
+                unpauseSession: (sessionId: string) => {
+                    if (!sessionId) {
+                        return;
+                    }
+
+                    set((state) => {
+                        const nextPausedSessions = new Map(state.pausedSessions);
+                        nextPausedSessions.delete(sessionId);
+                        return { pausedSessions: nextPausedSessions };
+                    });
+                },
+
+                isSessionPaused: (sessionId: string) => {
+                    return get().pausedSessions.has(sessionId);
+                },
             }),
             {
                 name: "session-store",
@@ -1491,6 +1677,7 @@ export const useSessionStore = create<SessionStore>()(
         worktreeMetadata: Array.from(state.worktreeMetadata.entries()),
         availableWorktrees: state.availableWorktrees,
         availableWorktreesByProject: Array.from(state.availableWorktreesByProject.entries()),
+        pausedSessions: Array.from(state.pausedSessions.entries()),
     }),
     merge: (persistedState, currentState) => {
         const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -1526,6 +1713,11 @@ export const useSessionStore = create<SessionStore>()(
             : [];
         const persistedWorktreesByProject = new Map(persistedWorktreesByProjectEntries);
 
+        const persistedPausedSessionsEntries = Array.isArray(persistedState.pausedSessions)
+            ? (persistedState.pausedSessions as Array<[string, PausedSessionInfo]>)
+            : [];
+        const persistedPausedSessions = new Map(persistedPausedSessionsEntries);
+
         const lastLoadedDirectory =
             typeof persistedState.lastLoadedDirectory === "string"
                 ? persistedState.lastLoadedDirectory
@@ -1545,6 +1737,7 @@ export const useSessionStore = create<SessionStore>()(
             availableWorktreesByProject: persistedWorktreesByProject.size > 0
                 ? persistedWorktreesByProject
                 : currentState.availableWorktreesByProject,
+            pausedSessions: persistedPausedSessions,
             lastLoadedDirectory,
         };
         return mergedResult;

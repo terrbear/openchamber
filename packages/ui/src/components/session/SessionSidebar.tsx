@@ -39,20 +39,23 @@ import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip
 import { GridLoader } from '@/components/ui/grid-loader';
 import {
   RiAddLine,
+  RiArchiveLine,
   RiArrowDownSLine,
   RiArrowRightSLine,
   RiCheckLine,
   RiCloseLine,
   RiDeleteBinLine,
   RiErrorWarningLine,
+  RiFileCopyLine,
   RiFolderAddLine,
   RiGitBranchLine,
   RiGitPullRequestLine,
+  RiInboxUnarchiveLine,
+  RiLinkUnlinkM,
 
   RiGithubLine,
 
   RiMore2Line,
-  RiPauseLine,
   RiPencilAiLine,
   RiSearchLine,
   RiShare2Line,
@@ -93,6 +96,7 @@ const GROUP_ORDER_STORAGE_KEY = 'oc.sessions.groupOrder';
 const GROUP_COLLAPSE_STORAGE_KEY = 'oc.sessions.groupCollapse';
 const PROJECT_ACTIVE_SESSION_STORAGE_KEY = 'oc.sessions.activeSessionByProject';
 const SESSION_EXPANDED_STORAGE_KEY = 'oc.sessions.expandedParents';
+const ARCHIVED_SESSIONS_STORAGE_KEY = 'oc.sessions.archived';
 
 const formatDateLabel = (value: string | number) => {
   const targetDate = new Date(value);
@@ -547,6 +551,8 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
   const [editTitle, setEditTitle] = React.useState('');
   const [editingProjectId, setEditingProjectId] = React.useState<string | null>(null);
   const [editProjectTitle, setEditProjectTitle] = React.useState('');
+  const [copiedSessionId, setCopiedSessionId] = React.useState<string | null>(null);
+  const copyTimeout = React.useRef<number | null>(null);
   const [expandedParents, setExpandedParents] = React.useState<Set<string>>(new Set());
   const [directoryStatus, setDirectoryStatus] = React.useState<Map<string, 'unknown' | 'exists' | 'missing'>>(
     () => new Map(),
@@ -616,6 +622,25 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
   const [isProjectRenameInline, setIsProjectRenameInline] = React.useState(false);
   const [projectRenameDraft, setProjectRenameDraft] = React.useState('');
   const [projectRootBranches, setProjectRootBranches] = React.useState<Map<string, string>>(new Map());
+  const [archivedSessionsByDirectory, setArchivedSessionsByDirectory] = React.useState<Map<string, Set<string>>>(() => {
+    try {
+      const raw = getSafeStorage().getItem(ARCHIVED_SESSIONS_STORAGE_KEY);
+      if (!raw) {
+        return new Map();
+      }
+      const parsed = JSON.parse(raw) as Record<string, string[]>;
+      const next = new Map<string, Set<string>>();
+      Object.entries(parsed).forEach(([directory, sessionIds]) => {
+        if (Array.isArray(sessionIds)) {
+          next.set(directory, new Set(sessionIds.filter((item) => typeof item === 'string')));
+        }
+      });
+      return next;
+    } catch {
+      return new Map();
+    }
+  });
+  const [showArchivedView, setShowArchivedView] = React.useState(false);
   const projectHeaderSentinelRefs = React.useRef<Map<string, HTMLDivElement | null>>(new Map());
   const ignoreIntersectionUntil = React.useRef<number>(0);
   const persistCollapsedProjectsTimer = React.useRef<number | null>(null);
@@ -650,7 +675,8 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
   const currentSessionId = useSessionStore((state) => state.currentSessionId);
   const setCurrentSession = useSessionStore((state) => state.setCurrentSession);
   const updateSessionTitle = useSessionStore((state) => state.updateSessionTitle);
-  const messages = useSessionStore((state) => state.messages);
+  const shareSession = useSessionStore((state) => state.shareSession);
+  const unshareSession = useSessionStore((state) => state.unshareSession);
   const sessionMemoryState = useSessionStore((state) => state.sessionMemoryState);
   const sessionStatus = useSessionStore((state) => state.sessionStatus);
   const sessionAttentionStates = useSessionStore((state) => state.sessionAttentionStates);
@@ -659,7 +685,6 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
   const availableWorktreesByProject = useSessionStore((state) => state.availableWorktreesByProject);
   const getSessionsByDirectory = useSessionStore((state) => state.getSessionsByDirectory);
   const openNewSessionDraft = useSessionStore((state) => state.openNewSessionDraft);
-  const isSessionPaused = useSessionStore((state) => state.isSessionPaused);
 
   const tauriIpcAvailable = React.useMemo(() => isTauriShell(), []);
   const isDesktopShellRuntime = React.useMemo(() => isDesktopShell(), []);
@@ -733,6 +758,27 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
 
   const sortedSessions = React.useMemo(() => {
     return [...sessions].sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0));
+  }, [sessions]);
+
+  // Cleanup stale archived session IDs
+  React.useEffect(() => {
+    setArchivedSessionsByDirectory((prev) => {
+      const validSessionIds = new Set(sessions.map((s) => s.id));
+      let hasChanges = false;
+      const next = new Map<string, Set<string>>();
+      
+      prev.forEach((sessionIds, directory) => {
+        const validIds = Array.from(sessionIds).filter((id) => validSessionIds.has(id));
+        if (validIds.length !== sessionIds.size) {
+          hasChanges = true;
+        }
+        if (validIds.length > 0) {
+          next.set(directory, new Set(validIds));
+        }
+      });
+
+      return hasChanges ? next : prev;
+    });
   }, [sessions]);
 
   React.useEffect(() => {
@@ -862,6 +908,13 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
     });
   }, [sortedSessions, projects, directoryStatus]);
 
+  React.useEffect(() => {
+    return () => {
+      if (copyTimeout.current) {
+        clearTimeout(copyTimeout.current);
+      }
+    };
+  }, []);
 
 
   const emptyState = (
@@ -941,54 +994,46 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
 
   const handleShareSession = React.useCallback(
     async (session: Session) => {
-      try {
-        // Load messages if not already in memory
-        let sessionMessages = messages.get(session.id);
-        if (!sessionMessages || sessionMessages.length === 0) {
-          const allMessages = await opencodeClient.getSessionMessages(session.id);
-          sessionMessages = allMessages;
-        }
-
-        const payload = {
-          session: {
-            id: session.id,
-            title: session.title,
-            created: session.time?.created,
-          },
-          messages: (sessionMessages || []).map((m) => ({
-            role: m.info.role,
-            content: m.parts,
-            metadata: {
-              id: m.info.id,
-              created: m.info.time?.created,
-              model: (m.info as Record<string, unknown>).model,
-            },
-          })),
-        };
-
-        const response = await fetch('/api/share', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
+      const result = await shareSession(session.id);
+      if (result && result.share?.url) {
+        toast.success('Session shared', {
+          description: 'You can copy the link from the menu.',
         });
-
-        if (!response.ok) {
-          throw new Error(`Share failed: ${response.statusText}`);
-        }
-
-        const data = await response.json();
-        if (data?.url) {
-          await navigator.clipboard.writeText(data.url);
-          toast.success('Link copied to clipboard');
-        } else {
-          throw new Error('No URL in response');
-        }
-      } catch (error) {
-        console.error('Failed to share session:', error);
+      } else {
         toast.error('Unable to share session');
       }
     },
-    [messages],
+    [shareSession],
+  );
+
+  const handleCopyShareUrl = React.useCallback((url: string, sessionId: string) => {
+    navigator.clipboard
+      .writeText(url)
+      .then(() => {
+        setCopiedSessionId(sessionId);
+        if (copyTimeout.current) {
+          clearTimeout(copyTimeout.current);
+        }
+        copyTimeout.current = window.setTimeout(() => {
+          setCopiedSessionId(null);
+          copyTimeout.current = null;
+        }, 2000);
+      })
+      .catch(() => {
+        toast.error('Failed to copy URL');
+      });
+  }, []);
+
+  const handleUnshareSession = React.useCallback(
+    async (sessionId: string) => {
+      const result = await unshareSession(sessionId);
+      if (result) {
+        toast.success('Session unshared');
+      } else {
+        toast.error('Unable to unshare session');
+      }
+    },
+    [unshareSession],
   );
 
   const collectDescendants = React.useCallback(
@@ -1013,6 +1058,26 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
   const handleDeleteSession = React.useCallback(
     async (session: Session) => {
       const descendants = collectDescendants(session.id);
+
+      // Clean up archived state if the session was archived
+      const sessionDirectory = normalizePath((session as Session & { directory?: string | null }).directory ?? null);
+      if (sessionDirectory) {
+        setArchivedSessionsByDirectory((prev) => {
+          const archivedSet = prev.get(sessionDirectory);
+          if (archivedSet && archivedSet.has(session.id)) {
+            const next = new Map(prev);
+            const nextSet = new Set(archivedSet);
+            nextSet.delete(session.id);
+            if (nextSet.size === 0) {
+              next.delete(sessionDirectory);
+            } else {
+              next.set(sessionDirectory, nextSet);
+            }
+            return next;
+          }
+          return prev;
+        });
+      }
 
       if (descendants.length === 0) {
 
@@ -1047,13 +1112,76 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
     [collectDescendants, deleteSession, deleteSessions],
   );
 
-  const handleOpenDirectoryDialog = React.useCallback(() => {
-    // When remote connection is active, use the remote filesystem browser
-    if (activeConnectionId !== 'local') {
-      sessionEvents.requestDirectoryDialog();
-      return;
-    }
+  const handleArchiveSession = React.useCallback(
+    (session: Session) => {
+      const sessionDirectory = normalizePath((session as Session & { directory?: string | null }).directory ?? null);
+      if (!sessionDirectory) {
+        toast.error('Cannot archive session without directory');
+        return;
+      }
 
+      setArchivedSessionsByDirectory((prev) => {
+        const next = new Map(prev);
+        const archivedSet = next.get(sessionDirectory) ?? new Set<string>();
+        archivedSet.add(session.id);
+        next.set(sessionDirectory, archivedSet);
+        return next;
+      });
+
+      toast.success('Session archived', {
+        action: {
+          label: 'Undo',
+          onClick: () => {
+            setArchivedSessionsByDirectory((prev) => {
+              const next = new Map(prev);
+              const archivedSet = next.get(sessionDirectory);
+              if (archivedSet) {
+                const nextSet = new Set(archivedSet);
+                nextSet.delete(session.id);
+                if (nextSet.size === 0) {
+                  next.delete(sessionDirectory);
+                } else {
+                  next.set(sessionDirectory, nextSet);
+                }
+              }
+              return next;
+            });
+          },
+        },
+      });
+    },
+    [], // toast and setState are stable
+  );
+
+  const handleUnarchiveSession = React.useCallback(
+    (session: Session) => {
+      const sessionDirectory = normalizePath((session as Session & { directory?: string | null }).directory ?? null);
+      if (!sessionDirectory) {
+        toast.error('Cannot unarchive session without directory');
+        return;
+      }
+
+      setArchivedSessionsByDirectory((prev) => {
+        const next = new Map(prev);
+        const archivedSet = next.get(sessionDirectory);
+        if (archivedSet) {
+          const nextSet = new Set(archivedSet);
+          nextSet.delete(session.id);
+          if (nextSet.size === 0) {
+            next.delete(sessionDirectory);
+          } else {
+            next.set(sessionDirectory, nextSet);
+          }
+        }
+        return next;
+      });
+
+      toast.success('Session restored');
+    },
+    [], // toast and setState are stable
+  );
+
+  const handleOpenDirectoryDialog = React.useCallback(() => {
     if (!tauriIpcAvailable) {
       sessionEvents.requestDirectoryDialog();
       return;
@@ -1063,7 +1191,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       .then(({ requestDirectoryAccess }) => requestDirectoryAccess(''))
       .then((result) => {
         if (result.success && result.path) {
-          const added = addProject(result.path, { id: result.projectId, connectionId: activeConnectionId });
+          const added = addProject(result.path, { id: result.projectId });
           if (!added) {
             toast.error('Failed to add project', {
               description: 'Please select a valid directory.',
@@ -1079,7 +1207,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
         console.error('Desktop: Error selecting directory:', error);
         toast.error('Failed to select directory');
       });
-  }, [addProject, activeConnectionId, tauriIpcAvailable]);
+  }, [addProject, tauriIpcAvailable]);
 
   const toggleParent = React.useCallback((sessionId: string) => {
     setExpandedParents((prev) => {
@@ -1116,9 +1244,24 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       availableWorktrees: WorktreeMetadata[],
       projectRootBranch: string | null,
       projectIsRepo: boolean,
+      showArchivedViewFilter: boolean,
     ) => {
       const normalizedProjectRoot = normalizePath(projectRoot ?? null);
-      const sortedProjectSessions = [...projectSessions].sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0));
+      
+      // Filter sessions based on archived view mode
+      const filteredSessions = projectSessions.filter((session) => {
+        const sessionDirectory = normalizePath((session as Session & { directory?: string | null }).directory ?? null);
+        if (!sessionDirectory) {
+          return !showArchivedViewFilter; // Sessions without a directory can't be archived (no directory key for storage)
+        }
+        const archivedSet = archivedSessionsByDirectory.get(sessionDirectory);
+        const isArchived = archivedSet && archivedSet.has(session.id);
+        
+        // Show only archived sessions when in archived view, otherwise show only active sessions
+        return showArchivedViewFilter ? isArchived : !isArchived;
+      });
+      
+      const sortedProjectSessions = [...filteredSessions].sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0));
 
       const sessionMap = new Map(sortedProjectSessions.map((session) => [session.id, session]));
       const childrenMap = new Map<string, Session[]>();
@@ -1253,7 +1396,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
 
       return groups;
     },
-    [homeDirectory, worktreeMetadata]
+    [homeDirectory, worktreeMetadata, archivedSessionsByDirectory]
   );
 
   const toggleGroupSessionLimit = React.useCallback((groupId: string) => {
@@ -1315,6 +1458,18 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       // ignored
     }
   }, [collapsedGroups, safeStorage]);
+
+  React.useEffect(() => {
+    try {
+      const serialized: Record<string, string[]> = {};
+      archivedSessionsByDirectory.forEach((sessionIds, directory) => {
+        serialized[directory] = Array.from(sessionIds);
+      });
+      safeStorage.setItem(ARCHIVED_SESSIONS_STORAGE_KEY, JSON.stringify(serialized));
+    } catch {
+      // ignored
+    }
+  }, [archivedSessionsByDirectory, safeStorage]);
 
   const normalizedProjects = React.useMemo(() => {
     return projects
@@ -1408,13 +1563,14 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
         worktreesForProject,
         projectRootBranches.get(project.id) ?? null,
         Boolean(projectRepoStatus.get(project.id)),
+        showArchivedView,
       );
       return {
         project,
         groups,
       };
     });
-  }, [normalizedProjects, getSessionsForProject, buildGroupedSessions, availableWorktreesByProject, projectRootBranches, projectRepoStatus]);
+  }, [normalizedProjects, getSessionsForProject, buildGroupedSessions, availableWorktreesByProject, projectRootBranches, projectRepoStatus, showArchivedView]);
 
   const visibleProjectSections = React.useMemo(() => {
     if (projectSections.length === 0) {
@@ -1735,9 +1891,6 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                 {session.share ? (
                   <RiShare2Line className="h-3 w-3 text-[color:var(--status-info)] flex-shrink-0" />
                 ) : null}
-                {isSessionPaused(session.id) ? (
-                  <RiPauseLine className="h-3 w-3 flex-shrink-0" style={{ color: 'var(--status-warning)' }} />
-                ) : null}
                 {hasSummary && ((additions ?? 0) !== 0 || (deletions ?? 0) !== 0) ? (
                   <span className="flex-shrink-0 text-[0.7rem] leading-none">
                     <span className="text-[color:var(--status-success)]">+{Math.max(0, additions ?? 0)}</span>
@@ -1863,9 +2016,6 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                   {session.share ? (
                     <RiShare2Line className="h-3 w-3 text-[color:var(--status-info)] flex-shrink-0" />
                   ) : null}
-                  {isSessionPaused(session.id) ? (
-                    <RiPauseLine className="h-3 w-3 flex-shrink-0" style={{ color: 'var(--status-warning)' }} />
-                  ) : null}
                   {hasSummary && ((additions ?? 0) !== 0 || (deletions ?? 0) !== 0) ? (
                     <span className="flex-shrink-0 text-[0.7rem] leading-none">
                       <span className="text-[color:var(--status-success)]">+{Math.max(0, additions ?? 0)}</span>
@@ -1918,10 +2068,50 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                       <RiPencilAiLine className="mr-1 h-4 w-4" />
                       Rename
                     </DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => handleShareSession(session)} className="[&>svg]:mr-1">
+                    {!session.share ? (
+                      <DropdownMenuItem onClick={() => handleShareSession(session)} className="[&>svg]:mr-1">
                         <RiShare2Line className="mr-1 h-4 w-4" />
                         Share
                       </DropdownMenuItem>
+                    ) : (
+                      <>
+                        <DropdownMenuItem
+                          onClick={() => {
+                            if (session.share?.url) {
+                              handleCopyShareUrl(session.share.url, session.id);
+                            }
+                          }}
+                          className="[&>svg]:mr-1"
+                        >
+                          {copiedSessionId === session.id ? (
+                            <>
+                              <RiCheckLine className="mr-1 h-4 w-4" style={{ color: 'var(--status-success)' }} />
+                              Copied
+                            </>
+                          ) : (
+                            <>
+                              <RiFileCopyLine className="mr-1 h-4 w-4" />
+                              Copy link
+                            </>
+                          )}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => handleUnshareSession(session.id)} className="[&>svg]:mr-1">
+                          <RiLinkUnlinkM className="mr-1 h-4 w-4" />
+                          Unshare
+                        </DropdownMenuItem>
+                      </>
+                    )}
+                    {showArchivedView ? (
+                      <DropdownMenuItem onClick={() => handleUnarchiveSession(session)} className="[&>svg]:mr-1">
+                        <RiInboxUnarchiveLine className="mr-1 h-4 w-4" />
+                        Unarchive
+                      </DropdownMenuItem>
+                    ) : (
+                      <DropdownMenuItem onClick={() => handleArchiveSession(session)} className="[&>svg]:mr-1">
+                        <RiArchiveLine className="mr-1 h-4 w-4" />
+                        Archive
+                      </DropdownMenuItem>
+                    )}
                     <DropdownMenuItem
                       className="text-destructive focus:text-destructive [&>svg]:mr-1"
                       onClick={() => handleDeleteSession(session)}
@@ -1957,9 +2147,15 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       toggleParent,
       handleSessionSelect,
       handleShareSession,
+      handleCopyShareUrl,
+      handleUnshareSession,
+      handleArchiveSession,
+      handleUnarchiveSession,
       handleDeleteSession,
+      copiedSessionId,
       mobileVariant,
       openMenuSessionId,
+      showArchivedView,
     ],
   );
 
@@ -2442,6 +2638,24 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                 </TooltipTrigger>
                 <TooltipContent side="bottom" sideOffset={4}><p>New multi-run</p></TooltipContent>
               </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    onClick={() => setShowArchivedView((prev) => !prev)}
+                    className={cn(
+                      headerActionButtonClass,
+                      showArchivedView && 'text-primary bg-primary/10'
+                    )}
+                    aria-label="Archived sessions"
+                  >
+                    <RiArchiveLine className="h-4.5 w-4.5" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" sideOffset={4}>
+                  <p>{showArchivedView ? 'Show active sessions' : 'Show archived sessions'}</p>
+                </TooltipContent>
+              </Tooltip>
               </div>
               ) : null}
             </div>
@@ -2575,68 +2789,81 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                   >
                     {!isCollapsed ? (
                       <div className="space-y-[0.6rem] py-1">
+                        {showArchivedView && (
+                          <div className="pl-1 pb-1 pt-0">
+                            <p className="text-sm font-semibold text-muted-foreground">Archived</p>
+                          </div>
+                        )}
                         {section.groups.length > 0 ? (
-                          <DndContext
-                            sensors={sensors}
-                            collisionDetection={closestCenter}
-                            onDragStart={(event) => {
-                              setActiveDraggedGroupId(String(event.active.id));
-                              const width = (event.active.rect.current.initial?.width ?? null);
-                              setActiveDraggedGroupWidth(typeof width === 'number' ? width : null);
-                            }}
-                            onDragCancel={() => {
-                              setActiveDraggedGroupId(null);
-                              setActiveDraggedGroupWidth(null);
-                            }}
-                            onDragEnd={(event) => {
-                              const { active, over } = event;
-                              setActiveDraggedGroupId(null);
-                              setActiveDraggedGroupWidth(null);
-                              if (!over || active.id === over.id) {
-                                return;
-                              }
-                              const oldIndex = orderedGroups.findIndex((item) => item.id === active.id);
-                              const newIndex = orderedGroups.findIndex((item) => item.id === over.id);
-                              if (oldIndex === -1 || newIndex === -1 || oldIndex === newIndex) {
-                                return;
-                              }
-                              const next = arrayMove(orderedGroups, oldIndex, newIndex).map((item) => item.id);
-                              setGroupOrderByProject((prev) => {
-                                const map = new Map(prev);
-                                map.set(projectKey, next);
-                                return map;
-                              });
-                            }}
-                          >
-                            <SortableContext
-                              items={orderedGroups.map((group) => group.id)}
-                              strategy={verticalListSortingStrategy}
-                            >
-                              {orderedGroups.map((group) => {
-                                const groupKey = `${projectKey}:${group.id}`;
-                                return (
-                                  <SortableGroupItem key={group.id} id={group.id}>
-                                    {renderGroupSessions(group, groupKey, projectKey)}
-                                  </SortableGroupItem>
-                                );
-                              })}
-                            </SortableContext>
-                            <DragOverlay modifiers={[centerDragOverlayUnderPointer]} dropAnimation={null}>
-                              {activeDraggedGroupId ? (
-                                (() => {
-                                  const dragGroup = orderedGroups.find((group) => group.id === activeDraggedGroupId);
-                                  if (!dragGroup) {
-                                    return null;
+                          <>
+                            {section.groups.every((group) => group.sessions.length === 0) && showArchivedView ? (
+                              <div className="py-1 text-left typography-micro text-muted-foreground pl-1">
+                                No archived sessions
+                              </div>
+                            ) : (
+                              <DndContext
+                                sensors={sensors}
+                                collisionDetection={closestCenter}
+                                onDragStart={(event) => {
+                                  setActiveDraggedGroupId(String(event.active.id));
+                                  const width = (event.active.rect.current.initial?.width ?? null);
+                                  setActiveDraggedGroupWidth(typeof width === 'number' ? width : null);
+                                }}
+                                onDragCancel={() => {
+                                  setActiveDraggedGroupId(null);
+                                  setActiveDraggedGroupWidth(null);
+                                }}
+                                onDragEnd={(event) => {
+                                  const { active, over } = event;
+                                  setActiveDraggedGroupId(null);
+                                  setActiveDraggedGroupWidth(null);
+                                  if (!over || active.id === over.id) {
+                                    return;
                                   }
-                                  const showBranchIcon = !dragGroup.isMain || Boolean(isRepo);
-                                  return <GroupDragOverlay label={dragGroup.label} showBranchIcon={showBranchIcon} width={activeDraggedGroupWidth ?? undefined} />;
-                                })()
-                              ) : null}
-                            </DragOverlay>
-                          </DndContext>
+                                  const oldIndex = orderedGroups.findIndex((item) => item.id === active.id);
+                                  const newIndex = orderedGroups.findIndex((item) => item.id === over.id);
+                                  if (oldIndex === -1 || newIndex === -1 || oldIndex === newIndex) {
+                                    return;
+                                  }
+                                  const next = arrayMove(orderedGroups, oldIndex, newIndex).map((item) => item.id);
+                                  setGroupOrderByProject((prev) => {
+                                    const map = new Map(prev);
+                                    map.set(projectKey, next);
+                                    return map;
+                                  });
+                                }}
+                              >
+                                <SortableContext
+                                  items={orderedGroups.map((group) => group.id)}
+                                  strategy={verticalListSortingStrategy}
+                                >
+                                  {orderedGroups.map((group) => {
+                                    const groupKey = `${projectKey}:${group.id}`;
+                                    return (
+                                      <SortableGroupItem key={group.id} id={group.id}>
+                                        {renderGroupSessions(group, groupKey, projectKey)}
+                                      </SortableGroupItem>
+                                    );
+                                  })}
+                                </SortableContext>
+                                <DragOverlay modifiers={[centerDragOverlayUnderPointer]} dropAnimation={null}>
+                                  {activeDraggedGroupId ? (
+                                    (() => {
+                                      const dragGroup = orderedGroups.find((group) => group.id === activeDraggedGroupId);
+                                      if (!dragGroup) {
+                                        return null;
+                                      }
+                                      const showBranchIcon = !dragGroup.isMain || Boolean(isRepo);
+                                      return <GroupDragOverlay label={dragGroup.label} showBranchIcon={showBranchIcon} width={activeDraggedGroupWidth ?? undefined} />;
+                                    })()
+                                  ) : null}
+                                </DragOverlay>
+                              </DndContext>
+                            )}
+                          </>
                         ) : (
                           <div className="py-1 text-left typography-micro text-muted-foreground">
-                            No sessions yet.
+                            {showArchivedView ? 'No archived sessions' : 'No sessions yet.'}
                           </div>
                         )}
                       </div>

@@ -51,6 +51,8 @@ import {
   RiFolderAddLine,
   RiGitBranchLine,
   RiGitPullRequestLine,
+  RiGitRepositoryLine,
+  RiNodeTree,
   RiStickyNoteLine,
   RiInboxUnarchiveLine,
   RiLinkUnlinkM,
@@ -60,8 +62,10 @@ import {
   RiMore2Line,
   RiPencilAiLine,
   RiSearchLine,
+  RiPushpinLine,
   RiShare2Line,
   RiShieldLine,
+  RiUnpinLine,
 } from '@remixicon/react';
 import { sessionEvents } from '@/lib/sessionEvents';
 import {
@@ -95,6 +99,7 @@ import { ProjectNotesTodoPanel } from './ProjectNotesTodoPanel';
 import { TranscriptSearch } from './TranscriptSearch';
 import { SidebarTodos } from './SidebarTodos';
 import { SidebarScratchPad } from './SidebarScratchPad';
+import { BranchPickerDialog } from './BranchPickerDialog';
 
 
 const ATTENTION_DIAMOND_INDICES = new Set([1, 3, 4, 5, 7]);
@@ -108,6 +113,7 @@ const GROUP_ORDER_STORAGE_KEY = 'oc.sessions.groupOrder';
 const GROUP_COLLAPSE_STORAGE_KEY = 'oc.sessions.groupCollapse';
 const PROJECT_ACTIVE_SESSION_STORAGE_KEY = 'oc.sessions.activeSessionByProject';
 const SESSION_EXPANDED_STORAGE_KEY = 'oc.sessions.expandedParents';
+const SESSION_PINNED_STORAGE_KEY = 'oc.sessions.pinned';
 
 const formatDateLabel = (value: string | number) => {
   const targetDate = new Date(value);
@@ -166,6 +172,28 @@ const toFiniteNumber = (value: unknown): number | undefined => {
     }
   }
   return undefined;
+};
+
+const getSessionCreatedAt = (session: Session): number => {
+  return toFiniteNumber(session.time?.created) ?? 0;
+};
+
+const getSessionUpdatedAt = (session: Session): number => {
+  return toFiniteNumber(session.time?.updated) ?? 0;
+};
+
+const compareSessionsByPinnedAndTime = (a: Session, b: Session, pinnedSessionIds: Set<string>): number => {
+  const aPinned = pinnedSessionIds.has(a.id);
+  const bPinned = pinnedSessionIds.has(b.id);
+  if (aPinned !== bPinned) {
+    return aPinned ? -1 : 1;
+  }
+
+  if (aPinned && bPinned) {
+    return getSessionCreatedAt(b) - getSessionCreatedAt(a);
+  }
+
+  return getSessionUpdatedAt(b) - getSessionUpdatedAt(a);
 };
 
 const centerDragOverlayUnderPointer: Modifier = ({ transform, activeNodeRect, activatorEvent }) => {
@@ -548,6 +576,7 @@ interface SessionSidebarProps {
   onSessionSelected?: (sessionId: string) => void;
   allowReselect?: boolean;
   hideDirectoryControls?: boolean;
+  hideProjectSelector?: boolean;
   showOnlyMainWorkspace?: boolean;
 }
 
@@ -556,6 +585,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
   onSessionSelected,
   allowReselect = false,
   hideDirectoryControls = false,
+  hideProjectSelector = false,
   showOnlyMainWorkspace = false,
 }) => {
   const [editingId, setEditingId] = React.useState<string | null>(null);
@@ -577,10 +607,23 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
   const [hoveredProjectId, setHoveredProjectId] = React.useState<string | null>(null);
   const [issuePickerOpen, setIssuePickerOpen] = React.useState(false);
   const [pullRequestPickerOpen, setPullRequestPickerOpen] = React.useState(false);
+  const [isBranchPickerOpen, setIsBranchPickerOpen] = React.useState(false);
   const [projectNotesPanelOpen, setProjectNotesPanelOpen] = React.useState(false);
   const [stuckProjectHeaders, setStuckProjectHeaders] = React.useState<Set<string>>(new Set());
   const [openMenuSessionId, setOpenMenuSessionId] = React.useState<string | null>(null);
   const [searchPanelOpen, setSearchPanelOpen] = React.useState(false);
+  const [pinnedSessionIds, setPinnedSessionIds] = React.useState<Set<string>>(() => {
+    try {
+      const raw = getSafeStorage().getItem(SESSION_PINNED_STORAGE_KEY);
+      if (!raw) {
+        return new Set();
+      }
+      const parsed = JSON.parse(raw) as string[];
+      return new Set(Array.isArray(parsed) ? parsed.filter((item) => typeof item === 'string') : []);
+    } catch {
+      return new Set();
+    }
+  });
   const [collapsedGroups, setCollapsedGroups] = React.useState<Set<string>>(() => {
     try {
       const raw = getSafeStorage().getItem(GROUP_COLLAPSE_STORAGE_KEY);
@@ -779,8 +822,20 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
     } catch { /* ignored */ }
   }, [safeStorage]);
 
-  const sortedSessions = React.useMemo(() => {
-    return [...sessions].sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0));
+  React.useEffect(() => {
+    const existingSessionIds = new Set(sessions.map((session) => session.id));
+    setPinnedSessionIds((prev) => {
+      let changed = false;
+      const next = new Set<string>();
+      prev.forEach((id) => {
+        if (existingSessionIds.has(id)) {
+          next.add(id);
+        } else {
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
   }, [sessions]);
 
   // Cleanup stale archived session IDs
@@ -804,6 +859,30 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       setArchivedSessions(cleanedData);
     }
   }, [sessions]);
+
+  React.useEffect(() => {
+    try {
+      safeStorage.setItem(SESSION_PINNED_STORAGE_KEY, JSON.stringify(Array.from(pinnedSessionIds)));
+    } catch {
+      // ignored
+    }
+  }, [pinnedSessionIds, safeStorage]);
+
+  const togglePinnedSession = React.useCallback((sessionId: string) => {
+    setPinnedSessionIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(sessionId)) {
+        next.delete(sessionId);
+      } else {
+        next.add(sessionId);
+      }
+      return next;
+    });
+  }, []);
+
+  const sortedSessions = React.useMemo(() => {
+    return [...sessions].sort((a, b) => compareSessionsByPinnedAndTime(a, b, pinnedSessionIds));
+  }, [sessions, pinnedSessionIds]);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -858,9 +937,9 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       collection.push(session);
       map.set(parentID, collection);
     });
-    map.forEach((list) => list.sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0)));
+    map.forEach((list) => list.sort((a, b) => compareSessionsByPinnedAndTime(a, b, pinnedSessionIds)));
     return map;
-  }, [sortedSessions]);
+  }, [sortedSessions, pinnedSessionIds]);
 
   React.useEffect(() => {
     const directories = new Set<string>();
@@ -1255,7 +1334,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
         return showArchivedViewFilter ? isArchived : !isArchived;
       });
       
-      const sortedProjectSessions = [...filteredSessions].sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0));
+      const sortedProjectSessions = [...filteredSessions].sort((a, b) => compareSessionsByPinnedAndTime(a, b, pinnedSessionIds));
 
       const sessionMap = new Map(sortedProjectSessions.map((session) => [session.id, session]));
       const childrenMap = new Map<string, Session[]>();
@@ -1268,7 +1347,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
         collection.push(session);
         childrenMap.set(parentID, collection);
       });
-      childrenMap.forEach((list) => list.sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0)));
+      childrenMap.forEach((list) => list.sort((a, b) => compareSessionsByPinnedAndTime(a, b, pinnedSessionIds)));
 
       // Build worktree lookup map
       const worktreeByPath = new Map<string, WorktreeMetadata>();
@@ -1357,11 +1436,21 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
 
       sortedWorktrees.forEach((meta) => {
         const directory = normalizePath(meta.path) ?? meta.path;
-        const label = meta.label || meta.name || formatDirectoryName(directory, homeDirectory) || directory;
+        const currentBranch = gitDirectories.get(directory)?.status?.current?.trim() || null;
+        const metadataBranch = meta.branch?.trim() || null;
+        const shouldSyncLabelWithBranch = Boolean(
+          currentBranch
+          && metadataBranch
+          && meta.label
+          && normalizeForBranchComparison(meta.label) === normalizeForBranchComparison(metadataBranch),
+        );
+        const label = shouldSyncLabelWithBranch
+          ? currentBranch!
+          : (meta.label || meta.name || formatDirectoryName(directory, homeDirectory) || directory);
         groups.push({
           id: `worktree:${directory}`,
           label,
-          branch: meta.branch || null,
+          branch: currentBranch || metadataBranch,
           description: formatPathForDisplay(directory, homeDirectory),
           isMain: false,
           worktree: meta,
@@ -1376,10 +1465,11 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
         .sort((a, b) => (groupOrder.get(a) ?? 0) - (groupOrder.get(b) ?? 0));
 
       orphanKeys.forEach((directory) => {
+        const currentBranch = gitDirectories.get(directory)?.status?.current?.trim() || null;
         groups.push({
           id: `worktree:orphan:${directory}`,
           label: formatDirectoryName(directory, homeDirectory) || directory,
-          branch: null,
+          branch: currentBranch,
           description: formatPathForDisplay(directory, homeDirectory),
           isMain: false,
           worktree: null,
@@ -1390,7 +1480,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
 
       return groups;
     },
-    [homeDirectory, worktreeMetadata, archivedSessionsByDirectory]
+    [homeDirectory, worktreeMetadata, archivedSessionsByDirectory, pinnedSessionIds, gitDirectories]
   );
 
   const toggleGroupSessionLimit = React.useCallback((groupId: string) => {
@@ -1536,16 +1626,25 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
     [availableWorktreesByProject, getSessionsByDirectory, sessionsByDirectory, isVSCode],
   );
 
+  // Keep last-known repo status to avoid UI jiggling during project switch
+  const lastRepoStatusRef = React.useRef(false);
+  if (activeProjectId && projectRepoStatus.has(activeProjectId)) {
+    lastRepoStatusRef.current = Boolean(projectRepoStatus.get(activeProjectId));
+  }
+
   const projectSections = React.useMemo(() => {
     return normalizedProjects.map((project) => {
       const projectSessions = getSessionsForProject(project);
       const worktreesForProject = availableWorktreesByProject.get(project.normalizedPath) ?? [];
+      const isRepo = projectRepoStatus.has(project.id)
+        ? Boolean(projectRepoStatus.get(project.id))
+        : lastRepoStatusRef.current;
       const groups = buildGroupedSessions(
         projectSessions,
         project.normalizedPath,
         worktreesForProject,
         projectRootBranches.get(project.id) ?? null,
-        Boolean(projectRepoStatus.get(project.id)),
+        isRepo,
         showArchivedView,
       );
       return {
@@ -1576,11 +1675,26 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       : null),
     [activeProjectForHeader],
   );
+  const branchPickerProject = React.useMemo(() => {
+    if (!activeProjectForHeader) {
+      return null;
+    }
+    return {
+      id: activeProjectForHeader.id,
+      path: activeProjectForHeader.path,
+      normalizedPath: activeProjectForHeader.normalizedPath,
+      label: activeProjectForHeader.label,
+    };
+  }, [activeProjectForHeader]);
 
   const activeProjectIsRepo = React.useMemo(
     () => (activeProjectForHeader ? Boolean(projectRepoStatus.get(activeProjectForHeader.id)) : false),
     [activeProjectForHeader, projectRepoStatus],
   );
+  // Only flip to false once the new project's status is actually resolved (present in map)
+  const stableActiveProjectIsRepo = activeProjectForHeader && projectRepoStatus.has(activeProjectForHeader.id)
+    ? activeProjectIsRepo
+    : lastRepoStatusRef.current;
   const reserveHeaderActionsSpace = Boolean(activeProjectForHeader);
   const useMobileNotesPanel = mobileVariant || deviceInfo.isMobile;
 
@@ -1792,7 +1906,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
   }, [activeProjectForHeader, projectRenameDraft, renameProject]);
 
   const headerActionButtonClass =
-    'inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-interactive-hover/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50';
+    'inline-flex h-6 w-6 items-center justify-center rounded-md leading-none text-muted-foreground hover:text-foreground hover:bg-interactive-hover/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50';
 
   // Track when project sticky headers become "stuck"
   React.useEffect(() => {
@@ -1837,6 +1951,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       const isActive = currentSessionId === session.id;
       const sessionTitle = session.title || 'Untitled Session';
       const hasChildren = node.children.length > 0;
+      const isPinnedSession = pinnedSessionIds.has(session.id);
       const isExpanded = expandedParents.has(session.id);
       const needsAttention = sessionAttentionStates.get(session.id)?.needsAttention === true;
       const sessionSummary = session.summary as
@@ -1981,8 +2096,8 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                 )}
               >
                 {}
-                <div className="flex w-full items-center gap-2 min-w-0 flex-1 overflow-hidden">
-                  {showStatusMarker ? (
+                  <div className="flex w-full items-center gap-2 min-w-0 flex-1 overflow-hidden">
+                    {showStatusMarker ? (
                     <span className="inline-flex h-3.5 w-3.5 flex-shrink-0 items-center justify-center">
                       {isStreaming ? (
                         <GridLoader size="xs" className="text-primary" />
@@ -2002,6 +2117,9 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                         </span>
                       )}
                     </span>
+                  ) : null}
+                  {isPinnedSession ? (
+                    <RiPushpinLine className="h-3 w-3 flex-shrink-0 text-primary" aria-label="Pinned session" />
                   ) : null}
                   <div className="block min-w-0 flex-1 truncate typography-ui-label font-normal text-foreground">
                     {sessionTitle}
@@ -2102,6 +2220,14 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                       <RiPencilAiLine className="mr-1 h-4 w-4" />
                       Rename
                     </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => togglePinnedSession(session.id)} className="[&>svg]:mr-1">
+                      {isPinnedSession ? (
+                        <RiUnpinLine className="mr-1 h-4 w-4" />
+                      ) : (
+                        <RiPushpinLine className="mr-1 h-4 w-4" />
+                      )}
+                      {isPinnedSession ? 'Unpin session' : 'Pin session'}
+                    </DropdownMenuItem>
                     {!session.share ? (
                       <DropdownMenuItem onClick={() => handleShareSession(session)} className="[&>svg]:mr-1">
                         <RiShare2Line className="mr-1 h-4 w-4" />
@@ -2181,6 +2307,8 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       toggleParent,
       handleSessionSelect,
       handleSessionDoubleClick,
+      pinnedSessionIds,
+      togglePinnedSession,
       handleShareSession,
       handleCopyShareUrl,
       handleUnshareSession,
@@ -2217,7 +2345,9 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
       };
       const allGroupSessions = collectGroupSessions(group.sessions);
       const normalizedGroupDirectory = normalizePath(group.directory ?? null);
-      const isGitProject = Boolean(projectId && projectRepoStatus.get(projectId));
+      const isGitProject = projectId && projectRepoStatus.has(projectId)
+        ? Boolean(projectRepoStatus.get(projectId))
+        : lastRepoStatusRef.current;
       const showBranchSubtitle = !group.isMain && isBranchDifferentFromLabel(group.branch, group.label);
       const isActiveGroup = Boolean(
         normalizedGroupDirectory
@@ -2297,12 +2427,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
             aria-label={!hideGroupLabel ? (isCollapsed ? `Expand ${group.label}` : `Collapse ${group.label}`) : undefined}
           >
             {!hideGroupLabel ? (
-              <div className="min-w-0 flex items-center gap-1.5 px-0">
-                {isCollapsed ? (
-                  <RiArrowRightSLine className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
-                ) : (
-                  <RiArrowDownSLine className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
-                )}
+              <div className="min-w-0 flex items-center gap-1.5 pl-1.5">
                 {!group.isMain || isGitProject ? (
                   <RiGitBranchLine className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
                 ) : null}
@@ -2316,6 +2441,11 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                     </span>
                   ) : null}
                 </div>
+                {isCollapsed ? (
+                  <RiArrowRightSLine className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
+                ) : (
+                  <RiArrowDownSLine className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
+                )}
               </div>
             ) : <div />}
             {group.directory ? (
@@ -2501,7 +2631,8 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
         </div>
       )}
       {!hideDirectoryControls && (
-        <div className="select-none pl-3.5 pr-2 py-1.5 flex-shrink-0 border-b border-border/60">
+        <div className={cn('select-none pl-3.5 pr-2 flex-shrink-0 border-b border-border/60', hideProjectSelector ? 'py-1' : 'py-1.5')}>
+          {!hideProjectSelector && (
           <div className="flex h-8 items-center justify-between gap-2">
             <DropdownMenu
               onOpenChange={(open) => {
@@ -2641,11 +2772,12 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
               </Tooltip>
             </div>
           </div>
+          )}
           {reserveHeaderActionsSpace ? (
-            <div className="mt-1 h-8 pl-1">
+            <div className="-ml-1 flex h-8 items-center">
               {activeProjectForHeader ? (
-              <div className="inline-flex h-8 items-center gap-1.5 rounded-md pl-0 pr-1">
-              {activeProjectIsRepo ? (
+              <div className="flex h-8 -translate-y-px items-center gap-1.5 rounded-md pl-0 pr-1">
+              {stableActiveProjectIsRepo ? (
                 <>
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -2671,7 +2803,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                     className={headerActionButtonClass}
                     aria-label="New worktree"
                   >
-                    <RiGitBranchLine className="h-4.5 w-4.5" />
+                    <RiNodeTree className="h-4.5 w-4.5" />
                   </button>
                 </TooltipTrigger>
                 <TooltipContent side="bottom" sideOffset={4}><p>New worktree</p></TooltipContent>
@@ -2735,6 +2867,21 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
               </Tooltip>
                 </>
               ) : null}
+              {stableActiveProjectIsRepo && branchPickerProject ? (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      onClick={() => setIsBranchPickerOpen(true)}
+                      className={headerActionButtonClass}
+                      aria-label="Manage branches"
+                    >
+                      <RiGitRepositoryLine className="h-4.5 w-4.5" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom" sideOffset={4}><p>Manage branches</p></TooltipContent>
+                </Tooltip>
+              ) : null}
               {useMobileNotesPanel ? (
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -2768,7 +2915,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
                   <DropdownMenuContent align="start" className="w-[340px] p-0">
                     <ProjectNotesTodoPanel
                       projectRef={activeProjectRefForHeader}
-                      canCreateWorktree={activeProjectIsRepo}
+                      canCreateWorktree={stableActiveProjectIsRepo}
                       onActionComplete={() => setProjectNotesPanelOpen(false)}
                     />
                   </DropdownMenuContent>
@@ -3020,6 +3167,12 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
         }}
       />
 
+      <BranchPickerDialog
+        open={isBranchPickerOpen}
+        onOpenChange={setIsBranchPickerOpen}
+        project={branchPickerProject}
+      />
+
       {useMobileNotesPanel ? (
         <MobileOverlayPanel
           open={projectNotesPanelOpen}
@@ -3028,7 +3181,7 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
         >
           <ProjectNotesTodoPanel
             projectRef={activeProjectRefForHeader}
-            canCreateWorktree={activeProjectIsRepo}
+            canCreateWorktree={stableActiveProjectIsRepo}
             onActionComplete={() => setProjectNotesPanelOpen(false)}
             className="p-0"
           />

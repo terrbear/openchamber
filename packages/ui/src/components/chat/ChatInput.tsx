@@ -129,7 +129,6 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
     const [showAbortStatus, setShowAbortStatus] = React.useState(false);
     const abortTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
     const prevWasAbortedRef = React.useRef(false);
-    const sendTriggeredByPointerDownRef = React.useRef(false);
 
     // Message queue
     const queueModeEnabled = useMessageQueueStore((state) => state.queueModeEnabled);
@@ -1667,27 +1666,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         <button
             type={isMobile ? 'button' : 'submit'}
             disabled={!canSend || (!currentSessionId && !newSessionDraftOpen)}
-            onPointerDownCapture={(event) => {
-                if (!isMobile || event.pointerType !== 'touch') {
-                    return;
-                }
-
-                if (!canSend || (!currentSessionId && !newSessionDraftOpen)) {
-                    return;
-                }
-
-                sendTriggeredByPointerDownRef.current = true;
-                event.preventDefault();
-                event.stopPropagation();
-                handlePrimaryAction();
-            }}
             onClick={(event) => {
                 if (!isMobile) {
-                    return;
-                }
-
-                if (sendTriggeredByPointerDownRef.current) {
-                    sendTriggeredByPointerDownRef.current = false;
                     return;
                 }
 
@@ -1711,26 +1691,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         <button
             type="button"
             disabled={!hasContent || !currentSessionId}
-            onPointerDownCapture={(event) => {
-                if (!isMobile || event.pointerType !== 'touch') {
-                    return;
-                }
-
-                if (!hasContent || !currentSessionId) {
-                    return;
-                }
-
-                sendTriggeredByPointerDownRef.current = true;
-                event.preventDefault();
-                event.stopPropagation();
-                handleQueueMessage();
-            }}
             onClick={(event) => {
                 if (isMobile) {
-                    if (sendTriggeredByPointerDownRef.current) {
-                        sendTriggeredByPointerDownRef.current = false;
-                        return;
-                    }
                     event.preventDefault();
                 }
                 handleQueueMessage();

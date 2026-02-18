@@ -28,6 +28,7 @@ interface ProjectsStore {
   renameProject: (id: string, label: string) => void;
   setBadge: (projectId: string, badge: string) => void;
   setGroup: (projectId: string, group: string) => void;
+  updateProjectMeta: (id: string, meta: { label?: string; icon?: string | null; color?: string | null }) => void;
   reorderProjects: (fromIndex: number, toIndex: number) => void;
   validateProjectPath: (path: string) => ProjectPathValidationResult;
   synchronizeFromSettings: (settings: DesktopSettings) => void;
@@ -78,7 +79,8 @@ const deriveProjectLabel = (path: string): string => {
     return 'Root';
   }
   const segments = normalized.split('/').filter(Boolean);
-  return segments[segments.length - 1] || normalized;
+  const raw = segments[segments.length - 1] || normalized;
+  return raw.replace(/[-_]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 };
 
 /**
@@ -145,6 +147,12 @@ const sanitizeProjects = (value: unknown): ProjectEntry[] => {
 
     if (typeof candidate.label === 'string' && candidate.label.trim().length > 0) {
       project.label = candidate.label.trim();
+    }
+    if (typeof candidate.icon === 'string' && candidate.icon.trim().length > 0) {
+      project.icon = candidate.icon.trim();
+    }
+    if (typeof candidate.color === 'string' && candidate.color.trim().length > 0) {
+      project.color = candidate.color.trim();
     }
     if (typeof candidate.addedAt === 'number' && Number.isFinite(candidate.addedAt) && candidate.addedAt >= 0) {
       project.addedAt = candidate.addedAt;
@@ -475,6 +483,26 @@ export const useProjectsStore = create<ProjectsStore>()(
           }
         }
         return project;
+      });
+      set({ projects: nextProjects });
+      persistProjects(nextProjects, activeProjectId);
+    },
+
+    updateProjectMeta: (id: string, meta: { label?: string; icon?: string | null; color?: string | null }) => {
+      if (vscodeWorkspace) {
+        return;
+      }
+      const { projects, activeProjectId } = get();
+      const nextProjects = projects.map((project) => {
+        if (project.id !== id) return project;
+        const updated = { ...project };
+        if (meta.label !== undefined) {
+          const trimmed = meta.label.trim();
+          if (trimmed) updated.label = trimmed;
+        }
+        if (meta.icon !== undefined) updated.icon = meta.icon;
+        if (meta.color !== undefined) updated.color = meta.color;
+        return updated;
       });
       set({ projects: nextProjects });
       persistProjects(nextProjects, activeProjectId);

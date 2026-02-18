@@ -1,5 +1,5 @@
 import React from 'react';
-import { RiDonutChartLine } from '@remixicon/react';
+import { RiDonutChartFill, RiDonutChartLine } from '@remixicon/react';
 import { cn } from '@/lib/utils';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { MobileOverlayPanel } from '@/components/ui/MobileOverlayPanel';
@@ -12,6 +12,12 @@ interface ContextUsageDisplayProps {
   size?: 'default' | 'compact';
   isMobile?: boolean;
   hideIcon?: boolean;
+  showPercentIcon?: boolean;
+  className?: string;
+  valueClassName?: string;
+  percentIconClassName?: string;
+  onClick?: () => void;
+  pressed?: boolean;
 }
 
 export const ContextUsageDisplay: React.FC<ContextUsageDisplayProps> = ({
@@ -22,6 +28,12 @@ export const ContextUsageDisplay: React.FC<ContextUsageDisplayProps> = ({
   size = 'default',
   isMobile = false,
   hideIcon = false,
+  showPercentIcon = false,
+  className,
+  valueClassName,
+  percentIconClassName,
+  onClick,
+  pressed = false,
 }) => {
   const [mobileTooltipOpen, setMobileTooltipOpen] = React.useState(false);
 
@@ -48,19 +60,59 @@ export const ContextUsageDisplay: React.FC<ContextUsageDisplayProps> = ({
     `Output limit: ${formatTokens(safeOutputLimit)}`,
   ];
 
-  const contextElement = (
+  const isInteractive = !isMobile && typeof onClick === 'function';
+
+  const contextContent = (
+    <>
+      {!isMobile && !hideIcon && <RiDonutChartLine className="h-4 w-4 flex-shrink-0" />}
+      <span className={cn('font-medium inline-flex items-center gap-1.5', valueClassName)}>
+        {showPercentIcon ? (
+          <>
+            <RiDonutChartFill
+              className={cn('h-3.5 w-3.5', percentIconClassName, getPercentageColor(percentage))}
+              aria-hidden="true"
+            />
+            <span className="text-foreground">{Math.min(percentage, 999).toFixed(1)}%</span>
+          </>
+        ) : (
+          <>
+            <span className={getPercentageColor(percentage)}>{Math.min(percentage, 999).toFixed(1)}</span>%
+          </>
+        )}
+      </span>
+    </>
+  );
+
+  const sharedClassName = cn(
+    'app-region-no-drag flex items-center gap-1.5 select-none',
+    size === 'compact' ? 'typography-micro' : 'typography-meta',
+    isInteractive
+      ? cn(
+        'rounded-md px-2 py-1.5 text-foreground transition-colors',
+        'hover:bg-interactive-hover',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary'
+      )
+      : 'text-muted-foreground/60',
+    className,
+  );
+
+  const contextElement = isInteractive ? (
+    <button
+      type="button"
+      className={sharedClassName}
+      aria-label="Context usage"
+      aria-pressed={pressed}
+      onClick={onClick}
+    >
+      {contextContent}
+    </button>
+  ) : (
     <div
-      className={cn(
-        'app-region-no-drag flex items-center gap-1.5 text-muted-foreground/60 select-none',
-        size === 'compact' ? 'typography-micro' : 'typography-meta',
-      )}
+      className={sharedClassName}
       aria-label="Context usage"
       onClick={isMobile ? () => setMobileTooltipOpen(true) : undefined}
     >
-      {!isMobile && !hideIcon && <RiDonutChartLine className="h-4 w-4 flex-shrink-0" />}
-      <span className={cn(getPercentageColor(percentage), 'font-medium')}>
-        {Math.min(percentage, 999).toFixed(1)}%
-      </span>
+      {contextContent}
     </div>
   );
 

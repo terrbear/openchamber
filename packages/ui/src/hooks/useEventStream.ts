@@ -488,7 +488,7 @@ export const useEventStream = () => {
     // Note: needs_attention logic is now handled by the server
     // Server maintains authoritative state based on view tracking and message events
 
-    if (prevType !== nextType) {
+    if (process.env.NODE_ENV === 'development' && prevType !== nextType) {
       try {
         console.info('[SESSION-STATUS]', {
           sessionId,
@@ -642,19 +642,56 @@ export const useEventStream = () => {
       case 'session.status':
         {
           const sessionId = readStringProp(props, ['sessionID', 'sessionId']);
-          const statusObj = (typeof props.status === 'object' && props.status !== null) ? props.status as Record<string, unknown> : null;
-          const statusType = typeof statusObj?.type === 'string' ? statusObj.type : null;
-          const statusInfo = statusObj ?? {};
+          const statusRaw = (props as { status?: unknown }).status;
+          const statusObj = (typeof statusRaw === 'object' && statusRaw !== null) ? statusRaw as Record<string, unknown> : null;
+          const statusType =
+            typeof statusRaw === 'string'
+              ? statusRaw
+              : typeof statusObj?.type === 'string'
+                ? statusObj.type
+                : typeof statusObj?.status === 'string'
+                  ? statusObj.status
+                  : typeof (props as { type?: unknown }).type === 'string'
+                    ? ((props as { type: string }).type)
+                    : typeof (props as { phase?: unknown }).phase === 'string'
+                      ? ((props as { phase: string }).phase)
+                      : typeof (props as { state?: unknown }).state === 'string'
+                        ? ((props as { state: string }).state)
+                        : null;
+          const statusInfo = statusObj ?? ({} as Record<string, unknown>);
+          const metadata = (props as { metadata?: unknown }).metadata;
+          const metadataObj = (typeof metadata === 'object' && metadata !== null) ? metadata as Record<string, unknown> : null;
 
           if (sessionId && statusType) {
             if (statusType === 'busy') {
-            updateSessionStatus(sessionId, { type: 'busy' }, 'sse:session.status');
+             updateSessionStatus(sessionId, { type: 'busy' }, 'sse:session.status');
             } else if (statusType === 'retry') {
               updateSessionStatus(sessionId, {
                 type: 'retry',
-                attempt: typeof statusInfo.attempt === 'number' ? statusInfo.attempt : undefined,
-                message: typeof statusInfo.message === 'string' ? statusInfo.message : undefined,
-                next: typeof statusInfo.next === 'number' ? statusInfo.next : undefined,
+                attempt:
+                  typeof statusInfo.attempt === 'number'
+                    ? statusInfo.attempt
+                    : typeof (props as { attempt?: unknown }).attempt === 'number'
+                      ? (props as { attempt: number }).attempt
+                      : typeof metadataObj?.attempt === 'number'
+                        ? metadataObj.attempt
+                      : undefined,
+                message:
+                  typeof statusInfo.message === 'string'
+                    ? statusInfo.message
+                    : typeof (props as { message?: unknown }).message === 'string'
+                      ? (props as { message: string }).message
+                      : typeof metadataObj?.message === 'string'
+                        ? metadataObj.message
+                      : undefined,
+                next:
+                  typeof statusInfo.next === 'number'
+                    ? statusInfo.next
+                    : typeof (props as { next?: unknown }).next === 'number'
+                      ? (props as { next: number }).next
+                      : typeof metadataObj?.next === 'number'
+                        ? metadataObj.next
+                      : undefined,
               }, 'sse:session.status');
 
               // Add 'stuck' notification to notification center (US-002)
@@ -817,7 +854,6 @@ export const useEventStream = () => {
           type: part.type || 'text',
         } as Part;
 
-        // Fallback: if we see assistant parts but session.status hasn't arrived yet, mark busy.
         if (roleInfo === 'assistant') {
           const partType = (messagePart as { type?: unknown }).type;
           const partTime = (messagePart as { time?: { end?: unknown } }).time;
@@ -859,6 +895,81 @@ export const useEventStream = () => {
 
         trackMessage(messageId, 'addStreamingPart_called');
         addStreamingPart(sessionId, messageId, messagePart, roleInfo);
+        break;
+      }
+
+      case 'message.part.delta': {
+        const sessionId = readStringProp(props, ['sessionID', 'sessionId']);
+        const messageId = readStringProp(props, ['messageID', 'messageId']);
+        const partId = readStringProp(props, ['partID', 'partId']);
+        const field = readStringProp(props, ['field']);
+        const delta = typeof props.delta === 'string' ? props.delta : null;
+
+        if (!sessionId || !messageId || !partId || !field || delta === null) {
+          if (streamDebugEnabled()) {
+            console.debug('[useEventStream] Skipping message.part.delta with missing payload', {
+              sessionID: props.sessionID,
+              messageID: props.messageID,
+              partID: props.partID,
+              field: props.field,
+            });
+          }
+          break;
+        }
+
+        lastMessageEventBySessionRef.current.set(sessionId, Date.now());
+        const pendingTimer = pendingMessageStallTimersRef.current.get(sessionId);
+        if (pendingTimer) {
+          clearTimeout(pendingTimer);
+          pendingMessageStallTimersRef.current.delete(sessionId);
+        }
+
+        const trimmedHeadMaxId = useSessionStore.getState().sessionMemoryState.get(sessionId)?.trimmedHeadMaxId;
+        if (trimmedHeadMaxId && !isIdNewer(messageId, trimmedHeadMaxId)) {
+          if (streamDebugEnabled()) {
+            console.debug('[useEventStream] Skipping message.part.delta for trimmed message', {
+              sessionId,
+              messageId,
+              trimmedHeadMaxId,
+            });
+          }
+          break;
+        }
+
+        const existingMessage = getMessageFromStore(sessionId, messageId);
+        const existingPart = existingMessage?.parts?.find((item) => item?.id === partId);
+        if (!existingPart) {
+          break;
+        }
+
+        const existingPartRecord = existingPart as Record<string, unknown>;
+        const existingFieldValue = existingPartRecord[field];
+        const updatedPart: Part = {
+          ...existingPart,
+          [field]: `${typeof existingFieldValue === 'string' ? existingFieldValue : ''}${delta}`,
+        } as Part;
+
+        let roleInfo = 'assistant';
+        const existingRole = (existingMessage?.info as Record<string, unknown> | undefined)?.role;
+        if (typeof existingRole === 'string') {
+          roleInfo = existingRole;
+        }
+
+        if (roleInfo === 'assistant' && delta.length > 0) {
+          const currentStatus = useSessionStore.getState().sessionStatus?.get(sessionId);
+          const recentlyConfirmedIdle =
+            currentStatus?.type === 'idle' &&
+            typeof currentStatus.confirmedAt === 'number' &&
+            Date.now() - currentStatus.confirmedAt < 1200;
+          if (!currentStatus || currentStatus.type === 'idle') {
+            if (!recentlyConfirmedIdle) {
+              updateSessionStatus(sessionId, { type: 'busy' }, 'sse:message.part.delta');
+            }
+          }
+        }
+
+        trackMessage(messageId, 'part_delta_received', { role: roleInfo, field });
+        addStreamingPart(sessionId, messageId, updatedPart, roleInfo);
         break;
       }
 

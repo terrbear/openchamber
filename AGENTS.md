@@ -24,6 +24,27 @@ Workspaces are `packages/*` (see `package.json`).
 - Desktop app (Tauri): `packages/desktop`
 - VS Code extension: `packages/vscode`
 
+## Documentation map
+Before changing any mapped module, read its module documentation first.
+
+### web
+Web runtime and server implementation for OpenChamber.
+
+#### lib
+Server-side integration modules used by API routes and runtime services.
+
+##### quota
+Quota provider registry, dispatch, and provider integrations for usage endpoints.
+- Module docs: `packages/web/server/lib/quota/DOCUMENTATION.md`
+
+##### git
+Git repository operations for the web server runtime.
+- Module docs: `packages/web/server/lib/git/DOCUMENTATION.md`
+
+##### github
+GitHub authentication, OAuth device flow, Octokit client factory, and repository URL parsing.
+- Module docs: `packages/web/server/lib/github/DOCUMENTATION.md`
+
 ## Build / dev commands (verified)
 All scripts are in `package.json`.
 - Validate: `bun run type-check`, `bun run lint`

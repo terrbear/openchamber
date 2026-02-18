@@ -4,6 +4,7 @@ import path from 'path';
 import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import http from 'http';
+import net from 'net';
 import { WebSocketServer } from 'ws';
 import { fileURLToPath } from 'url';
 import os from 'os';
@@ -21,7 +22,6 @@ import {
   pruneRebindTimestamps,
   readTerminalInputWsControlFrame,
 } from './lib/terminal-input-ws-protocol.js';
-import { createOpencodeServer } from '@opencode-ai/sdk/server';
 import webPush from 'web-push';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -281,7 +281,7 @@ const resolveWorkspacePathFromWorktrees = async (targetPath, baseDirectory) => {
   const resolvedBase = path.resolve(baseDirectory || os.homedir());
 
   try {
-    const { getWorktrees } = await import('./lib/git-service.js');
+    const { getWorktrees } = await import('./lib/git/index.js');
     const worktrees = await getWorktrees(resolvedBase);
 
     for (const worktree of worktrees) {
@@ -1330,6 +1330,8 @@ const sanitizeProjects = (input) => {
     const rawPath = typeof candidate.path === 'string' ? candidate.path.trim() : '';
     const normalizedPath = rawPath ? path.resolve(normalizeDirectoryPath(rawPath)) : '';
     const label = typeof candidate.label === 'string' ? candidate.label.trim() : '';
+    const icon = typeof candidate.icon === 'string' ? candidate.icon.trim() : '';
+    const color = typeof candidate.color === 'string' ? candidate.color.trim() : '';
     const addedAt = Number.isFinite(candidate.addedAt) ? Number(candidate.addedAt) : null;
     const lastOpenedAt = Number.isFinite(candidate.lastOpenedAt)
       ? Number(candidate.lastOpenedAt)
@@ -1346,6 +1348,8 @@ const sanitizeProjects = (input) => {
       id,
       path: normalizedPath,
       ...(label ? { label } : {}),
+      ...(icon ? { icon } : {}),
+      ...(color ? { color } : {}),
       ...(Number.isFinite(addedAt) && addedAt >= 0 ? { addedAt } : {}),
       ...(Number.isFinite(lastOpenedAt) && lastOpenedAt >= 0 ? { lastOpenedAt } : {}),
     };
@@ -2860,14 +2864,29 @@ const getHmrState = () => {
     globalThis[HMR_STATE_KEY] = {
       openCodeProcess: null,
       openCodePort: null,
-      openCodeWorkingDirectory: os.homedir(),
-      isShuttingDown: false,
-      signalsAttached: false,
-    };
+        openCodeWorkingDirectory: os.homedir(),
+        isShuttingDown: false,
+        signalsAttached: false,
+        userProvidedOpenCodePassword: undefined,
+        openCodeAuthPassword: null,
+        openCodeAuthSource: null,
+      };
   }
   return globalThis[HMR_STATE_KEY];
 };
 const hmrState = getHmrState();
+
+const normalizeOpenCodePassword = (value) => {
+  if (typeof value !== 'string') {
+    return '';
+  }
+  return value.trim();
+};
+
+if (typeof hmrState.userProvidedOpenCodePassword === 'undefined') {
+  const initialPassword = normalizeOpenCodePassword(process.env.OPENCODE_SERVER_PASSWORD);
+  hmrState.userProvidedOpenCodePassword = initialPassword || null;
+}
 
 // Non-HMR state (safe to reset on reload)
 let healthCheckInterval = null;
@@ -2888,6 +2907,18 @@ let exitOnShutdown = true;
 let uiAuthController = null;
 let cloudflareTunnelController = null;
 let terminalInputWsServer = null;
+const userProvidedOpenCodePassword =
+  typeof hmrState.userProvidedOpenCodePassword === 'string' && hmrState.userProvidedOpenCodePassword.length > 0
+    ? hmrState.userProvidedOpenCodePassword
+    : null;
+let openCodeAuthPassword =
+  typeof hmrState.openCodeAuthPassword === 'string' && hmrState.openCodeAuthPassword.length > 0
+    ? hmrState.openCodeAuthPassword
+    : userProvidedOpenCodePassword;
+let openCodeAuthSource =
+  typeof hmrState.openCodeAuthSource === 'string' && hmrState.openCodeAuthSource.length > 0
+    ? hmrState.openCodeAuthSource
+    : (userProvidedOpenCodePassword ? 'user-env' : null);
 
 // Sync helper - call after modifying any HMR state variable
 const syncToHmrState = () => {
@@ -2896,6 +2927,8 @@ const syncToHmrState = () => {
   hmrState.isShuttingDown = isShuttingDown;
   hmrState.signalsAttached = signalsAttached;
   hmrState.openCodeWorkingDirectory = openCodeWorkingDirectory;
+  hmrState.openCodeAuthPassword = openCodeAuthPassword;
+  hmrState.openCodeAuthSource = openCodeAuthSource;
 };
 
 // Sync helper - call to restore state from HMR (e.g., on module reload)
@@ -2905,6 +2938,14 @@ const syncFromHmrState = () => {
   isShuttingDown = hmrState.isShuttingDown;
   signalsAttached = hmrState.signalsAttached;
   openCodeWorkingDirectory = hmrState.openCodeWorkingDirectory;
+  openCodeAuthPassword =
+    typeof hmrState.openCodeAuthPassword === 'string' && hmrState.openCodeAuthPassword.length > 0
+      ? hmrState.openCodeAuthPassword
+      : userProvidedOpenCodePassword;
+  openCodeAuthSource =
+    typeof hmrState.openCodeAuthSource === 'string' && hmrState.openCodeAuthSource.length > 0
+      ? hmrState.openCodeAuthSource
+      : (userProvidedOpenCodePassword ? 'user-env' : null);
 };
 
 // Module-level variables that shadow HMR state
@@ -2984,18 +3025,13 @@ const ENV_SKIP_OPENCODE_START = process.env.OPENCODE_SKIP_START === 'true' ||
 const ENV_DESKTOP_NOTIFY = process.env.OPENCHAMBER_DESKTOP_NOTIFY === 'true';
 
 // OpenCode server authentication (Basic Auth with username "opencode")
-const ENV_OPENCODE_SERVER_PASSWORD = (() => {
-  const pwd = process.env.OPENCODE_SERVER_PASSWORD;
-  return typeof pwd === 'string' && pwd.length > 0 ? pwd : null;
-})();
 
 /**
  * Returns auth headers for OpenCode server requests if OPENCODE_SERVER_PASSWORD is set.
  * Uses Basic Auth with username "opencode" and the password from the env variable.
  */
 function getOpenCodeAuthHeaders() {
-  // Re-read from env each time in case it wasn't set at module load (HMR issue)
-  const password = ENV_OPENCODE_SERVER_PASSWORD || process.env.OPENCODE_SERVER_PASSWORD;
+  const password = normalizeOpenCodePassword(openCodeAuthPassword || process.env.OPENCODE_SERVER_PASSWORD || '');
   
   if (!password) {
     return {};
@@ -3003,6 +3039,60 @@ function getOpenCodeAuthHeaders() {
   
   const credentials = Buffer.from(`opencode:${password}`).toString('base64');
   return { Authorization: `Basic ${credentials}` };
+}
+
+function isOpenCodeConnectionSecure() {
+  return Object.prototype.hasOwnProperty.call(getOpenCodeAuthHeaders(), 'Authorization');
+}
+
+function generateSecureOpenCodePassword() {
+  return crypto
+    .randomBytes(32)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+function isValidOpenCodePassword(password) {
+  return typeof password === 'string' && password.trim().length > 0;
+}
+
+function setOpenCodeAuthState(password, source) {
+  const normalized = normalizeOpenCodePassword(password);
+  if (!isValidOpenCodePassword(normalized)) {
+    openCodeAuthPassword = null;
+    openCodeAuthSource = null;
+    delete process.env.OPENCODE_SERVER_PASSWORD;
+    syncToHmrState();
+    return null;
+  }
+
+  openCodeAuthPassword = normalized;
+  openCodeAuthSource = source;
+  process.env.OPENCODE_SERVER_PASSWORD = normalized;
+  syncToHmrState();
+  return normalized;
+}
+
+async function ensureLocalOpenCodeServerPassword({ rotateManaged = false } = {}) {
+  if (isValidOpenCodePassword(userProvidedOpenCodePassword)) {
+    return setOpenCodeAuthState(userProvidedOpenCodePassword, 'user-env');
+  }
+
+  if (rotateManaged) {
+    const rotatedPassword = setOpenCodeAuthState(generateSecureOpenCodePassword(), 'rotated');
+    console.log('Rotated secure password for managed local OpenCode instance');
+    return rotatedPassword;
+  }
+
+  if (isValidOpenCodePassword(openCodeAuthPassword)) {
+    return setOpenCodeAuthState(openCodeAuthPassword, openCodeAuthSource || 'generated');
+  }
+
+  const generatedPassword = setOpenCodeAuthState(generateSecureOpenCodePassword(), 'generated');
+  console.log('Generated secure password for managed local OpenCode instance');
+  return generatedPassword;
 }
 
 const ENV_CONFIGURED_API_PREFIX = normalizeApiPrefix(
@@ -3552,15 +3642,12 @@ const startGlobalEventWatcher = async () => {
 
             // Update authoritative session state from OpenCode events
             if (payload && payload.type === 'session.status') {
-              const status = payload.properties?.status;
-              const sessionId = payload.properties?.sessionID ?? payload.properties?.sessionId;
-              const eventId = payload.properties?.eventId || `sse-${Date.now()}`;
-
-              if (typeof sessionId === 'string' && status?.type) {
-                updateSessionState(sessionId, status.type, eventId, {
-                  attempt: status.attempt,
-                  message: status.message,
-                  next: status.next
+              const update = extractSessionStatusUpdate(payload);
+              if (update) {
+                updateSessionState(update.sessionId, update.type, update.eventId || `sse-${Date.now()}`, {
+                  attempt: update.attempt,
+                  message: update.message,
+                  next: update.next,
                 });
               }
             }
@@ -3812,6 +3899,84 @@ function parseSseDataPayload(block) {
   }
 }
 
+function extractSessionStatusUpdate(payload) {
+  if (!payload || typeof payload !== 'object' || payload.type !== 'session.status') {
+    return null;
+  }
+
+  const props = payload.properties ?? {};
+  const status =
+    props.status ??
+    props.session?.status ??
+    props.sessionInfo?.status;
+  const metadata =
+    props.metadata ??
+    (typeof status === 'object' && status !== null ? status.metadata : null);
+
+  const sessionId = props.sessionID ?? props.sessionId;
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    return null;
+  }
+
+  const statusType =
+    typeof status === 'string'
+      ? status
+      : typeof status?.type === 'string'
+        ? status.type
+        : typeof status?.status === 'string'
+          ? status.status
+          : typeof props.type === 'string'
+            ? props.type
+            : typeof props.phase === 'string'
+              ? props.phase
+              : typeof props.state === 'string'
+                ? props.state
+                : null;
+
+  const normalizedType =
+    statusType === 'idle' || statusType === 'busy' || statusType === 'retry'
+      ? statusType
+      : null;
+
+  if (!normalizedType) {
+    return null;
+  }
+
+  const attempt =
+    typeof status?.attempt === 'number'
+      ? status.attempt
+      : typeof props.attempt === 'number'
+        ? props.attempt
+        : typeof metadata?.attempt === 'number'
+          ? metadata.attempt
+          : undefined;
+  const message =
+    typeof status?.message === 'string'
+      ? status.message
+      : typeof props.message === 'string'
+        ? props.message
+        : typeof metadata?.message === 'string'
+          ? metadata.message
+          : undefined;
+  const next =
+    typeof status?.next === 'number'
+      ? status.next
+      : typeof props.next === 'number'
+        ? props.next
+        : typeof metadata?.next === 'number'
+          ? metadata.next
+          : undefined;
+
+  return {
+    sessionId,
+    type: normalizedType,
+    attempt,
+    message,
+    next,
+    eventId: typeof props.eventId === 'string' ? props.eventId : null,
+  };
+}
+
 function emitDesktopNotification(payload) {
   if (!ENV_DESKTOP_NOTIFY) {
     return;
@@ -4027,13 +4192,10 @@ function deriveSessionActivityTransitions(payload) {
   }
 
   if (payload.type === 'session.status') {
-    const status = payload.properties?.status;
-    const sessionId = payload.properties?.sessionID ?? payload.properties?.sessionId;
-    const statusType = status?.type;
-
-    if (typeof sessionId === 'string' && sessionId.length > 0 && typeof statusType === 'string') {
-      const phase = statusType === 'busy' || statusType === 'retry' ? 'busy' : 'idle';
-      return [{ sessionId, phase }];
+    const update = extractSessionStatusUpdate(payload);
+    if (update) {
+      const phase = update.type === 'busy' || update.type === 'retry' ? 'busy' : 'idle';
+      return [{ sessionId: update.sessionId, phase }];
     }
   }
 
@@ -4047,7 +4209,7 @@ function deriveSessionActivityTransitions(payload) {
     }
   }
 
-  if (payload.type === 'message.part.updated') {
+  if (payload.type === 'message.part.updated' || payload.type === 'message.part.delta') {
     const info = payload.properties?.info;
     const sessionId = info?.sessionID ?? info?.sessionId ?? payload.properties?.sessionID ?? payload.properties?.sessionId;
     const role = info?.role;
@@ -4641,7 +4803,6 @@ function parseArgs(argv = process.argv.slice(2)) {
 function killProcessOnPort(port) {
   if (!port) return;
   try {
-    // SDK's proc.kill() only kills the Node wrapper, not the actual opencode binary.
     // Kill any process listening on our port to clean up orphaned children.
     const result = spawnSync('lsof', ['-ti', `:${port}`], { encoding: 'utf8', timeout: 5000 });
     const output = result.stdout || '';
@@ -4661,27 +4822,143 @@ function killProcessOnPort(port) {
   }
 }
 
+async function createManagedOpenCodeServerProcess({
+  hostname,
+  port,
+  timeout,
+  cwd,
+  env,
+}) {
+  const binary = (process.env.OPENCODE_BINARY || 'opencode').trim() || 'opencode';
+  const args = ['serve', '--hostname', hostname, '--port', String(port)];
+  const child = spawn(binary, args, {
+    cwd,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  const url = await new Promise((resolve, reject) => {
+    let output = '';
+    let done = false;
+    const finish = (handler, value) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      child.stdout?.off('data', onStdout);
+      child.stderr?.off('data', onStderr);
+      child.off('exit', onExit);
+      child.off('error', onError);
+      handler(value);
+    };
+
+    const onStdout = (chunk) => {
+      output += chunk.toString();
+      const lines = output.split('\n');
+      for (const line of lines) {
+        if (!line.startsWith('opencode server listening')) continue;
+        const match = line.match(/on\s+(https?:\/\/[^\s]+)/);
+        if (!match) {
+          finish(reject, new Error(`Failed to parse server url from output: ${line}`));
+          return;
+        }
+        finish(resolve, match[1]);
+        return;
+      }
+    };
+
+    const onStderr = (chunk) => {
+      output += chunk.toString();
+    };
+
+    const onExit = (code) => {
+      finish(reject, new Error(`OpenCode exited with code ${code}. Output: ${output}`));
+    };
+
+    const onError = (error) => {
+      finish(reject, error);
+    };
+
+    const timer = setTimeout(() => {
+      finish(reject, new Error(`Timeout waiting for OpenCode to start after ${timeout}ms`));
+    }, timeout);
+
+    child.stdout?.on('data', onStdout);
+    child.stderr?.on('data', onStderr);
+    child.on('exit', onExit);
+    child.on('error', onError);
+  });
+
+  return {
+    url,
+    close() {
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // ignore
+      }
+    },
+  };
+}
+
+async function resolveManagedOpenCodePort(requestedPort) {
+  if (typeof requestedPort === 'number' && Number.isFinite(requestedPort) && requestedPort > 0) {
+    return requestedPort;
+  }
+
+  return await new Promise((resolve, reject) => {
+    const server = net.createServer();
+    const cleanup = () => {
+      server.removeAllListeners('error');
+      server.removeAllListeners('listening');
+    };
+
+    server.once('error', (error) => {
+      cleanup();
+      reject(error);
+    });
+
+    server.once('listening', () => {
+      const address = server.address();
+      const port = address && typeof address === 'object' ? address.port : 0;
+      server.close(() => {
+        cleanup();
+        if (port > 0) {
+          resolve(port);
+          return;
+        }
+        reject(new Error('Failed to allocate OpenCode port'));
+      });
+    });
+
+    server.listen(0, '127.0.0.1');
+  });
+}
+
 async function startOpenCode() {
   const desiredPort = ENV_CONFIGURED_OPENCODE_PORT ?? 0;
+  const spawnPort = await resolveManagedOpenCodePort(desiredPort);
   console.log(
     desiredPort > 0
       ? `Starting OpenCode on requested port ${desiredPort}...`
-      : 'Starting OpenCode with dynamic port assignment...'
+      : `Starting OpenCode on allocated port ${spawnPort}...`
   );
-  // Note: SDK starts in current process CWD. openCodeWorkingDirectory is tracked but not used for spawn in SDK.
 
   await applyOpencodeBinaryFromSettings();
   ensureOpencodeCliEnv();
+  const openCodePassword = await ensureLocalOpenCodeServerPassword({
+    rotateManaged: true,
+  });
 
   try {
-    const serverInstance = await createOpencodeServer({
+    const serverInstance = await createManagedOpenCodeServerProcess({
       hostname: '127.0.0.1',
-      port: desiredPort,
+      port: spawnPort,
       timeout: 30000,
+      cwd: openCodeWorkingDirectory,
       env: {
         ...process.env,
-        // Pass minimal config to avoid pollution, but inherit PATH etc
-      }
+        OPENCODE_SERVER_PASSWORD: openCodePassword,
+      },
     });
 
     if (!serverInstance || !serverInstance.url) {
@@ -5475,6 +5752,8 @@ async function main(options = {}) {
       timestamp: new Date().toISOString(),
       openCodePort: openCodePort,
       openCodeRunning: Boolean(openCodePort && isOpenCodeReady && !isRestartingOpenCode),
+      openCodeSecureConnection: isOpenCodeConnectionSecure(),
+      openCodeAuthSource: openCodeAuthSource || null,
       openCodeApiPrefix: '',
       openCodeApiPrefixDetected: true,
       isOpenCodeReady,
@@ -5484,6 +5763,13 @@ async function main(options = {}) {
       opencodeShimInterpreter: resolvedOpencodeBinary ? opencodeShimInterpreter(resolvedOpencodeBinary) : null,
       nodeBinaryResolved: resolvedNodeBinary || null,
       bunBinaryResolved: resolvedBunBinary || null,
+    });
+  });
+
+  app.post('/api/system/shutdown', (req, res) => {
+    res.json({ ok: true });
+    gracefulShutdown({ exitProcess: false }).catch((error) => {
+      console.error('Shutdown request failed:', error?.message || error);
     });
   });
 
@@ -6447,6 +6733,20 @@ async function main(options = {}) {
           // Silent failure - transcript capture should not disrupt the stream
         });
       }
+
+      // Keep server-authoritative session state fresh even if the
+      // background watcher is disconnected.
+      if (payload && payload.type === 'session.status') {
+        const update = extractSessionStatusUpdate(payload);
+        if (update) {
+          updateSessionState(update.sessionId, update.type, update.eventId || `proxy-${Date.now()}`, {
+            attempt: update.attempt,
+            message: update.message,
+            next: update.next,
+          });
+        }
+      }
+
       const transitions = deriveSessionActivityTransitions(payload);
       if (transitions && transitions.length > 0) {
         for (const activity of transitions) {
@@ -6582,6 +6882,18 @@ async function main(options = {}) {
           // Silent failure - transcript capture should not disrupt the stream
         });
       }
+
+      if (payload && payload.type === 'session.status') {
+        const update = extractSessionStatusUpdate(payload);
+        if (update) {
+          updateSessionState(update.sessionId, update.type, update.eventId || `proxy-${Date.now()}`, {
+            attempt: update.attempt,
+            message: update.message,
+            next: update.next,
+          });
+        }
+      }
+
       const transitions = deriveSessionActivityTransitions(payload);
       if (transitions && transitions.length > 0) {
         for (const activity of transitions) {
@@ -6976,6 +7288,133 @@ async function main(options = {}) {
     SKILL_DIR,
   } = await import('./lib/opencode-config.js');
 
+  const findWorktreeRootForSkills = (workingDirectory) => {
+    if (!workingDirectory) return null;
+    let current = path.resolve(workingDirectory);
+    while (true) {
+      if (fs.existsSync(path.join(current, '.git'))) {
+        return current;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) {
+        return null;
+      }
+      current = parent;
+    }
+  };
+
+  const getSkillProjectAncestors = (workingDirectory) => {
+    if (!workingDirectory) return [];
+    const result = [];
+    let current = path.resolve(workingDirectory);
+    const stop = findWorktreeRootForSkills(workingDirectory) || current;
+    while (true) {
+      result.push(current);
+      if (current === stop) break;
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+    return result;
+  };
+
+  const isPathInside = (candidatePath, parentPath) => {
+    if (!candidatePath || !parentPath) return false;
+    const normalizedCandidate = path.resolve(candidatePath);
+    const normalizedParent = path.resolve(parentPath);
+    return normalizedCandidate === normalizedParent || normalizedCandidate.startsWith(`${normalizedParent}${path.sep}`);
+  };
+
+  const inferSkillScopeAndSourceFromPath = (skillPath, workingDirectory) => {
+    const resolvedPath = typeof skillPath === 'string' ? path.resolve(skillPath) : '';
+    const home = os.homedir();
+    const source = resolvedPath.includes(`${path.sep}.agents${path.sep}skills${path.sep}`)
+      ? 'agents'
+      : resolvedPath.includes(`${path.sep}.claude${path.sep}skills${path.sep}`)
+        ? 'claude'
+        : 'opencode';
+
+    const projectAncestors = getSkillProjectAncestors(workingDirectory);
+    const isProjectScoped = projectAncestors.some((ancestor) => {
+      const candidates = [
+        path.join(ancestor, '.opencode'),
+        path.join(ancestor, '.claude', 'skills'),
+        path.join(ancestor, '.agents', 'skills'),
+      ];
+      return candidates.some((candidate) => isPathInside(resolvedPath, candidate));
+    });
+
+    if (isProjectScoped) {
+      return { scope: SKILL_SCOPE.PROJECT, source };
+    }
+
+    const userRoots = [
+      path.join(home, '.config', 'opencode'),
+      path.join(home, '.opencode'),
+      path.join(home, '.claude', 'skills'),
+      path.join(home, '.agents', 'skills'),
+      process.env.OPENCODE_CONFIG_DIR ? path.resolve(process.env.OPENCODE_CONFIG_DIR) : null,
+    ].filter(Boolean);
+
+    if (userRoots.some((root) => isPathInside(resolvedPath, root))) {
+      return { scope: SKILL_SCOPE.USER, source };
+    }
+
+    return { scope: SKILL_SCOPE.USER, source };
+  };
+
+  const fetchOpenCodeDiscoveredSkills = async (workingDirectory) => {
+    if (!openCodePort) {
+      return null;
+    }
+
+    try {
+      const url = new URL(buildOpenCodeUrl('/skill', ''));
+      if (workingDirectory) {
+        url.searchParams.set('directory', workingDirectory);
+      }
+
+      const response = await fetch(url.toString(), {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          ...getOpenCodeAuthHeaders(),
+        },
+        signal: AbortSignal.timeout(8_000),
+      });
+
+      if (!response.ok) {
+        return null;
+      }
+
+      const payload = await response.json();
+      if (!Array.isArray(payload)) {
+        return null;
+      }
+
+      return payload
+        .map((item) => {
+          const name = typeof item?.name === 'string' ? item.name.trim() : '';
+          const location = typeof item?.location === 'string' ? item.location : '';
+          const description = typeof item?.description === 'string' ? item.description : '';
+          if (!name || !location) {
+            return null;
+          }
+          const inferred = inferSkillScopeAndSourceFromPath(location, workingDirectory);
+          return {
+            name,
+            path: location,
+            scope: inferred.scope,
+            source: inferred.source,
+            description,
+          };
+        })
+        .filter(Boolean);
+    } catch {
+      return null;
+    }
+  };
+
   // List all discovered skills
   app.get('/api/config/skills', async (req, res) => {
     try {
@@ -6983,11 +7422,11 @@ async function main(options = {}) {
       if (!directory) {
         return res.status(400).json({ error });
       }
-      const skills = discoverSkills(directory);
+      const skills = (await fetchOpenCodeDiscoveredSkills(directory)) || discoverSkills(directory);
 
       // Enrich with full sources info
       const enrichedSkills = skills.map(skill => {
-        const sources = getSkillSources(skill.name, directory);
+        const sources = getSkillSources(skill.name, directory, skill);
         return {
           ...skill,
           sources
@@ -7009,7 +7448,7 @@ async function main(options = {}) {
   const { scanSkillsRepository } = await import('./lib/skills-catalog/scan.js');
   const { installSkillsFromRepository } = await import('./lib/skills-catalog/install.js');
   const { scanClawdHubPage, installSkillsFromClawdHub, isClawdHubSource } = await import('./lib/skills-catalog/clawdhub/index.js');
-  const { getProfiles, getProfile } = await import('./lib/git-identity-storage.js');
+  const { getProfiles, getProfile } = await import('./lib/git/index.js');
 
   const listGitIdentitiesForResponse = () => {
     try {
@@ -7101,7 +7540,9 @@ async function main(options = {}) {
         return res.status(404).json({ ok: false, error: { kind: 'invalidSource', message: 'Unknown source' } });
       }
 
-      const discovered = directory ? discoverSkills(directory) : [];
+      const discovered = directory
+        ? ((await fetchOpenCodeDiscoveredSkills(directory)) || discoverSkills(directory))
+        : [];
       const installedByName = new Map(discovered.map((s) => [s.name, s]));
 
       if (src.sourceType === 'clawdhub' || isClawdHubSource(src.source)) {
@@ -7116,7 +7557,7 @@ async function main(options = {}) {
             ...item,
             sourceId: src.id,
             installed: installed
-              ? { isInstalled: true, scope: installed.scope }
+              ? { isInstalled: true, scope: installed.scope, source: installed.source }
               : { isInstalled: false },
           };
         });
@@ -7160,7 +7601,7 @@ async function main(options = {}) {
           ...item,
           gitIdentityId: src.gitIdentityId,
           installed: installed
-            ? { isInstalled: true, scope: installed.scope }
+            ? { isInstalled: true, scope: installed.scope, source: installed.source }
             : { isInstalled: false },
         };
       });
@@ -7214,6 +7655,7 @@ async function main(options = {}) {
         subpath,
         gitIdentityId,
         scope,
+        targetSource,
         selections,
         conflictPolicy,
         conflictDecisions,
@@ -7235,6 +7677,7 @@ async function main(options = {}) {
       if (isClawdHubSource(source)) {
         const result = await installSkillsFromClawdHub({
           scope,
+          targetSource,
           workingDirectory,
           userSkillDir: SKILL_DIR,
           selections,
@@ -7260,6 +7703,7 @@ async function main(options = {}) {
         subpath,
         identity,
         scope,
+        targetSource,
         workingDirectory,
         userSkillDir: SKILL_DIR,
         selections,
@@ -7300,7 +7744,9 @@ async function main(options = {}) {
       if (!directory) {
         return res.status(400).json({ error });
       }
-      const sources = getSkillSources(skillName, directory);
+      const discoveredSkill = ((await fetchOpenCodeDiscoveredSkills(directory)) || [])
+        .find((skill) => skill.name === skillName) || null;
+      const sources = getSkillSources(skillName, directory, discoveredSkill);
 
       res.json({
         name: skillName,
@@ -7325,7 +7771,9 @@ async function main(options = {}) {
         return res.status(400).json({ error });
       }
 
-      const sources = getSkillSources(skillName, directory);
+        const discoveredSkill = ((await fetchOpenCodeDiscoveredSkills(directory)) || [])
+          .find((skill) => skill.name === skillName) || null;
+        const sources = getSkillSources(skillName, directory, discoveredSkill);
       if (!sources.md.exists || !sources.md.dir) {
         return res.status(404).json({ error: 'Skill not found' });
       }
@@ -7346,7 +7794,7 @@ async function main(options = {}) {
   app.post('/api/config/skills/:name', async (req, res) => {
     try {
       const skillName = req.params.name;
-      const { scope, ...config } = req.body;
+      const { scope, source: skillSource, ...config } = req.body;
       const { directory, error } = await resolveProjectDirectory(req);
       if (!directory) {
         return res.status(400).json({ error });
@@ -7355,7 +7803,7 @@ async function main(options = {}) {
       console.log('[Server] Creating skill:', skillName);
       console.log('[Server] Scope:', scope, 'Working directory:', directory);
 
-      createSkill(skillName, config, directory, scope);
+      createSkill(skillName, { ...config, source: skillSource }, directory, scope);
       // Skills are just files - OpenCode loads them on-demand, no restart needed
 
       res.json({
@@ -7407,7 +7855,9 @@ async function main(options = {}) {
         return res.status(400).json({ error });
       }
 
-      const sources = getSkillSources(skillName, directory);
+      const discoveredSkill = ((await fetchOpenCodeDiscoveredSkills(directory)) || [])
+        .find((skill) => skill.name === skillName) || null;
+      const sources = getSkillSources(skillName, directory, discoveredSkill);
       if (!sources.md.exists || !sources.md.dir) {
         return res.status(404).json({ error: 'Skill not found' });
       }
@@ -7434,7 +7884,9 @@ async function main(options = {}) {
         return res.status(400).json({ error });
       }
 
-      const sources = getSkillSources(skillName, directory);
+      const discoveredSkill = ((await fetchOpenCodeDiscoveredSkills(directory)) || [])
+        .find((skill) => skill.name === skillName) || null;
+      const sources = getSkillSources(skillName, directory, discoveredSkill);
       if (!sources.md.exists || !sources.md.dir) {
         return res.status(404).json({ error: 'Skill not found' });
       }
@@ -7506,24 +7958,19 @@ async function main(options = {}) {
   let quotaProviders = null;
   const getQuotaProviders = async () => {
     if (!quotaProviders) {
-      quotaProviders = await import('./lib/quota-providers.js');
+      quotaProviders = await import('./lib/quota/index.js');
     }
     return quotaProviders;
   };
 
   // ================= GitHub OAuth (Device Flow) =================
 
-  // Note: scopes may be overridden via OPENCHAMBER_GITHUB_SCOPES or settings.json (see github-auth.js).
+  // Note: scopes may be overridden via OPENCHAMBER_GITHUB_SCOPES or settings.json (see lib/github/auth.js).
 
   let githubLibraries = null;
   const getGitHubLibraries = async () => {
     if (!githubLibraries) {
-      const [auth, device, octokit] = await Promise.all([
-        import('./lib/github-auth.js'),
-        import('./lib/github-device-flow.js'),
-        import('./lib/github-octokit.js'),
-      ]);
-      githubLibraries = { ...auth, ...device, ...octokit };
+      githubLibraries = await import('./lib/github/index.js');
     }
     return githubLibraries;
   };
@@ -7777,7 +8224,7 @@ async function main(options = {}) {
         return res.json({ connected: false });
       }
 
-      const { resolveGitHubRepoFromDirectory } = await import('./lib/github-repo.js');
+      const { resolveGitHubRepoFromDirectory } = await import('./lib/github/index.js');
       const { repo } = await resolveGitHubRepoFromDirectory(directory, remote);
       if (!repo) {
         return res.json({ connected: true, repo: null, branch, pr: null, checks: null, canMerge: false });
@@ -7788,7 +8235,7 @@ async function main(options = {}) {
        let headOwnerForSearch = null;
        
        // First, check the branch's tracking info to see which remote it's on
-       const { getStatus } = await import('./lib/git-service.js');
+       const { getStatus } = await import('./lib/git/index.js');
        const status = await getStatus(directory).catch(() => null);
        if (status?.tracking) {
          const trackingRemote = status.tracking.split('/')[0];
@@ -8003,7 +8450,7 @@ async function main(options = {}) {
         return res.status(401).json({ error: 'GitHub not connected' });
       }
 
-      const { resolveGitHubRepoFromDirectory } = await import('./lib/github-repo.js');
+      const { resolveGitHubRepoFromDirectory } = await import('./lib/github/index.js');
       const { repo } = await resolveGitHubRepoFromDirectory(directory, remote);
       if (!repo) {
         return res.status(400).json({ error: 'Unable to resolve GitHub repo from git remote' });
@@ -8041,7 +8488,7 @@ async function main(options = {}) {
       // Determine the source remote for the head branch
       // Priority: 1) explicit headRemote, 2) tracking branch remote, 3) 'origin' if targeting non-origin
       let sourceRemote = headRemote;
-      const { getStatus, getRemotes } = await import('./lib/git-service.js');
+      const { getStatus, getRemotes } = await import('./lib/git/index.js');
       
       // If no explicit headRemote, check the branch's tracking info
       if (!sourceRemote) {
@@ -8180,7 +8627,7 @@ async function main(options = {}) {
         return res.status(401).json({ error: 'GitHub not connected' });
       }
 
-      const { resolveGitHubRepoFromDirectory } = await import('./lib/github-repo.js');
+      const { resolveGitHubRepoFromDirectory } = await import('./lib/github/index.js');
       const { repo } = await resolveGitHubRepoFromDirectory(directory);
       if (!repo) {
         return res.status(400).json({ error: 'Unable to resolve GitHub repo from git remote' });
@@ -8255,7 +8702,7 @@ async function main(options = {}) {
         return res.status(401).json({ error: 'GitHub not connected' });
       }
 
-      const { resolveGitHubRepoFromDirectory } = await import('./lib/github-repo.js');
+      const { resolveGitHubRepoFromDirectory } = await import('./lib/github/index.js');
       const { repo } = await resolveGitHubRepoFromDirectory(directory);
       if (!repo) {
         return res.status(400).json({ error: 'Unable to resolve GitHub repo from git remote' });
@@ -8298,7 +8745,7 @@ async function main(options = {}) {
         return res.status(401).json({ error: 'GitHub not connected' });
       }
 
-      const { resolveGitHubRepoFromDirectory } = await import('./lib/github-repo.js');
+      const { resolveGitHubRepoFromDirectory } = await import('./lib/github/index.js');
       const { repo } = await resolveGitHubRepoFromDirectory(directory);
       if (!repo) {
         return res.status(400).json({ error: 'Unable to resolve GitHub repo from git remote' });
@@ -8349,7 +8796,7 @@ async function main(options = {}) {
         return res.json({ connected: false });
       }
 
-      const { resolveGitHubRepoFromDirectory } = await import('./lib/github-repo.js');
+      const { resolveGitHubRepoFromDirectory } = await import('./lib/github/index.js');
       const { repo } = await resolveGitHubRepoFromDirectory(directory);
       if (!repo) {
         return res.json({ connected: true, repo: null, issues: [] });
@@ -8405,7 +8852,7 @@ async function main(options = {}) {
         return res.json({ connected: false });
       }
 
-      const { resolveGitHubRepoFromDirectory } = await import('./lib/github-repo.js');
+      const { resolveGitHubRepoFromDirectory } = await import('./lib/github/index.js');
       const { repo } = await resolveGitHubRepoFromDirectory(directory);
       if (!repo) {
         return res.json({ connected: true, repo: null, issue: null });
@@ -8466,7 +8913,7 @@ async function main(options = {}) {
         return res.json({ connected: false });
       }
 
-      const { resolveGitHubRepoFromDirectory } = await import('./lib/github-repo.js');
+      const { resolveGitHubRepoFromDirectory } = await import('./lib/github/index.js');
       const { repo } = await resolveGitHubRepoFromDirectory(directory);
       if (!repo) {
         return res.json({ connected: true, repo: null, comments: [] });
@@ -8511,7 +8958,7 @@ async function main(options = {}) {
         return res.json({ connected: false });
       }
 
-      const { resolveGitHubRepoFromDirectory } = await import('./lib/github-repo.js');
+      const { resolveGitHubRepoFromDirectory } = await import('./lib/github/index.js');
       const { repo } = await resolveGitHubRepoFromDirectory(directory);
       if (!repo) {
         return res.json({ connected: true, repo: null, prs: [] });
@@ -8586,7 +9033,7 @@ async function main(options = {}) {
         return res.json({ connected: false });
       }
 
-      const { resolveGitHubRepoFromDirectory } = await import('./lib/github-repo.js');
+      const { resolveGitHubRepoFromDirectory } = await import('./lib/github/index.js');
       const { repo } = await resolveGitHubRepoFromDirectory(directory);
       if (!repo) {
         return res.json({ connected: true, repo: null, pr: null });
@@ -9041,11 +9488,7 @@ async function main(options = {}) {
   let gitLibraries = null;
   const getGitLibraries = async () => {
     if (!gitLibraries) {
-      const [storage, service] = await Promise.all([
-        import('./lib/git-identity-storage.js'),
-        import('./lib/git-service.js')
-      ]);
-      gitLibraries = { ...storage, ...service };
+      gitLibraries = await import('./lib/git/index.js');
     }
     return gitLibraries;
   };
@@ -9110,7 +9553,7 @@ async function main(options = {}) {
 
   app.get('/api/git/discover-credentials', async (req, res) => {
     try {
-      const { discoverGitCredentials } = await import('./lib/git-credentials.js');
+      const { discoverGitCredentials } = await import('./lib/git/index.js');
       const credentials = discoverGitCredentials();
       res.json(credentials);
     } catch (error) {
@@ -9298,6 +9741,7 @@ async function main(options = {}) {
         modified: result.modified,
         path: result.path,
         truncated: result.truncated || false,
+        isBinary: Boolean(result.isBinary),
       });
     } catch (error) {
       console.error('Failed to get git file diff:', error);
@@ -11272,7 +11716,6 @@ Context:
     console.log(`Force killed ${killedCount} terminal session(s)`);
     res.json({ success: true, killedCount });
   });
-
 
   try {
     syncFromHmrState();

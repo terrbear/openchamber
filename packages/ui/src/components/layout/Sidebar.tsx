@@ -6,7 +6,7 @@ import { useUIStore } from '@/stores/useUIStore';
 import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
 
 export const SIDEBAR_CONTENT_WIDTH = 264;
-const SIDEBAR_MIN_WIDTH = 200;
+const SIDEBAR_MIN_WIDTH = 300;
 const SIDEBAR_MAX_WIDTH = 500;
 
 interface SidebarProps {

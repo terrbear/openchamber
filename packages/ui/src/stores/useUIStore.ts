@@ -5,6 +5,17 @@ import { getSafeStorage } from './utils/safeStorage';
 import { SEMANTIC_TYPOGRAPHY, getTypographyVariable, type SemanticTypographyKey } from '@/lib/typography';
 
 export type MainTab = 'chat' | 'plan' | 'git' | 'diff' | 'terminal' | 'files';
+export type RightSidebarTab = 'git' | 'files';
+export type ContextPanelMode = 'diff' | 'file' | 'context';
+
+type ContextPanelDirectoryState = {
+  isOpen: boolean;
+  expanded: boolean;
+  mode: ContextPanelMode | null;
+  targetPath: string | null;
+  width: number;
+  touchedAt: number;
+};
 
 export type MainTabGuard = (nextTab: MainTab) => boolean;
 export type EventStreamStatus =
@@ -51,6 +62,71 @@ const isLegacyDefaultTemplates = (value: unknown): boolean => {
   );
 };
 
+const CONTEXT_PANEL_DEFAULT_WIDTH = 600;
+const CONTEXT_PANEL_MIN_WIDTH = 360;
+const CONTEXT_PANEL_MAX_WIDTH = 1400;
+const LEFT_SIDEBAR_MIN_WIDTH = 300;
+const RIGHT_SIDEBAR_MIN_WIDTH = 400;
+
+const normalizeDirectoryPath = (value: string): string => {
+  if (!value) return '';
+
+  const raw = value.replace(/\\/g, '/');
+  const hadUncPrefix = raw.startsWith('//');
+  let normalized = raw.replace(/\/+$/g, '');
+  normalized = normalized.replace(/\/+/g, '/');
+
+  if (hadUncPrefix && !normalized.startsWith('//')) {
+    normalized = `/${normalized}`;
+  }
+
+  if (normalized === '') {
+    return raw.startsWith('/') ? '/' : '';
+  }
+
+  return normalized;
+};
+
+const clampContextPanelWidth = (width: number): number => {
+  if (!Number.isFinite(width)) {
+    return CONTEXT_PANEL_DEFAULT_WIDTH;
+  }
+
+  return Math.min(CONTEXT_PANEL_MAX_WIDTH, Math.max(CONTEXT_PANEL_MIN_WIDTH, Math.round(width)));
+};
+
+const touchContextPanelState = (prev?: ContextPanelDirectoryState): ContextPanelDirectoryState => {
+  if (prev) {
+    return { ...prev, touchedAt: Date.now() };
+  }
+
+  return {
+    isOpen: false,
+    expanded: false,
+    mode: null,
+    targetPath: null,
+    width: CONTEXT_PANEL_DEFAULT_WIDTH,
+    touchedAt: Date.now(),
+  };
+};
+
+const clampContextPanelRoots = (
+  byDirectory: Record<string, ContextPanelDirectoryState>,
+  maxRoots: number
+): Record<string, ContextPanelDirectoryState> => {
+  const entries = Object.entries(byDirectory);
+  if (entries.length <= maxRoots) {
+    return byDirectory;
+  }
+
+  entries.sort((a, b) => (b[1]?.touchedAt ?? 0) - (a[1]?.touchedAt ?? 0));
+  const next: Record<string, ContextPanelDirectoryState> = {};
+  for (const [directory, state] of entries.slice(0, maxRoots)) {
+    next[directory] = state;
+  }
+  return next;
+};
+
 interface UIStore {
 
   theme: 'light' | 'dark' | 'system';
@@ -62,7 +138,10 @@ interface UIStore {
   isRightSidebarOpen: boolean;
   rightSidebarWidth: number;
   hasManuallyResizedRightSidebar: boolean;
+  rightSidebarTab: RightSidebarTab;
+  contextPanelByDirectory: Record<string, ContextPanelDirectoryState>;
   isBottomTerminalOpen: boolean;
+  isBottomTerminalExpanded: boolean;
   bottomTerminalHeight: number;
   hasManuallyResizedBottomTerminal: boolean;
   isSessionSwitcherOpen: boolean;
@@ -143,8 +222,16 @@ interface UIStore {
   toggleRightSidebar: () => void;
   setRightSidebarOpen: (open: boolean) => void;
   setRightSidebarWidth: (width: number) => void;
+  setRightSidebarTab: (tab: RightSidebarTab) => void;
+  openContextDiff: (directory: string, filePath: string) => void;
+  openContextFile: (directory: string, filePath: string) => void;
+  openContextOverview: (directory: string) => void;
+  closeContextPanel: (directory: string) => void;
+  toggleContextPanelExpanded: (directory: string) => void;
+  setContextPanelWidth: (directory: string, width: number) => void;
   toggleBottomTerminal: () => void;
   setBottomTerminalOpen: (open: boolean) => void;
+  setBottomTerminalExpanded: (expanded: boolean) => void;
   setBottomTerminalHeight: (height: number) => void;
   setSessionSwitcherOpen: (open: boolean) => void;
   setActiveMainTab: (tab: MainTab) => void;
@@ -224,12 +311,15 @@ export const useUIStore = create<UIStore>()(
         isMultiRunLauncherOpen: false,
         multiRunLauncherPrefillPrompt: '',
         isSidebarOpen: true,
-        sidebarWidth: 264,
+        sidebarWidth: LEFT_SIDEBAR_MIN_WIDTH,
         hasManuallyResizedLeftSidebar: false,
         isRightSidebarOpen: false,
-        rightSidebarWidth: 420,
+        rightSidebarWidth: RIGHT_SIDEBAR_MIN_WIDTH,
         hasManuallyResizedRightSidebar: false,
+        rightSidebarTab: 'git',
+        contextPanelByDirectory: {},
         isBottomTerminalOpen: false,
+        isBottomTerminalExpanded: false,
         bottomTerminalHeight: 300,
         hasManuallyResizedBottomTerminal: false,
         isSessionSwitcherOpen: false,
@@ -307,12 +397,10 @@ export const useUIStore = create<UIStore>()(
           set((state) => {
             const newOpen = !state.isSidebarOpen;
 
-            if (newOpen && typeof window !== 'undefined') {
-              const proportionalWidth = Math.floor(window.innerWidth * 0.2);
+            if (newOpen && !state.hasManuallyResizedLeftSidebar) {
               return {
                 isSidebarOpen: newOpen,
-                sidebarWidth: proportionalWidth,
-                hasManuallyResizedLeftSidebar: false
+                sidebarWidth: LEFT_SIDEBAR_MIN_WIDTH,
               };
             }
             return { isSidebarOpen: newOpen };
@@ -320,14 +408,23 @@ export const useUIStore = create<UIStore>()(
         },
 
         setSidebarOpen: (open) => {
-          set(() => {
-
-            if (open && typeof window !== 'undefined') {
-              const proportionalWidth = Math.floor(window.innerWidth * 0.2);
+          set((state) => {
+            if (state.isSidebarOpen === open) {
+              if (!open) {
+                return state;
+              }
+              if (!state.hasManuallyResizedLeftSidebar && state.sidebarWidth !== LEFT_SIDEBAR_MIN_WIDTH) {
+                return {
+                  isSidebarOpen: open,
+                  sidebarWidth: LEFT_SIDEBAR_MIN_WIDTH,
+                };
+              }
+              return state;
+            }
+            if (open && !state.hasManuallyResizedLeftSidebar) {
               return {
                 isSidebarOpen: open,
-                sidebarWidth: proportionalWidth,
-                hasManuallyResizedLeftSidebar: false
+                sidebarWidth: LEFT_SIDEBAR_MIN_WIDTH,
               };
             }
             return { isSidebarOpen: open };
@@ -342,12 +439,10 @@ export const useUIStore = create<UIStore>()(
           set((state) => {
             const newOpen = !state.isRightSidebarOpen;
 
-            if (newOpen && typeof window !== 'undefined') {
-              const proportionalWidth = Math.floor(window.innerWidth * 0.28);
+            if (newOpen && !state.hasManuallyResizedRightSidebar) {
               return {
                 isRightSidebarOpen: newOpen,
-                rightSidebarWidth: proportionalWidth,
-                hasManuallyResizedRightSidebar: false,
+                rightSidebarWidth: RIGHT_SIDEBAR_MIN_WIDTH,
               };
             }
             return { isRightSidebarOpen: newOpen };
@@ -355,13 +450,23 @@ export const useUIStore = create<UIStore>()(
         },
 
         setRightSidebarOpen: (open) => {
-          set(() => {
-            if (open && typeof window !== 'undefined') {
-              const proportionalWidth = Math.floor(window.innerWidth * 0.28);
+          set((state) => {
+            if (state.isRightSidebarOpen === open) {
+              if (!open) {
+                return state;
+              }
+              if (!state.hasManuallyResizedRightSidebar && state.rightSidebarWidth !== RIGHT_SIDEBAR_MIN_WIDTH) {
+                return {
+                  isRightSidebarOpen: open,
+                  rightSidebarWidth: RIGHT_SIDEBAR_MIN_WIDTH,
+                };
+              }
+              return state;
+            }
+            if (open && !state.hasManuallyResizedRightSidebar) {
               return {
                 isRightSidebarOpen: open,
-                rightSidebarWidth: proportionalWidth,
-                hasManuallyResizedRightSidebar: false,
+                rightSidebarWidth: RIGHT_SIDEBAR_MIN_WIDTH,
               };
             }
             return { isRightSidebarOpen: open };
@@ -370,6 +475,148 @@ export const useUIStore = create<UIStore>()(
 
         setRightSidebarWidth: (width) => {
           set({ rightSidebarWidth: width, hasManuallyResizedRightSidebar: true });
+        },
+
+        setRightSidebarTab: (tab) => {
+          set({ rightSidebarTab: tab });
+        },
+
+        openContextDiff: (directory, filePath) => {
+          const normalizedDirectory = normalizeDirectoryPath((directory || '').trim());
+          const normalizedFilePath = (filePath || '').trim();
+          if (!normalizedDirectory || !normalizedFilePath) {
+            return;
+          }
+
+          set((state) => {
+            const prev = state.contextPanelByDirectory[normalizedDirectory];
+            const current = touchContextPanelState(prev);
+            const byDirectory = {
+              ...state.contextPanelByDirectory,
+              [normalizedDirectory]: {
+                ...current,
+                isOpen: true,
+                mode: 'diff' as const,
+                targetPath: normalizedFilePath,
+              },
+            };
+
+            return { contextPanelByDirectory: clampContextPanelRoots(byDirectory, 20) };
+          });
+          get().setPendingDiffFile(normalizedFilePath);
+        },
+
+        openContextFile: (directory, filePath) => {
+          const normalizedDirectory = normalizeDirectoryPath((directory || '').trim());
+          const normalizedFilePath = (filePath || '').trim();
+          if (!normalizedDirectory || !normalizedFilePath) {
+            return;
+          }
+
+          set((state) => {
+            const prev = state.contextPanelByDirectory[normalizedDirectory];
+            const current = touchContextPanelState(prev);
+            const byDirectory = {
+              ...state.contextPanelByDirectory,
+              [normalizedDirectory]: {
+                ...current,
+                isOpen: true,
+                mode: 'file' as const,
+                targetPath: normalizedFilePath,
+              },
+            };
+
+            return { contextPanelByDirectory: clampContextPanelRoots(byDirectory, 20) };
+          });
+        },
+
+        openContextOverview: (directory) => {
+          const normalizedDirectory = normalizeDirectoryPath((directory || '').trim());
+          if (!normalizedDirectory) {
+            return;
+          }
+
+          set((state) => {
+            const prev = state.contextPanelByDirectory[normalizedDirectory];
+            const current = touchContextPanelState(prev);
+            const byDirectory = {
+              ...state.contextPanelByDirectory,
+              [normalizedDirectory]: {
+                ...current,
+                isOpen: true,
+                mode: 'context' as const,
+                targetPath: null,
+              },
+            };
+
+            return { contextPanelByDirectory: clampContextPanelRoots(byDirectory, 20) };
+          });
+        },
+
+        closeContextPanel: (directory) => {
+          const normalizedDirectory = normalizeDirectoryPath((directory || '').trim());
+          if (!normalizedDirectory) {
+            return;
+          }
+
+          set((state) => {
+            const prev = state.contextPanelByDirectory[normalizedDirectory];
+            if (!prev || !prev.isOpen) {
+              return state;
+            }
+
+            const byDirectory = {
+              ...state.contextPanelByDirectory,
+              [normalizedDirectory]: {
+                ...touchContextPanelState(prev),
+                isOpen: false,
+              },
+            };
+
+            return { contextPanelByDirectory: clampContextPanelRoots(byDirectory, 20) };
+          });
+        },
+
+        toggleContextPanelExpanded: (directory) => {
+          const normalizedDirectory = normalizeDirectoryPath((directory || '').trim());
+          if (!normalizedDirectory) {
+            return;
+          }
+
+          set((state) => {
+            const prev = state.contextPanelByDirectory[normalizedDirectory];
+            const current = touchContextPanelState(prev);
+            const byDirectory = {
+              ...state.contextPanelByDirectory,
+              [normalizedDirectory]: {
+                ...current,
+                expanded: !current.expanded,
+              },
+            };
+
+            return { contextPanelByDirectory: clampContextPanelRoots(byDirectory, 20) };
+          });
+        },
+
+        setContextPanelWidth: (directory, width) => {
+          const normalizedDirectory = normalizeDirectoryPath((directory || '').trim());
+          if (!normalizedDirectory) {
+            return;
+          }
+
+          set((state) => {
+            const prev = state.contextPanelByDirectory[normalizedDirectory];
+            const current = touchContextPanelState(prev);
+            const byDirectory = {
+              ...state.contextPanelByDirectory,
+              [normalizedDirectory]: {
+                ...current,
+                width: clampContextPanelWidth(width),
+              },
+            };
+
+            return { contextPanelByDirectory: clampContextPanelRoots(byDirectory, 20) };
+          });
         },
 
         toggleBottomTerminal: () => {
@@ -390,7 +637,25 @@ export const useUIStore = create<UIStore>()(
         },
 
         setBottomTerminalOpen: (open) => {
-          set(() => {
+          set((state) => {
+            if (state.isBottomTerminalOpen === open) {
+              if (!open) {
+                return state;
+              }
+              if (!state.hasManuallyResizedBottomTerminal && typeof window !== 'undefined') {
+                const proportionalHeight = Math.floor(window.innerHeight * 0.32);
+                if (state.bottomTerminalHeight === proportionalHeight && state.hasManuallyResizedBottomTerminal === false) {
+                  return state;
+                }
+                return {
+                  isBottomTerminalOpen: open,
+                  bottomTerminalHeight: proportionalHeight,
+                  hasManuallyResizedBottomTerminal: false,
+                };
+              }
+              return state;
+            }
+
             if (open && typeof window !== 'undefined') {
               const proportionalHeight = Math.floor(window.innerHeight * 0.32);
               return {
@@ -402,6 +667,10 @@ export const useUIStore = create<UIStore>()(
 
             return { isBottomTerminalOpen: open };
           });
+        },
+
+        setBottomTerminalExpanded: (expanded) => {
+          set({ isBottomTerminalExpanded: expanded });
         },
 
         setBottomTerminalHeight: (height) => {
@@ -424,36 +693,7 @@ export const useUIStore = create<UIStore>()(
           if (guard && !guard(tab)) {
             return;
           }
-          const state = get();
-          const currentTab = state.activeMainTab;
-          const fullscreenTabs: MainTab[] = ['files', 'diff'];
-          const isEnteringFullscreen = fullscreenTabs.includes(tab) && !fullscreenTabs.includes(currentTab);
-          const isLeavingFullscreen = !fullscreenTabs.includes(tab) && fullscreenTabs.includes(currentTab);
-
-          if (isEnteringFullscreen) {
-            // Save current sidebar state and close it
-            set({
-              activeMainTab: tab,
-              sidebarOpenBeforeFullscreenTab: state.isSidebarOpen,
-              isSidebarOpen: false,
-            });
-          } else if (isLeavingFullscreen) {
-            // Restore sidebar state if it was open before
-            const shouldRestore = state.sidebarOpenBeforeFullscreenTab === true;
-            set({
-              activeMainTab: tab,
-              sidebarOpenBeforeFullscreenTab: null,
-              ...(shouldRestore && typeof window !== 'undefined'
-                ? {
-                    isSidebarOpen: true,
-                    sidebarWidth: Math.floor(window.innerWidth * 0.2),
-                    hasManuallyResizedLeftSidebar: false,
-                  }
-                : {}),
-            });
-          } else {
-            set({ activeMainTab: tab });
-          }
+          set({ activeMainTab: tab });
         },
 
         setPendingDiffFile: (filePath) => {
@@ -465,21 +705,7 @@ export const useUIStore = create<UIStore>()(
           if (guard && !guard('diff')) {
             return;
           }
-          const state = get();
-          const currentTab = state.activeMainTab;
-          const fullscreenTabs: MainTab[] = ['files', 'diff'];
-          const isEnteringFullscreen = !fullscreenTabs.includes(currentTab);
-
-          if (isEnteringFullscreen) {
-            set({
-              pendingDiffFile: filePath,
-              activeMainTab: 'diff',
-              sidebarOpenBeforeFullscreenTab: state.isSidebarOpen,
-              isSidebarOpen: false,
-            });
-          } else {
-            set({ pendingDiffFile: filePath, activeMainTab: 'diff' });
-          }
+          set({ pendingDiffFile: filePath, activeMainTab: 'diff' });
         },
 
         // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -800,14 +1026,6 @@ export const useUIStore = create<UIStore>()(
           set((state) => {
             const updates: Partial<UIStore> = {};
 
-            if (state.isSidebarOpen && !state.hasManuallyResizedLeftSidebar) {
-              updates.sidebarWidth = Math.floor(window.innerWidth * 0.2);
-            }
-
-            if (state.isRightSidebarOpen && !state.hasManuallyResizedRightSidebar) {
-              updates.rightSidebarWidth = Math.floor(window.innerWidth * 0.28);
-            }
-
             if (state.isBottomTerminalOpen && !state.hasManuallyResizedBottomTerminal) {
               updates.bottomTerminalHeight = Math.floor(window.innerHeight * 0.32);
             }
@@ -895,7 +1113,7 @@ export const useUIStore = create<UIStore>()(
       {
         name: 'ui-store',
         storage: createJSONStorage(() => getSafeStorage()),
-        version: 3,
+        version: 4,
         migrate: (persistedState, version) => {
           if (!persistedState || typeof persistedState !== 'object') {
             return persistedState;
@@ -935,6 +1153,14 @@ export const useUIStore = create<UIStore>()(
             delete state.memoryLimitActiveSession;
           }
 
+          if (typeof state.rightSidebarTab !== 'string' || (state.rightSidebarTab !== 'git' && state.rightSidebarTab !== 'files')) {
+            state.rightSidebarTab = 'git';
+          }
+
+          if (!state.contextPanelByDirectory || typeof state.contextPanelByDirectory !== 'object') {
+            state.contextPanelByDirectory = {};
+          }
+
           return state;
         },
         partialize: (state) => ({
@@ -943,7 +1169,10 @@ export const useUIStore = create<UIStore>()(
           sidebarWidth: state.sidebarWidth,
           isRightSidebarOpen: state.isRightSidebarOpen,
           rightSidebarWidth: state.rightSidebarWidth,
+          rightSidebarTab: state.rightSidebarTab,
+          contextPanelByDirectory: state.contextPanelByDirectory,
           isBottomTerminalOpen: state.isBottomTerminalOpen,
+          isBottomTerminalExpanded: state.isBottomTerminalExpanded,
           bottomTerminalHeight: state.bottomTerminalHeight,
           isSessionSwitcherOpen: state.isSessionSwitcherOpen,
           activeMainTab: state.activeMainTab,

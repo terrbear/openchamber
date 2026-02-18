@@ -204,7 +204,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     let response: Response;
     let wrapAsGlobal = false;
 
-    const requestHeaders = this._buildSseHeaders(headers || {});
+    const requestHeaders = this._buildSseHeaders({
+      ...(headers || {}),
+      ...(this._openCodeManager?.getOpenCodeAuthHeaders() || {}),
+    });
 
     try {
       response = await fetch(targetUrl, {
@@ -459,7 +462,7 @@ const deriveSessionActivity = (payload: Record<string, unknown> | null): Session
     }
   }
 
-  if (type === 'message.part.updated') {
+  if (type === 'message.part.updated' || type === 'message.part.delta') {
     const info = properties?.info as Record<string, unknown> | undefined;
     const sessionId = info?.sessionID ?? info?.sessionId ?? properties?.sessionID ?? properties?.sessionId;
     const role = info?.role;

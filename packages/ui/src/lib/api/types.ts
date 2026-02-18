@@ -145,6 +145,7 @@ export interface GitFileDiffResponse {
   path: string;
   /** When true, original/modified were truncated server-side because the file exceeded the size limit. */
   truncated?: boolean;
+  isBinary?: boolean;
 }
 
 export interface GetGitFileDiffOptions {
@@ -495,6 +496,8 @@ export interface ProjectEntry {
   id: string;
   path: string;
   label?: string;
+  icon?: string | null;
+  color?: string | null;
   addedAt?: number;
   lastOpenedAt?: number;
   sidebarCollapsed?: boolean;
@@ -951,6 +954,7 @@ export interface SkillsCatalogSource {
 export interface SkillsCatalogItemInstalledBadge {
   isInstalled: boolean;
   scope?: 'user' | 'project';
+  source?: 'opencode' | 'agents' | 'claude';
 }
 
 export interface ClawdHubSkillMetadata {
@@ -1029,6 +1033,7 @@ export interface SkillsInstallRequest {
   subpath?: string;
   gitIdentityId?: string;
   scope: 'user' | 'project';
+  targetSource?: 'opencode' | 'agents';
   selections: SkillsInstallSelection[];
   conflictPolicy?: 'prompt' | 'skipAll' | 'overwriteAll';
   conflictDecisions?: Record<string, 'skip' | 'overwrite'>;
@@ -1037,12 +1042,12 @@ export interface SkillsInstallRequest {
 export type SkillsInstallError = SkillsRepoScanError | {
   kind: 'conflicts';
   message: string;
-  conflicts: Array<{ skillName: string; scope: 'user' | 'project' }>;
+  conflicts: Array<{ skillName: string; scope: 'user' | 'project'; source?: 'opencode' | 'agents' }>;
 };
 
 export interface SkillsInstallResponse {
   ok: boolean;
-  installed?: Array<{ skillName: string; scope: 'user' | 'project' }>;
+  installed?: Array<{ skillName: string; scope: 'user' | 'project'; source?: 'opencode' | 'agents' }>;
   skipped?: Array<{ skillName: string; reason: string }>;
   error?: SkillsInstallError;
 }

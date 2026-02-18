@@ -9,7 +9,6 @@ import { updateDesktopSettings } from '@/lib/persistence';
 import { getSafeStorage } from './utils/safeStorage';
 import { useDirectoryStore } from './useDirectoryStore';
 import { streamDebugEnabled } from '@/stores/utils/streamDebug';
-import { getFirstTwoGraphemes } from '@/lib/text-utils';
 
 interface ProjectPathValidationResult {
   ok: boolean;
@@ -26,7 +25,6 @@ interface ProjectsStore {
   setActiveProject: (id: string) => void;
   setActiveProjectIdOnly: (id: string) => void;
   renameProject: (id: string, label: string) => void;
-  setBadge: (projectId: string, badge: string) => void;
   setGroup: (projectId: string, group: string) => void;
   updateProjectMeta: (id: string, meta: { label?: string; icon?: string | null; color?: string | null }) => void;
   reorderProjects: (fromIndex: number, toIndex: number) => void;
@@ -81,23 +79,6 @@ const deriveProjectLabel = (path: string): string => {
   const segments = normalized.split('/').filter(Boolean);
   const raw = segments[segments.length - 1] || normalized;
   return raw.replace(/[-_]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
-};
-
-/**
- * Validate and truncate badge to max 2 grapheme clusters
- */
-const validateBadge = (badge: string): string => {
-  if (typeof badge !== 'string') {
-    return '';
-  }
-  const trimmed = badge.trim();
-  if (!trimmed) {
-    return '';
-  }
-  
-  // Use shared utility to get first two graphemes
-  const result = getFirstTwoGraphemes(trimmed);
-  return result;
 };
 
 const createProjectId = (): string => {
@@ -162,12 +143,6 @@ const sanitizeProjects = (value: unknown): ProjectEntry[] => {
     }
     if (typeof candidate.sidebarCollapsed === 'boolean') {
       project.sidebarCollapsed = candidate.sidebarCollapsed;
-    }
-    if (typeof candidate.badge === 'string') {
-      const validatedBadge = validateBadge(candidate.badge);
-      if (validatedBadge) {
-        project.badge = validatedBadge;
-      }
     }
     if (typeof candidate.group === 'string' && candidate.group.trim().length > 0) {
       project.group = candidate.group.trim();
@@ -440,27 +415,6 @@ export const useProjectsStore = create<ProjectsStore>()(
       const nextProjects = projects.map((project) =>
         project.id === id ? { ...project, label: trimmed } : project
       );
-      set({ projects: nextProjects });
-      persistProjects(nextProjects, activeProjectId);
-    },
-
-    setBadge: (projectId: string, badge: string) => {
-      if (vscodeWorkspace) {
-        return;
-      }
-      const validatedBadge = validateBadge(badge);
-      
-      const { projects, activeProjectId } = get();
-      const nextProjects = projects.map((project) => {
-        if (project.id === projectId) {
-          if (validatedBadge) {
-            return { ...project, badge: validatedBadge };
-          } else {
-            return { ...project, badge: undefined };
-          }
-        }
-        return project;
-      });
       set({ projects: nextProjects });
       persistProjects(nextProjects, activeProjectId);
     },

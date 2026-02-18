@@ -55,7 +55,10 @@
     "release:prepare": "bun run build && bun run type-check && bun run lint",
     "release:test": "./scripts/test-release-build.sh",
     "release:test:intel": "./scripts/test-release-build.sh x86_64",
-    "release:test:arm": "./scripts/test-release-build.sh aarch64"
+    "release:test:arm": "./scripts/test-release-build.sh aarch64",
+    "test": "bun run --cwd packages/ui test",
+    "test:ui": "bun run --cwd packages/ui test",
+    "test:watch": "bun run --cwd packages/ui test:watch"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.0",
@@ -126,6 +129,8 @@
   "devDependencies": {
     "@eslint/js": "^9.33.0",
     "@tailwindcss/postcss": "^4.0.0",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
     "@types/dom-speech-recognition": "^0.0.7",
     "@types/node": "^24.3.1",
     "@types/react": "^19.1.10",
@@ -141,6 +146,7 @@
     "eslint-plugin-react-hooks": "^5.2.0",
     "eslint-plugin-react-refresh": "^0.4.20",
     "globals": "^16.3.0",
+    "jsdom": "^28.1.0",
     "nodemon": "^3.1.7",
     "patch-package": "^8.0.0",
     "tailwindcss": "^4.0.0",
@@ -148,6 +154,8 @@
     "tw-animate-css": "^1.3.8",
     "typescript": "~5.8.3",
     "typescript-eslint": "^8.39.1",
-    "vite": "^7.1.2"
+    "vite": "^7.1.2",
+    "vite-tsconfig-paths": "^6.1.1",
+    "vitest": "^4.0.18"
   }
 }

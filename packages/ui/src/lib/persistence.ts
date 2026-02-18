@@ -166,9 +166,6 @@ const sanitizeProjects = (value: unknown): DesktopSettings['projects'] | undefin
     if (typeof candidate.sidebarCollapsed === 'boolean') {
       (project as unknown as Record<string, unknown>).sidebarCollapsed = candidate.sidebarCollapsed;
     }
-    if (typeof candidate.badge === 'string' && candidate.badge.trim().length > 0) {
-      project.badge = candidate.badge.trim();
-    }
     if (typeof candidate.group === 'string' && candidate.group.trim().length > 0) {
       project.group = candidate.group.trim();
     }

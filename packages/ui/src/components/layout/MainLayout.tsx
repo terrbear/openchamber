@@ -3,7 +3,6 @@ import { Header } from './Header';
 import { BottomTerminalDock } from './BottomTerminalDock';
 import { Sidebar } from './Sidebar';
 import { RightSidebar } from './RightSidebar';
-import { ProjectRail } from './ProjectRail';
 import { RightSidebarTabs } from './RightSidebarTabs';
 import { ContextPanel } from './ContextPanel';
 import { ErrorBoundary } from '../ui/ErrorBoundary';
@@ -557,7 +556,6 @@ export const MainLayout: React.FC = () => {
                         <div className={cn('absolute inset-0 flex flex-col', isMultiRunLauncherOpen && 'invisible')}>
                             <Header />
                             <div className="flex flex-1 overflow-hidden">
-                                {!isMultiRunLauncherOpen && <ProjectRail />}
                                 <Sidebar isOpen={isSidebarOpen} isMobile={isMobile}>
                                     <SessionSidebar hideProjectSelector />
                                 </Sidebar>

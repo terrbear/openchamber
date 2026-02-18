@@ -501,7 +501,6 @@ export interface ProjectEntry {
   addedAt?: number;
   lastOpenedAt?: number;
   sidebarCollapsed?: boolean;
-  badge?: string;
   group?: string;
   connectionId?: string;
 }

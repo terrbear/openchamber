@@ -1,5 +1,5 @@
 import React from 'react';
-import { RiCheckLine, RiCloseLine, RiEditLine, RiListCheck3, RiQuestionLine } from '@remixicon/react';
+import { RiArrowRightSLine, RiCheckLine, RiCloseLine, RiEditLine, RiListCheck3, RiQuestionLine } from '@remixicon/react';
 import { Checkbox } from '@/components/ui/checkbox';
 
 import { cn } from '@/lib/utils';
@@ -15,6 +15,14 @@ const SUMMARY_TAB = 'summary';
 
 export const QuestionCard: React.FC<QuestionCardProps> = ({ question }) => {
   const { respondToQuestion, rejectQuestion } = useSessionStore();
+  const isFromSubagent = useSessionStore(
+    React.useCallback((state) => {
+      const currentSessionId = state.currentSessionId;
+      if (!currentSessionId || question.sessionID === currentSessionId) return false;
+      const sourceSession = state.sessions.find((session) => session.id === question.sessionID);
+      return Boolean(sourceSession?.parentID && sourceSession.parentID === currentSessionId);
+    }, [question.sessionID])
+  );
   const [activeTab, setActiveTab] = React.useState<TabKey>('0');
   const [isResponding, setIsResponding] = React.useState(false);
   const [hasResponded, setHasResponded] = React.useState(false);
@@ -68,25 +76,43 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({ question }) => {
   const selectedForActive = selectedOptions[activeIndex] ?? [];
   const isCustomActive = Boolean(customMode[activeIndex]);
 
-  const requiredSatisfied = React.useMemo(() => {
-    if (questions.length === 0) return false;
-
+  const unansweredIndexes = React.useMemo(() => {
+    const pending: number[] = [];
     for (let index = 0; index < questions.length; index += 1) {
       const isCustom = Boolean(customMode[index]);
       if (isCustom) {
         const value = (customText[index] ?? '').trim();
-        if (!value) return false;
+        if (!value) pending.push(index);
         continue;
       }
 
       const answers = selectedOptions[index] ?? [];
       if (answers.length === 0) {
-        return false;
+        pending.push(index);
+      }
+    }
+    return pending;
+  }, [customMode, customText, questions.length, selectedOptions]);
+
+  const requiredSatisfied = React.useMemo(() => {
+    if (questions.length === 0) return false;
+    return unansweredIndexes.length === 0;
+  }, [questions.length, unansweredIndexes.length]);
+
+  const handleNextUnanswered = React.useCallback(() => {
+    if (questions.length === 0 || unansweredIndexes.length === 0) return;
+
+    const start = isSummaryTab ? -1 : activeIndex;
+    for (let offset = 1; offset <= questions.length; offset += 1) {
+      const candidate = (start + offset + questions.length) % questions.length;
+      if (unansweredIndexes.includes(candidate)) {
+        setActiveTab(String(candidate));
+        return;
       }
     }
 
-    return true;
-  }, [customMode, customText, questions.length, selectedOptions]);
+    setActiveTab(String(unansweredIndexes[0]));
+  }, [activeIndex, isSummaryTab, questions.length, unansweredIndexes]);
 
   const buildAnswersPayload = React.useCallback((): string[][] => {
     const answers: string[][] = [];
@@ -169,6 +195,11 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({ question }) => {
             <div className="flex items-center gap-2">
               <RiQuestionLine className="h-3.5 w-3.5 text-primary" />
               <span className="typography-meta font-medium text-muted-foreground">Input needed</span>
+              {isFromSubagent ? (
+                <span className="typography-micro text-muted-foreground px-1.5 py-0.5 rounded bg-foreground/5">
+                  From subagent
+                </span>
+              ) : null}
               {activeHeader ? (
                 <span className="ml-auto typography-micro font-medium text-foreground/70 px-1.5 py-0.5 rounded bg-muted/30 border border-border/20">
                   {activeHeader}
@@ -184,6 +215,8 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({ question }) => {
                 {tabs.map((tab) => {
                   const isActive = activeTab === tab.value;
                   const isSummary = tab.value === SUMMARY_TAB;
+                  const tabIndex = isSummary ? -1 : Number(tab.value);
+                  const isAnswered = !isSummary && Number.isFinite(tabIndex) && !unansweredIndexes.includes(tabIndex);
                   return (
                     <button
                       key={tab.value}
@@ -192,8 +225,12 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({ question }) => {
                       className={cn(
                         'px-2 py-0.5 typography-meta font-medium rounded transition-colors flex items-center gap-1',
                         isActive
-                            ? 'bg-interactive-selection/40 text-foreground'
-                            : 'text-muted-foreground hover:text-foreground hover:bg-interactive-hover/20'
+                          ? 'bg-interactive-selection/40 text-foreground'
+                          : isSummary
+                            ? 'text-muted-foreground hover:text-foreground hover:bg-interactive-hover/20'
+                            : isAnswered
+                              ? 'text-muted-foreground/60 hover:text-muted-foreground hover:bg-interactive-hover/20'
+                              : 'text-foreground/85 hover:text-foreground hover:bg-interactive-hover/20'
                       )}
                     >
                       {isSummary ? <RiListCheck3 className="h-3 w-3" /> : null}
@@ -349,16 +386,16 @@ export const QuestionCard: React.FC<QuestionCardProps> = ({ question }) => {
           <div className="px-2 pb-1.5 pt-1 flex items-center gap-1.5 border-t border-border/20">
             <button
               type="button"
-              onClick={handleConfirm}
-              disabled={isResponding || !requiredSatisfied}
+              onClick={requiredSatisfied ? handleConfirm : handleNextUnanswered}
+              disabled={isResponding}
               className={cn(
                 'flex items-center gap-1 px-2 py-1 typography-meta font-medium rounded transition-colors',
                 'bg-[rgb(var(--status-success)/0.1)] text-[var(--status-success)] hover:bg-[rgb(var(--status-success)/0.2)]',
                 'disabled:opacity-50 disabled:cursor-not-allowed'
               )}
             >
-              <RiCheckLine className="h-3 w-3" />
-              Confirm
+              {requiredSatisfied ? <RiCheckLine className="h-3 w-3" /> : <RiArrowRightSLine className="h-3 w-3" />}
+              {requiredSatisfied ? 'Submit' : 'Next'}
             </button>
 
             <button

@@ -47,6 +47,7 @@ declare global {
 const ENABLE_EMPTY_RESPONSE_DETECTION = false;
 const TEXT_SHRINK_TOLERANCE = 50;
 const RESYNC_DEBOUNCE_MS = 750;
+const QUESTION_RECONCILE_COOLDOWN_MS = 1500;
 
 const textLengthCache = new WeakMap<Part[], number>();
 const computeTextLength = (parts: Part[] | undefined | null): number => {
@@ -155,6 +156,38 @@ export const useEventStream = () => {
     return undefined;
   }, [activeSessionDirectory, fallbackDirectory]);
 
+  const bootstrapPendingQuestions = React.useCallback(async () => {
+    try {
+      const projects = useProjectsStore.getState().projects;
+      const projectDirs = projects.map((project) => project.path);
+      // Use getState() to avoid sessions dependency which causes cascading updates
+      const currentSessions = useSessionStore.getState().sessions;
+      const sessionDirs = currentSessions.map((session) => (session as { directory?: string | null }).directory);
+
+      const directories = [effectiveDirectory, ...projectDirs, ...sessionDirs];
+      const pending = await opencodeClient.listPendingQuestions({ directories });
+      if (pending.length === 0) {
+        return;
+      }
+
+      for (const request of pending) {
+        addQuestion(request as unknown as QuestionRequest);
+      }
+    } catch {
+      // ignored
+    }
+  }, [addQuestion, effectiveDirectory]);
+
+  const lastQuestionRefreshAtRef = React.useRef(0);
+  const requestPendingQuestionsRefresh = React.useCallback((force = false) => {
+    const now = Date.now();
+    if (!force && now - lastQuestionRefreshAtRef.current < QUESTION_RECONCILE_COOLDOWN_MS) {
+      return;
+    }
+    lastQuestionRefreshAtRef.current = now;
+    void bootstrapPendingQuestions();
+  }, [bootstrapPendingQuestions]);
+
   React.useEffect(() => {
     let cancelled = false;
 
@@ -173,36 +206,13 @@ export const useEventStream = () => {
       }
     };
 
-    const bootstrapPendingQuestions = async () => {
-      try {
-        const projects = useProjectsStore.getState().projects;
-        const projectDirs = projects.map((project) => project.path);
-        // Use getState() to avoid sessions dependency which causes cascading updates
-        const currentSessions = useSessionStore.getState().sessions;
-        const sessionDirs = currentSessions.map((session) => (session as { directory?: string | null }).directory);
-
-        const directories = [effectiveDirectory, ...projectDirs, ...sessionDirs];
-
-        const pending = await opencodeClient.listPendingQuestions({ directories });
-        if (cancelled || pending.length === 0) {
-          return;
-        }
-
-        for (const request of pending) {
-          addQuestion(request as unknown as QuestionRequest);
-        }
-      } catch {
-        // ignored
-      }
-    };
-
     void bootstrapPendingPermissions();
-    void bootstrapPendingQuestions();
+    requestPendingQuestionsRefresh(true);
 
     return () => {
       cancelled = true;
     };
-  }, [addPermission, addQuestion, effectiveDirectory]);
+  }, [addPermission, requestPendingQuestionsRefresh]);
 
   const normalizeDirectory = React.useCallback((value: string | null | undefined): string | null => {
     if (typeof value !== 'string') return null;
@@ -829,6 +839,28 @@ export const useEventStream = () => {
           break;
         }
 
+        const shouldKeepSyntheticUserText = (value: unknown): boolean => {
+          const text = typeof value === 'string' ? value.trim() : '';
+          if (!text) return false;
+          return (
+            text.startsWith('User has requested to enter plan mode') ||
+            text.startsWith('The plan at ') ||
+            text.startsWith('The following tool was executed by the user')
+          );
+        };
+
+        const inferUserRoleFromPart = (): boolean => {
+          const partType = typeof partExt.type === 'string' ? partExt.type : '';
+          if (partType === 'subtask' || partType === 'agent' || partType === 'file') {
+            return true;
+          }
+          if (partType === 'text' && partExt.synthetic === true) {
+            const text = (partExt as { text?: unknown }).text;
+            return shouldKeepSyntheticUserText(text);
+          }
+          return false;
+        };
+
         let roleInfo = 'assistant';
         if (messageInfo && typeof (messageInfo as { role?: unknown }).role === 'string') {
           roleInfo = (messageInfo as { role?: string }).role as string;
@@ -842,11 +874,18 @@ export const useEventStream = () => {
           }
         }
 
+        if (roleInfo !== 'user' && inferUserRoleFromPart()) {
+          roleInfo = 'user';
+        }
+
         trackMessage(messageId, 'part_received', { role: roleInfo });
 
         if (roleInfo === 'user' && partExt.synthetic === true) {
-          trackMessage(messageId, 'skipped_synthetic_user_part');
-          break;
+          const text = (partExt as { text?: unknown }).text;
+          if (!shouldKeepSyntheticUserText(text)) {
+            trackMessage(messageId, 'skipped_synthetic_user_part');
+            break;
+          }
         }
 
         const messagePart: Part = {
@@ -859,7 +898,14 @@ export const useEventStream = () => {
           const partTime = (messagePart as { time?: { end?: unknown } }).time;
           const partHasEnded = typeof partTime?.end === 'number';
           const toolState = (messagePart as { state?: { status?: unknown } }).state?.status;
+          const toolName = typeof (messagePart as { tool?: unknown }).tool === 'string'
+            ? (messagePart as { tool: string }).tool.toLowerCase()
+            : null;
           const textContent = (messagePart as { text?: unknown }).text;
+
+          if (partType === 'tool' && toolName === 'question') {
+            requestPendingQuestionsRefresh();
+          }
 
           const isStreamingPart = (() => {
             if (partType === 'tool') {
@@ -1197,7 +1243,8 @@ export const useEventStream = () => {
                 const textStr = typeof text === 'string' ? text.trim() : '';
                 const shouldKeep =
                   textStr.startsWith('User has requested to enter plan mode') ||
-                  textStr.startsWith('The plan at ');
+                  textStr.startsWith('The plan at ') ||
+                  textStr.startsWith('The following tool was executed by the user');
                 if (!shouldKeep) continue;
               }
 
@@ -1234,6 +1281,15 @@ export const useEventStream = () => {
         if (!hasParts && !completedFromServer && !hasCompletedStatus && !eventHasStopFinish) break;
 
         if ((messageExt as { role?: unknown }).role === 'assistant' && hasParts) {
+          const hasQuestionTool = partsArray.some((part) => (
+            part?.type === 'tool'
+            && typeof (part as { tool?: unknown }).tool === 'string'
+            && (part as { tool: string }).tool.toLowerCase() === 'question'
+          ));
+          if (hasQuestionTool) {
+            requestPendingQuestionsRefresh();
+          }
+
           const incomingLen = computeTextLength(partsArray);
           const wouldShrink = existingLen > 0 && incomingLen + TEXT_SHRINK_TOLERANCE < existingLen;
 
@@ -1386,7 +1442,6 @@ export const useEventStream = () => {
           }
 
 	          completeStreamingMessage(sessionId, messageId);
-	          updateSessionStatus(sessionId, { type: 'idle' }, 'sse:message.updated.completed');
 	          // Removed: void refreshSessionStatus();
 
 	          const rawMessageSessionId = (message as { sessionID?: string }).sessionID;
@@ -1491,6 +1546,11 @@ export const useEventStream = () => {
               return;
             }
 
+            const requestSession = useSessionStore.getState().sessions.find((session) => session.id === request.sessionID);
+            if (requestSession?.parentID && requestSession.parentID === current) {
+              return;
+            }
+
             const pending = useSessionStore
               .getState()
               .permissions
@@ -1545,6 +1605,11 @@ export const useEventStream = () => {
           setTimeout(() => {
             const current = currentSessionIdRef.current;
             if (current === request.sessionID) {
+              return;
+            }
+
+            const requestSession = useSessionStore.getState().sessions.find((session) => session.id === request.sessionID);
+            if (requestSession?.parentID && requestSession.parentID === current) {
               return;
             }
 
@@ -1696,6 +1761,7 @@ export const useEventStream = () => {
     applySessionMetadata,
     trackMessage,
     reportMessage,
+    requestPendingQuestionsRefresh,
     
     updateSession,
     removeSessionFromStore,

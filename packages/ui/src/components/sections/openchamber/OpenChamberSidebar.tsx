@@ -8,7 +8,17 @@ import { AboutSettings } from './AboutSettings';
 import { reloadOpenCodeConfiguration } from '@/stores/useAgentsStore';
 import { cn } from '@/lib/utils';
 
-export type OpenChamberSection = 'visual' | 'chat' | 'sessions' | 'connections' | 'git' | 'github' | 'notifications' | 'voice' | 'todos';
+export type OpenChamberSection =
+  | 'visual'
+  | 'chat'
+  | 'shortcuts'
+  | 'sessions'
+  | 'connections'
+  | 'todos'
+  | 'git'
+  | 'github'
+  | 'notifications'
+  | 'voice';
 
 interface OpenChamberSidebarProps {
   selectedSection: OpenChamberSection;
@@ -34,6 +44,11 @@ const OPENCHAMBER_SECTION_GROUPS: SectionGroup[] = [
     id: 'chat',
     label: 'Chat',
     items: ['Tools', 'Diff', 'Reasoning'],
+  },
+  {
+    id: 'shortcuts',
+    label: 'Shortcuts',
+    items: ['Keyboard', 'Overrides'],
   },
   {
     id: 'sessions',

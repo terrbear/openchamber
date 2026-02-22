@@ -12,6 +12,7 @@ import { VoiceSettings } from './VoiceSettings';
 import { OpenCodeCliSettings } from './OpenCodeCliSettings';
 import { ConnectionsSettings } from './ConnectionsSettings';
 import { ProjectTodos } from './ProjectTodos';
+import { KeyboardShortcutsSettings } from './KeyboardShortcutsSettings';
 import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
 import { useDeviceInfo } from '@/lib/device';
 import { isVSCodeRuntime, isWebRuntime } from '@/lib/desktop';
@@ -71,6 +72,8 @@ export const OpenChamberPage: React.FC<OpenChamberPageProps> = ({ section }) => 
                 return <ConnectionsSectionContent />;
             case 'todos':
                 return <TodosSectionContent />;
+            case 'shortcuts':
+                return <ShortcutsSectionContent />;
             case 'git':
                 return <GitSectionContent />;
             case 'github':
@@ -95,6 +98,10 @@ export const OpenChamberPage: React.FC<OpenChamberPageProps> = ({ section }) => 
             </div>
         </ScrollableOverlay>
     );
+};
+
+const ShortcutsSectionContent: React.FC = () => {
+    return <KeyboardShortcutsSettings />;
 };
 
 // Visual section: Theme Mode, Font Size, Spacing, Corner Radius, Input Bar Offset (mobile)

@@ -35,6 +35,7 @@ import { formatPercent, formatWindowLabel, QUOTA_PROVIDERS, calculatePace, calcu
 import { UsageProgressBar } from '@/components/sections/usage/UsageProgressBar';
 import { PaceIndicator } from '@/components/sections/usage/PaceIndicator';
 import { updateDesktopSettings } from '@/lib/persistence';
+import { eventMatchesShortcut, formatShortcutForDisplay, getEffectiveShortcutCombo } from '@/lib/shortcuts';
 import {
   getAllModelFamilies,
   getDisplayModelName,
@@ -55,7 +56,7 @@ import { DesktopHostSwitcherDialog } from '@/components/desktop/DesktopHostSwitc
 import { OpenInAppButton } from '@/components/desktop/OpenInAppButton';
 import { isDesktopLocalOriginActive, isDesktopShell, isTauriShell, isVSCodeRuntime } from '@/lib/desktop';
 import { sessionEvents } from '@/lib/sessionEvents';
-import { desktopHostsGet } from '@/lib/desktopHosts';
+import { desktopHostsGet, locationMatchesHost, redactSensitiveUrl } from '@/lib/desktopHosts';
 import { NotificationCenter } from '@/components/notification/NotificationCenter';
 import { useNotificationCenterStore, getUnreadCount } from '@/stores/useNotificationCenterStore';
 import { ProjectEditDialog } from '@/components/layout/ProjectEditDialog';
@@ -149,6 +150,7 @@ export const Header: React.FC = () => {
   const setSettingsDialogOpen = useUIStore((state) => state.setSettingsDialogOpen);
   const activeMainTab = useUIStore((state) => state.activeMainTab);
   const setActiveMainTab = useUIStore((state) => state.setActiveMainTab);
+  const shortcutOverrides = useUIStore((state) => state.shortcutOverrides);
 
   const { getCurrentModel } = useConfigStore();
   const runtimeApis = useRuntimeAPIs();
@@ -539,47 +541,22 @@ export const Header: React.FC = () => {
       return;
     }
 
-    const normalizeHostUrl = (raw: string): string | null => {
-      const trimmed = raw.trim();
-      if (!trimmed) return null;
-      try {
-        const url = new URL(trimmed);
-        if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-          return null;
-        }
-        return url.origin;
-      } catch {
-        try {
-          const url = new URL(trimmed.endsWith('/') ? trimmed : `${trimmed}/`);
-          if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-            return null;
-          }
-          return url.origin;
-        } catch {
-          return null;
-        }
-      }
-    };
-
     try {
       const cfg = await desktopHostsGet();
-      const currentOrigin = window.location.origin;
-      const localOrigin = window.__OPENCHAMBER_LOCAL_ORIGIN__ || currentOrigin;
-      const normalizedCurrent = normalizeHostUrl(currentOrigin) || currentOrigin;
-      const normalizedLocal = normalizeHostUrl(localOrigin) || localOrigin;
+      const currentHref = window.location.href;
+      const localOrigin = window.__OPENCHAMBER_LOCAL_ORIGIN__ || window.location.origin;
 
-      if (normalizedCurrent && normalizedLocal && normalizedCurrent === normalizedLocal) {
+      if (locationMatchesHost(currentHref, localOrigin)) {
         setCurrentInstanceLabel('Local');
         return;
       }
 
       const match = cfg.hosts.find((host) => {
-        const normalized = normalizeHostUrl(host.url);
-        return normalized && normalized === normalizedCurrent;
+        return locationMatchesHost(currentHref, host.url);
       });
 
       if (match?.label?.trim()) {
-        setCurrentInstanceLabel(match.label.trim());
+        setCurrentInstanceLabel(redactSensitiveUrl(match.label.trim()));
         return;
       }
 
@@ -1066,6 +1043,10 @@ export const Header: React.FC = () => {
     return base;
   }, [diffFileCount, isMobile, showPlanTab]);
 
+  const shortcutLabel = React.useCallback((actionId: string) => {
+    return formatShortcutForDisplay(getEffectiveShortcutCombo(actionId, shortcutOverrides));
+  }, [shortcutOverrides]);
+
   useEffect(() => {
     if (!isMobile && (activeMainTab === 'git' || activeMainTab === 'terminal' || activeMainTab === 'diff' || activeMainTab === 'files')) {
       setActiveMainTab('chat');
@@ -1115,6 +1096,65 @@ export const Header: React.FC = () => {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [tabs, setActiveMainTab, showProjectTabs, projects, activeProjectId, setActiveProject]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const toggleServicesCombo = getEffectiveShortcutCombo('toggle_services_menu', shortcutOverrides);
+      if (eventMatchesShortcut(e, toggleServicesCombo)) {
+        e.preventDefault();
+
+        if (isDesktopServicesOpen) {
+          setIsDesktopServicesOpen(false);
+        } else {
+          setIsDesktopServicesOpen(true);
+          void refreshCurrentInstanceLabel();
+          if (desktopServicesTab === 'usage' && quotaResults.length === 0) {
+            void fetchAllQuotas();
+          }
+        }
+        return;
+      }
+
+      const cycleServicesCombo = getEffectiveShortcutCombo('cycle_services_tab', shortcutOverrides);
+      if (eventMatchesShortcut(e, cycleServicesCombo)) {
+        e.preventDefault();
+
+        const tabValues = servicesTabs.map((tab) => tab.value) as Array<'instance' | 'usage' | 'mcp'>;
+        if (tabValues.length === 0) {
+          return;
+        }
+
+        const currentIndex = tabValues.indexOf(desktopServicesTab);
+        const nextIndex = currentIndex === -1 ? 0 : (currentIndex + 1) % tabValues.length;
+        const nextTab = tabValues[nextIndex];
+        setDesktopServicesTab(nextTab);
+        setIsDesktopServicesOpen(true);
+        void refreshCurrentInstanceLabel();
+        if (nextTab === 'usage' && quotaResults.length === 0) {
+          void fetchAllQuotas();
+        }
+        return;
+      }
+
+      const toggleContextPlanCombo = getEffectiveShortcutCombo('toggle_context_plan', shortcutOverrides);
+      if (eventMatchesShortcut(e, toggleContextPlanCombo)) {
+        e.preventDefault();
+        handleOpenContextPlan();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [
+    shortcutOverrides,
+    isDesktopServicesOpen,
+    desktopServicesTab,
+    servicesTabs,
+    quotaResults.length,
+    fetchAllQuotas,
+    refreshCurrentInstanceLabel,
+    handleOpenContextPlan,
+  ]);
 
   const renderTab = (tab: TabConfig) => {
     const isActive = activeMainTab === tab.id;
@@ -1455,14 +1495,21 @@ export const Header: React.FC = () => {
       role="tablist"
       aria-label="Main navigation"
     >
-      <button
-        type="button"
-        onClick={handleOpenSessionSwitcher}
-        aria-label="Open sessions"
-        className={`${headerIconButtonClass} mr-2 shrink-0`}
-      >
-        <RiLayoutLeftLine className="h-5 w-5" />
-      </button>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            onClick={handleOpenSessionSwitcher}
+            aria-label="Open sessions"
+            className={`${headerIconButtonClass} mr-2 shrink-0`}
+          >
+            <RiLayoutLeftLine className="h-5 w-5" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent>
+          <p>Open sessions ({shortcutLabel('toggle_sidebar')})</p>
+        </TooltipContent>
+      </Tooltip>
 
       {/* Project tabs */}
       {showProjectTabs && (
@@ -1685,7 +1732,7 @@ export const Header: React.FC = () => {
               </button>
             </TooltipTrigger>
             <TooltipContent>
-              <p>Plan</p>
+              <p>Plan ({shortcutLabel('toggle_context_plan')})</p>
             </TooltipContent>
           </Tooltip>
         )}
@@ -1723,7 +1770,11 @@ export const Header: React.FC = () => {
                 </DropdownMenuTrigger>
               </TooltipTrigger>
               <TooltipContent>
-                <p>{isDesktopApp ? `Current instance: ${currentInstanceLabel}` : 'Services'}</p>
+                <p>
+                  {isDesktopApp
+                    ? `Current instance: ${currentInstanceLabel}`
+                    : 'Services'} ({shortcutLabel('toggle_services_menu')}; next tab {shortcutLabel('cycle_services_tab')})
+                </p>
               </TooltipContent>
             </Tooltip>
             <DropdownMenuContent
@@ -1956,7 +2007,7 @@ export const Header: React.FC = () => {
             </button>
           </TooltipTrigger>
           <TooltipContent>
-            <p>Terminal panel</p>
+            <p>Terminal panel ({shortcutLabel('toggle_terminal')})</p>
           </TooltipContent>
         </Tooltip>
 
@@ -1972,7 +2023,7 @@ export const Header: React.FC = () => {
             </button>
           </TooltipTrigger>
           <TooltipContent>
-            <p>Right sidebar</p>
+            <p>Right sidebar ({shortcutLabel('toggle_right_sidebar')})</p>
           </TooltipContent>
         </Tooltip>
 
@@ -2435,7 +2486,7 @@ export const Header: React.FC = () => {
                 </button>
               </TooltipTrigger>
               <TooltipContent>
-                <p>Settings</p>
+                <p>{`Settings (${shortcutLabel('open_settings')})`}</p>
               </TooltipContent>
             </Tooltip>
             </div>

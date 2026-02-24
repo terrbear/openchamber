@@ -2910,6 +2910,7 @@ let exitOnShutdown = true;
 let uiAuthController = null;
 let cloudflareTunnelController = null;
 let terminalInputWsServer = null;
+let claudeCodeAdapterInstance = null;
 const userProvidedOpenCodePassword =
   typeof hmrState.userProvidedOpenCodePassword === 'string' && hmrState.userProvidedOpenCodePassword.length > 0
     ? hmrState.userProvidedOpenCodePassword
@@ -3026,6 +3027,9 @@ const ENV_CONFIGURED_OPENCODE_PORT = (() => {
 const ENV_SKIP_OPENCODE_START = process.env.OPENCODE_SKIP_START === 'true' ||
                                     process.env.OPENCHAMBER_SKIP_OPENCODE_START === 'true';
 const ENV_DESKTOP_NOTIFY = process.env.OPENCHAMBER_DESKTOP_NOTIFY === 'true';
+const ENV_BACKEND = process.env.OPENCHAMBER_BACKEND || 'opencode';
+const ENV_CLAUDECODE_BINARY = (process.env.CLAUDECODE_BINARY || '').trim() || 'claude';
+const ENV_CLAUDECODE_PERMISSION_MODE = (process.env.CLAUDECODE_PERMISSION_MODE || '').trim() || 'acceptEdits';
 
 // OpenCode server authentication (Basic Auth with username "opencode")
 
@@ -5794,6 +5798,17 @@ async function gracefulShutdown(options = {}) {
     }
   }
 
+  // Stop Claude Code adapter if running
+  if (claudeCodeAdapterInstance) {
+    console.log('Stopping Claude Code adapter...');
+    try {
+      await claudeCodeAdapterInstance.stop();
+    } catch (error) {
+      console.warn('Error stopping Claude Code adapter:', error);
+    }
+    claudeCodeAdapterInstance = null;
+  }
+
   // Only stop OpenCode if we started it ourselves (not when using external server)
   if (!ENV_SKIP_OPENCODE_START && !isExternalOpenCode) {
     const portToKill = openCodePort;
@@ -5808,7 +5823,9 @@ async function gracefulShutdown(options = {}) {
       openCodeProcess = null;
     }
 
-    killProcessOnPort(portToKill);
+    if (ENV_BACKEND !== 'claudecode') {
+      killProcessOnPort(portToKill);
+    }
   } else {
     console.log('Skipping OpenCode shutdown (external server)');
   }
@@ -5925,6 +5942,7 @@ async function main(options = {}) {
     res.json({
       status: 'ok',
       timestamp: new Date().toISOString(),
+      backend: ENV_BACKEND,
       openCodePort: openCodePort,
       openCodeRunning: Boolean(openCodePort && isOpenCodeReady && !isRestartingOpenCode),
       openCodeSecureConnection: isOpenCodeConnectionSecure(),
@@ -12102,64 +12120,89 @@ Context:
     res.json({ success: true, killedCount });
   });
 
-  try {
-    syncFromHmrState();
-    if (await isOpenCodeProcessHealthy()) {
-      console.log(`[HMR] Reusing existing OpenCode process on port ${openCodePort}`);
-    } else if (ENV_SKIP_OPENCODE_START && ENV_CONFIGURED_OPENCODE_PORT) {
-      console.log(`Using external OpenCode server on port ${ENV_CONFIGURED_OPENCODE_PORT} (skip-start mode)`);
-      setOpenCodePort(ENV_CONFIGURED_OPENCODE_PORT);
+  if (ENV_BACKEND === 'claudecode') {
+    try {
+      console.log(`[openchamber] Starting with Claude Code backend (binary: ${ENV_CLAUDECODE_BINARY})`);
+      const { startClaudeCodeAdapter } = await import('./lib/claudecode/adapter.js');
+      claudeCodeAdapterInstance = await startClaudeCodeAdapter({
+        port: 0,
+        claudeBinary: ENV_CLAUDECODE_BINARY,
+        cwd: process.cwd(),
+        permissionMode: ENV_CLAUDECODE_PERMISSION_MODE,
+      });
+      console.log(`[openchamber] Claude Code adapter listening on port ${claudeCodeAdapterInstance.port}`);
+      setOpenCodePort(claudeCodeAdapterInstance.port);
       isOpenCodeReady = true;
-      isExternalOpenCode = true;
+      isExternalOpenCode = false;
       lastOpenCodeError = null;
       openCodeNotReadySince = 0;
-      syncToHmrState();
-    } else if (ENV_CONFIGURED_OPENCODE_PORT && await probeExternalOpenCode(ENV_CONFIGURED_OPENCODE_PORT)) {
-      console.log(`Auto-detected existing OpenCode server on port ${ENV_CONFIGURED_OPENCODE_PORT}`);
-      setOpenCodePort(ENV_CONFIGURED_OPENCODE_PORT);
-      isOpenCodeReady = true;
-      isExternalOpenCode = true;
-      lastOpenCodeError = null;
-      openCodeNotReadySince = 0;
-      syncToHmrState();
-    } else if (!ENV_CONFIGURED_OPENCODE_PORT && await probeExternalOpenCode(4096)) {
-      console.log('Auto-detected existing OpenCode server on default port 4096');
-      setOpenCodePort(4096);
-      isOpenCodeReady = true;
-      isExternalOpenCode = true;
-      lastOpenCodeError = null;
-      openCodeNotReadySince = 0;
-      syncToHmrState();
-    } else {
-      if (ENV_CONFIGURED_OPENCODE_PORT) {
-        console.log(`Using OpenCode port from environment: ${ENV_CONFIGURED_OPENCODE_PORT}`);
+      setupProxy(app);
+    } catch (error) {
+      console.error(`Failed to start Claude Code adapter: ${error.message}`);
+      console.log('Continuing without Claude Code integration...');
+      lastOpenCodeError = error.message;
+      setupProxy(app);
+    }
+  } else {
+    try {
+      syncFromHmrState();
+      if (await isOpenCodeProcessHealthy()) {
+        console.log(`[HMR] Reusing existing OpenCode process on port ${openCodePort}`);
+      } else if (ENV_SKIP_OPENCODE_START && ENV_CONFIGURED_OPENCODE_PORT) {
+        console.log(`Using external OpenCode server on port ${ENV_CONFIGURED_OPENCODE_PORT} (skip-start mode)`);
         setOpenCodePort(ENV_CONFIGURED_OPENCODE_PORT);
+        isOpenCodeReady = true;
+        isExternalOpenCode = true;
+        lastOpenCodeError = null;
+        openCodeNotReadySince = 0;
+        syncToHmrState();
+      } else if (ENV_CONFIGURED_OPENCODE_PORT && await probeExternalOpenCode(ENV_CONFIGURED_OPENCODE_PORT)) {
+        console.log(`Auto-detected existing OpenCode server on port ${ENV_CONFIGURED_OPENCODE_PORT}`);
+        setOpenCodePort(ENV_CONFIGURED_OPENCODE_PORT);
+        isOpenCodeReady = true;
+        isExternalOpenCode = true;
+        lastOpenCodeError = null;
+        openCodeNotReadySince = 0;
+        syncToHmrState();
+      } else if (!ENV_CONFIGURED_OPENCODE_PORT && await probeExternalOpenCode(4096)) {
+        console.log('Auto-detected existing OpenCode server on default port 4096');
+        setOpenCodePort(4096);
+        isOpenCodeReady = true;
+        isExternalOpenCode = true;
+        lastOpenCodeError = null;
+        openCodeNotReadySince = 0;
+        syncToHmrState();
       } else {
-        openCodePort = null;
+        if (ENV_CONFIGURED_OPENCODE_PORT) {
+          console.log(`Using OpenCode port from environment: ${ENV_CONFIGURED_OPENCODE_PORT}`);
+          setOpenCodePort(ENV_CONFIGURED_OPENCODE_PORT);
+        } else {
+          openCodePort = null;
+          syncToHmrState();
+        }
+
+        lastOpenCodeError = null;
+        openCodeProcess = await startOpenCode();
         syncToHmrState();
       }
-
-      lastOpenCodeError = null;
-      openCodeProcess = await startOpenCode();
-      syncToHmrState();
-    }
-    await waitForOpenCodePort();
-    try {
-      await waitForOpenCodeReady();
+      await waitForOpenCodePort();
+      try {
+        await waitForOpenCodeReady();
+      } catch (error) {
+        console.error(`OpenCode readiness check failed: ${error.message}`);
+        scheduleOpenCodeApiDetection();
+      }
+      setupProxy(app);
+      scheduleOpenCodeApiDetection();
+      startHealthMonitoring();
+      void startGlobalEventWatcher();
     } catch (error) {
-      console.error(`OpenCode readiness check failed: ${error.message}`);
+      console.error(`Failed to start OpenCode: ${error.message}`);
+      console.log('Continuing without OpenCode integration...');
+      lastOpenCodeError = error.message;
+      setupProxy(app);
       scheduleOpenCodeApiDetection();
     }
-    setupProxy(app);
-    scheduleOpenCodeApiDetection();
-    startHealthMonitoring();
-    void startGlobalEventWatcher();
-  } catch (error) {
-    console.error(`Failed to start OpenCode: ${error.message}`);
-    console.log('Continuing without OpenCode integration...');
-    lastOpenCodeError = error.message;
-    setupProxy(app);
-    scheduleOpenCodeApiDetection();
   }
 
   const distPath = (() => {

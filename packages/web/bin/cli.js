@@ -140,6 +140,9 @@ function parseArgs() {
           } else if (value !== undefined) {
             console.error(`Error: --backend must be 'opencode' or 'claudecode', got '${value}'`);
             process.exit(1);
+          } else {
+            console.error("Error: --backend requires a value ('opencode' or 'claudecode')");
+            process.exit(1);
           }
           break;
         }
@@ -524,6 +527,8 @@ function writeInstanceOptions(instanceFilePath, options) {
       daemon: options.daemon || false,
       // Store password existence but not value - will use env var
       hasUiPassword: typeof options.uiPassword === 'string',
+      backend: options.backend || 'opencode',
+      claudeBinary: options.claudeBinary || undefined,
     };
     // For daemon mode, we need to store the password to restart properly
     if (options.daemon && typeof options.uiPassword === 'string') {
@@ -951,6 +956,8 @@ const commands = {
         ...(portWasSpecified ? { port: options.port } : {}),
         ...(process.argv.includes('--daemon') || process.argv.includes('-d') ? { daemon: options.daemon } : {}),
         ...(process.argv.includes('--ui-password') ? { uiPassword: options.uiPassword } : {}),
+        ...(process.argv.includes('--backend') ? { backend: options.backend } : {}),
+        ...(process.argv.includes('--claude-binary') ? { claudeBinary: options.claudeBinary } : {}),
       };
 
       // Stop the instance

@@ -78,7 +78,10 @@ export const AboutDialog: React.FC<AboutDialogProps> = ({
   }, [open]);
 
   React.useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      setActiveBackend(null);
+      return;
+    }
     let cancelled = false;
     fetch('/health')
       .then((res) => res.json())
@@ -140,7 +143,7 @@ export const AboutDialog: React.FC<AboutDialogProps> = ({
           <p className="typography-meta text-muted-foreground">
             {activeBackend === 'claudecode' ? (
               <>A fan-made interface for Claude Code agent</>
-            ) : (
+            ) : activeBackend === 'opencode' ? (
               <>
                 A fan-made interface for{' '}
                 <a
@@ -153,6 +156,8 @@ export const AboutDialog: React.FC<AboutDialogProps> = ({
                 </a>{' '}
                 agent
               </>
+            ) : (
+              <>A fan-made interface for your AI agent</>
             )}
           </p>
           {activeBackend !== null && (

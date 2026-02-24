@@ -102,6 +102,7 @@ function createApp(cwd) {
       createdAt: now,
       updatedAt: now,
       messageCount: 0,
+      claudeSessionId: null, // set after first successful claude run
     };
     sessions[id] = session;
     try {
@@ -215,9 +216,14 @@ function createApp(cwd) {
       // Mark session busy
       broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: 'busy' } });
 
-      // Spawn claude
+      // Spawn claude — use --resume only if we have a real claude session ID from a prior turn
       const sessionCwd = (Object.hasOwn(sessions, id) && sessions[id].path) || _cwd;
-      const args = ['--print', '--output-format', 'stream-json', '--resume', id, '--permission-mode', _permissionMode];
+      const claudeSessionId = Object.hasOwn(sessions, id) ? sessions[id].claudeSessionId : null;
+      const args = [
+        '--print', '--output-format', 'stream-json',
+        '--permission-mode', _permissionMode,
+        ...(claudeSessionId ? ['--resume', claudeSessionId] : []),
+      ];
       const claudeProc = spawn(_claudeBinary, args, {
         cwd: sessionCwd,
         env: process.env,
@@ -241,6 +247,13 @@ function createApp(cwd) {
         if (!line.trim()) return;
         let parsed;
         try { parsed = JSON.parse(line); } catch { return; }
+
+        if (parsed.type === 'result' && parsed.session_id && Object.hasOwn(sessions, id) && !sessions[id].claudeSessionId) {
+          // Capture the real claude session ID on the first successful run so subsequent
+          // turns can use --resume to continue the same conversation.
+          sessions[id].claudeSessionId = parsed.session_id;
+          saveSessions().catch(() => {});
+        }
 
         if (parsed.type === 'text') {
           assistantText += parsed.text;

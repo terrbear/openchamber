@@ -1,7 +1,7 @@
 .PHONY: package
 
 run:
-	bun run dev
+	OPENCHAMBER_BACKEND=claudecode bun run dev
 
 # Detect platform and set appropriate bundle types
 UNAME_S := $(shell uname -s)

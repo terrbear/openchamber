@@ -81,6 +81,41 @@ async function saveMessages(sessionId, msgs) {
   await fs.promises.writeFile(messagesFile(sessionId), JSON.stringify(msgs, null, 2), 'utf8');
 }
 
+// Convert internal session to the SDK Session shape the UI expects.
+function toSdkSession(session) {
+  const createdMs = session.createdAt ? new Date(session.createdAt).getTime() : Date.now();
+  const updatedMs = session.updatedAt ? new Date(session.updatedAt).getTime() : createdMs;
+  return {
+    id: session.id,
+    slug: session.id,
+    projectID: 'default',
+    directory: session.directory || session.path || _cwd,
+    title: session.title || 'New Session',
+    version: '1',
+    time: { created: createdMs, updated: updatedMs },
+    messageCount: session.messageCount || 0,
+    claudeSessionId: session.claudeSessionId || null,
+  };
+}
+
+// Convert stored message to the { info, parts } shape the client expects.
+function toSdkMessage(msg, sessionId) {
+  const createdMs = msg.createdAt ? new Date(msg.createdAt).getTime() : Date.now();
+  return {
+    info: {
+      id: msg.id,
+      sessionID: sessionId,
+      role: msg.role,
+      time: { created: createdMs, updated: createdMs },
+      status: 'completed',
+      ...(msg.role === 'assistant' ? { finish: 'stop' } : {}),
+    },
+    parts: msg.content
+      ? [{ id: `${msg.id}-p0`, type: 'text', text: msg.content, messageID: msg.id, sessionID: sessionId }]
+      : [],
+  };
+}
+
 function createApp(cwd) {
   const app = express();
   app.use(express.json());
@@ -98,7 +133,7 @@ function createApp(cwd) {
     const session = {
       id,
       title,
-      path: cwd,
+      directory: cwd,
       createdAt: now,
       updatedAt: now,
       messageCount: 0,
@@ -110,15 +145,16 @@ function createApp(cwd) {
     } catch {
       // non-fatal
     }
-    broadcastGlobalEvent({ type: 'session.updated', properties: { sessionID: session.id } });
-    res.status(201).json(session);
+    const sdk = toSdkSession(session);
+    broadcastGlobalEvent({ type: 'session.updated', properties: { info: sdk } });
+    res.status(201).json(sdk);
   });
 
   // GET /session
   app.get('/session', (_req, res) => {
-    const list = Object.values(sessions).sort(
-      (a, b) => new Date(b.updatedAt) - new Date(a.updatedAt)
-    );
+    const list = Object.values(sessions)
+      .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))
+      .map(toSdkSession);
     res.json(list);
   });
 
@@ -128,7 +164,7 @@ function createApp(cwd) {
     if (!Object.hasOwn(sessions, id)) {
       return res.status(404).json({ error: 'Session not found' });
     }
-    res.json(sessions[id]);
+    res.json(toSdkSession(sessions[id]));
   });
 
   // DELETE /session/:id
@@ -160,7 +196,7 @@ function createApp(cwd) {
       return res.status(404).json({ error: 'Session not found' });
     }
     const messages = await loadMessages(id);
-    res.json(messages);
+    res.json(messages.map(msg => toSdkMessage(msg, id)));
   });
 
   // POST /session/:id/prompt_async — fire-and-forget; events delivered via SSE
@@ -200,6 +236,7 @@ function createApp(cwd) {
       existingMessages.push({ id: userMessageId, role: 'user', content, createdAt: new Date().toISOString() });
       await saveMessages(id, existingMessages);
 
+      const userCreatedAt = Date.now();
       broadcastGlobalEvent({
         type: 'message.updated',
         properties: {
@@ -208,23 +245,27 @@ function createApp(cwd) {
             sessionID: id,
             role: 'user',
             status: 'completed',
-            parts: [{ id: crypto.randomUUID(), type: 'text', text: content }],
+            time: { created: userCreatedAt, updated: userCreatedAt },
+            parts: [{ id: `${userMessageId}-p0`, type: 'text', text: content, messageID: userMessageId, sessionID: id }],
           }
         }
       });
 
       // Mark session busy
-      broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: 'busy' } });
+      broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: { type: 'busy' } } });
 
       // Spawn claude — use --resume only if we have a real claude session ID from a prior turn
-      const sessionCwd = (Object.hasOwn(sessions, id) && sessions[id].path) || _cwd;
+      const sessionCwd = (Object.hasOwn(sessions, id) && sessions[id].directory) || _cwd;
       const claudeSessionId = Object.hasOwn(sessions, id) ? sessions[id].claudeSessionId : null;
       const args = [
         '--print', '--output-format', 'stream-json', '--verbose',
         '--permission-mode', _permissionMode,
         ...(claudeSessionId ? ['--resume', claudeSessionId] : []),
       ];
-      const { CLAUDECODE, ...spawnEnv } = process.env;
+      // Strip Claude Code's own env vars so nested sessions aren't blocked
+      // eslint-disable-next-line no-unused-vars
+      const { CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, ...spawnEnv } = process.env;
+      console.error(`[claudecode-adapter] Spawning: ${_claudeBinary} ${args.join(' ')}`);
       const claudeProc = spawn(_claudeBinary, args, {
         cwd: sessionCwd,
         env: spawnEnv,
@@ -241,7 +282,7 @@ function createApp(cwd) {
 
       const timeoutHandle = setTimeout(() => {
         if (!claudeProc.killed) claudeProc.kill('SIGTERM');
-        broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: 'idle', error: 'Claude Code timed out' } });
+        broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: { type: 'idle' } } });
       }, TIMEOUT_MS);
 
       const processLine = (line) => {
@@ -274,7 +315,7 @@ function createApp(cwd) {
                 messageID: assistantMessageId,
                 sessionID: id,
               },
-              info: { id: assistantMessageId, sessionID: id }
+              info: { id: assistantMessageId, sessionID: id, role: 'assistant' }
             }
           });
         }
@@ -293,18 +334,21 @@ function createApp(cwd) {
 
       claudeProc.on('error', (err) => {
         clearTimeout(timeoutHandle);
-        broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: 'idle', error: err.message } });
+        broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: { type: 'idle' } } });
+        console.error('[claudecode-adapter] Claude process error:', err.message);
       });
 
       claudeProc.on('close', async (code) => {
         clearTimeout(timeoutHandle);
+        console.error(`[claudecode-adapter] Claude closed with code ${code}, assistantText.length=${assistantText.length}`);
 
         // Process any remaining buffered line
         if (stdoutBuf.trim()) processLine(stdoutBuf.trim());
 
         if (code !== 0 && !assistantText) {
           const errDetail = stderrBuf.trim() || `Claude exited with code ${code}`;
-          broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: 'idle', error: errDetail } });
+          console.error('[claudecode-adapter] Claude failed:', errDetail);
+          broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: { type: 'idle' } } });
           return;
         }
 
@@ -323,6 +367,7 @@ function createApp(cwd) {
         }
 
         // Emit final message.updated with complete content
+        const assistantCompletedAt = Date.now();
         broadcastGlobalEvent({
           type: 'message.updated',
           properties: {
@@ -331,17 +376,21 @@ function createApp(cwd) {
               sessionID: id,
               role: 'assistant',
               status: 'completed',
-              parts: [{ id: assistantPartId, type: 'text', text: assistantText }],
+              finish: 'stop',
+              time: { created: assistantCompletedAt, updated: assistantCompletedAt, completed: assistantCompletedAt },
+              parts: [{ id: assistantPartId, type: 'text', text: assistantText, messageID: assistantMessageId, sessionID: id }],
             }
           }
         });
 
-        broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: 'idle' } });
-        broadcastGlobalEvent({ type: 'session.updated', properties: { sessionID: id } });
+        broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: { type: 'idle' } } });
+        if (Object.hasOwn(sessions, id)) {
+          broadcastGlobalEvent({ type: 'session.updated', properties: { info: toSdkSession(sessions[id]) } });
+        }
       });
     })().catch((err) => {
       console.error('[claudecode-adapter] Unhandled error in prompt_async handler:', err.message);
-      broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: 'idle', error: err.message } });
+      broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: { type: 'idle' } } });
     });
   });
 
@@ -389,6 +438,26 @@ function createApp(cwd) {
   });
   app.post('/config/reload', (_req, res) => {
     res.json({ ok: true });
+  });
+
+  // Stubs for UI polling endpoints
+  app.get('/session/status', (_req, res) => {
+    res.json({ sessions: {} });
+  });
+  app.get('/session/:id/todo', (_req, res) => {
+    res.json([]);
+  });
+  app.get('/question', (_req, res) => {
+    res.json([]);
+  });
+  app.post('/question/reply', (_req, res) => {
+    res.json(false);
+  });
+  app.post('/question/reject', (_req, res) => {
+    res.json(false);
+  });
+  app.get('/permission', (_req, res) => {
+    res.json([]);
   });
 
   // Filesystem / git / terminal stubs

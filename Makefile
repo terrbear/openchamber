@@ -1,6 +1,7 @@
 .PHONY: package
 
 run:
+	kill $(lsof -ti:6969) || true
 	OPENCHAMBER_BACKEND=claudecode bun run dev
 
 # Detect platform and set appropriate bundle types

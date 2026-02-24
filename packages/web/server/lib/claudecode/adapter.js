@@ -18,6 +18,9 @@ let _claudeBinary = 'claude';
 let _cwd = process.cwd();
 let _permissionMode = 'acceptEdits';
 
+// Pending permission questions keyed by requestId: { resolve, question }
+const pendingQuestions = {};
+
 const globalSseClients = new Set();
 
 function broadcastGlobalEvent(obj) {
@@ -260,12 +263,12 @@ function createApp(cwd) {
       const args = [
         '--print', '--output-format', 'stream-json', '--verbose',
         '--permission-mode', _permissionMode,
+        '--permission-prompt-tool', 'stdio',
         ...(claudeSessionId ? ['--resume', claudeSessionId] : []),
       ];
       // Strip Claude Code's own env vars so nested sessions aren't blocked
       // eslint-disable-next-line no-unused-vars
       const { CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, ...spawnEnv } = process.env;
-      console.error(`[claudecode-adapter] Spawning: ${_claudeBinary} ${args.join(' ')}`);
       const claudeProc = spawn(_claudeBinary, args, {
         cwd: sessionCwd,
         env: spawnEnv,
@@ -295,6 +298,40 @@ function createApp(cwd) {
           // turns can use --resume to continue the same conversation.
           sessions[id].claudeSessionId = parsed.session_id;
           saveSessions().catch(() => {});
+        }
+
+        // Handle permission requests from --permission-prompt-tool stdio
+        if (parsed.type === 'permission_request' || parsed.type === 'tool_permission_request') {
+          const requestId = parsed.id || parsed.request_id || crypto.randomUUID();
+          const toolName = parsed.tool_name || parsed.tool || parsed.name || 'unknown';
+          const toolInput = parsed.tool_input || parsed.input || parsed.arguments || {};
+          const inputSummary = typeof toolInput === 'object'
+            ? (toolInput.command || toolInput.path || JSON.stringify(toolInput).slice(0, 80))
+            : String(toolInput).slice(0, 80);
+
+          const question = {
+            id: requestId,
+            sessionID: id,
+            questions: [{
+              question: `Allow ${toolName}?`,
+              header: toolName,
+              options: [
+                { label: 'Yes', description: `Allow ${toolName}: ${inputSummary}` },
+                { label: 'No', description: 'Deny this operation' },
+              ],
+            }],
+          };
+
+          pendingQuestions[requestId] = {
+            question,
+            resolve: ({ allow }) => {
+              const response = JSON.stringify({ type: 'permission_response', id: requestId, allow }) + '\n';
+              claudeProc.stdin.write(response, 'utf8');
+            },
+          };
+
+          broadcastGlobalEvent({ type: 'question.asked', properties: question });
+          return;
         }
 
         if (parsed.type === 'assistant' && parsed.message && Array.isArray(parsed.message.content)) {
@@ -387,6 +424,13 @@ function createApp(cwd) {
         if (Object.hasOwn(sessions, id)) {
           broadcastGlobalEvent({ type: 'session.updated', properties: { info: toSdkSession(sessions[id]) } });
         }
+
+        // Clean up any pending questions for this session (e.g. if process died mid-prompt)
+        for (const [reqId, entry] of Object.entries(pendingQuestions)) {
+          if (entry.question.sessionID === id) {
+            delete pendingQuestions[reqId];
+          }
+        }
       });
     })().catch((err) => {
       console.error('[claudecode-adapter] Unhandled error in prompt_async handler:', err.message);
@@ -428,7 +472,15 @@ function createApp(cwd) {
     });
   });
   app.get('/config/agents', (_req, res) => {
-    res.json([]);
+    // Return a hidden stub agent so the UI's loadAgents() doesn't early-return before
+    // applying model selection from settings (safeAgents.length === 0 causes an early return
+    // that skips the defaultModel logic in bootstrapConfiguration).
+    res.json([{
+      name: 'build',
+      mode: 'primary',
+      hidden: true,
+      model: { providerID: 'claude', modelID: 'default' },
+    }]);
   });
   app.get('/config/commands', (_req, res) => {
     res.json([]);
@@ -448,13 +500,33 @@ function createApp(cwd) {
     res.json([]);
   });
   app.get('/question', (_req, res) => {
-    res.json([]);
+    // Return any questions that are still pending (not yet answered)
+    const pending = Object.values(pendingQuestions).map(q => q.question);
+    res.json(pending);
   });
-  app.post('/question/reply', (_req, res) => {
-    res.json(false);
+  app.post('/question/reply', (req, res) => {
+    const { requestID, answers } = req.body || {};
+    if (!requestID || !Object.hasOwn(pendingQuestions, requestID)) {
+      return res.status(404).json({ error: 'Question not found' });
+    }
+    const entry = pendingQuestions[requestID];
+    delete pendingQuestions[requestID];
+    entry.resolve({ allow: true, answers });
+    const { sessionID } = entry.question;
+    broadcastGlobalEvent({ type: 'question.replied', properties: { sessionID, requestID } });
+    res.json(true);
   });
-  app.post('/question/reject', (_req, res) => {
-    res.json(false);
+  app.post('/question/reject', (req, res) => {
+    const { requestID } = req.body || {};
+    if (!requestID || !Object.hasOwn(pendingQuestions, requestID)) {
+      return res.status(404).json({ error: 'Question not found' });
+    }
+    const entry = pendingQuestions[requestID];
+    delete pendingQuestions[requestID];
+    entry.resolve({ allow: false });
+    const { sessionID } = entry.question;
+    broadcastGlobalEvent({ type: 'question.rejected', properties: { sessionID, requestID } });
+    res.json(true);
   });
   app.get('/permission', (_req, res) => {
     res.json([]);

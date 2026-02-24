@@ -220,13 +220,14 @@ function createApp(cwd) {
       const sessionCwd = (Object.hasOwn(sessions, id) && sessions[id].path) || _cwd;
       const claudeSessionId = Object.hasOwn(sessions, id) ? sessions[id].claudeSessionId : null;
       const args = [
-        '--print', '--output-format', 'stream-json',
+        '--print', '--output-format', 'stream-json', '--verbose',
         '--permission-mode', _permissionMode,
         ...(claudeSessionId ? ['--resume', claudeSessionId] : []),
       ];
+      const { CLAUDECODE, ...spawnEnv } = process.env;
       const claudeProc = spawn(_claudeBinary, args, {
         cwd: sessionCwd,
-        env: process.env,
+        env: spawnEnv,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
 
@@ -255,8 +256,13 @@ function createApp(cwd) {
           saveSessions().catch(() => {});
         }
 
-        if (parsed.type === 'text') {
-          assistantText += parsed.text;
+        if (parsed.type === 'assistant' && parsed.message && Array.isArray(parsed.message.content)) {
+          // stream-json format: assistant message with content array
+          for (const block of parsed.message.content) {
+            if (block.type === 'text' && typeof block.text === 'string') {
+              assistantText += block.text;
+            }
+          }
           // Emit streaming text update — same partId so UI updates the part in-place
           broadcastGlobalEvent({
             type: 'message.part.updated',

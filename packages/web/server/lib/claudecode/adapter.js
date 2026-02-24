@@ -535,10 +535,10 @@ function createApp(cwd) {
   const notImplemented = (_req, res) => {
     res.status(501).json({ error: 'Not implemented for Claude Code backend' });
   };
-  app.get('/fs/*', notImplemented);
-  app.get('/git/*', notImplemented);
-  app.get('/terminal/*', notImplemented);
-  app.post('/terminal/*', notImplemented);
+  app.get('/fs/*path', notImplemented);
+  app.get('/git/*path', notImplemented);
+  app.get('/terminal/*path', notImplemented);
+  app.post('/terminal/*path', notImplemented);
 
   // Unknown routes
   app.use((_req, res) => {

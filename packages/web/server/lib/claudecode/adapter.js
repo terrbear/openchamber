@@ -516,7 +516,21 @@ function createApp(cwd) {
 
   // Config stubs
   app.get('/config/settings', (_req, res) => {
-    res.json({ theme: null, autoshare: false, keybinds: {} });
+    res.json({ theme: null, autoshare: false, keybinds: {}, defaultModel: 'claude/default' });
+  });
+  app.get('/config/providers', (_req, res) => {
+    // Return a stub provider so the UI can auto-select a model and allow message submission.
+    // Claude Code manages its own model selection; the specific model ID is ignored by the adapter.
+    res.json({
+      providers: [{
+        id: 'claude',
+        name: 'Claude Code',
+        models: {
+          default: { id: 'default', name: 'Default (Claude Code)' },
+        },
+      }],
+      default: {},
+    });
   });
   app.get('/config/agents', (_req, res) => {
     res.json([]);

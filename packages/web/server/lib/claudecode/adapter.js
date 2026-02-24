@@ -77,6 +77,10 @@ async function loadMessages(sessionId) {
   }
 }
 
+async function saveMessages(sessionId, msgs) {
+  await fs.promises.writeFile(messagesFile(sessionId), JSON.stringify(msgs, null, 2), 'utf8');
+}
+
 function createApp(cwd) {
   const app = express();
   app.use(express.json());
@@ -158,344 +162,167 @@ function createApp(cwd) {
     res.json(messages);
   });
 
-  // POST /session/:id/message — streaming via claude --output-format=stream-json
-  app.post('/session/:id/message', async (req, res) => {
+  // POST /session/:id/prompt_async — fire-and-forget; events delivered via SSE
+  app.post('/session/:id/prompt_async', async (req, res) => {
     const { id } = req.params;
     if (!Object.hasOwn(sessions, id)) {
       return res.status(404).json({ error: 'Session not found' });
     }
 
+    // Extract text from parts array (OpenCode API format)
     const body = req.body || {};
-    const content = typeof body.content === 'string' ? body.content : '';
-    if (!content.trim()) {
-      return res.status(400).json({ error: 'content is required' });
+    const parts = Array.isArray(body.parts) ? body.parts : [];
+    const textPart = parts.find(p => p && p.type === 'text');
+    const content = (typeof textPart?.text === 'string') ? textPart.text.trim() : '';
+    if (!content) {
+      return res.status(400).json({ error: 'Message must contain a text part' });
     }
 
-    // Update session title from first message if still default
-    if (sessions[id].title === 'New Session') {
-      sessions[id].title = content.slice(0, 60) + (content.length > 60 ? '…' : '');
-    }
+    // Generate stable IDs for this exchange
+    const userMessageId = crypto.randomUUID();
+    const assistantMessageId = crypto.randomUUID();
+    const assistantPartId = crypto.randomUUID();
 
-    // Persist user message
-    const userMsgId = crypto.randomUUID();
-    const userMessage = {
-      id: userMsgId,
-      role: 'user',
-      content,
-      createdAt: new Date().toISOString(),
-    };
-    const existingMessages = await loadMessages(id);
-    existingMessages.push(userMessage);
+    // Return immediately — the UI will receive events via the SSE stream
+    res.status(200).json({ id: userMessageId });
 
-    const saveMessages = (msgs) =>
-      fs.promises.writeFile(
-        messagesFile(id),
-        JSON.stringify(msgs, null, 2),
-        'utf8'
-      );
-
-    try {
-      await saveMessages(existingMessages);
-    } catch (err) {
-      console.error('[claudecode-adapter] Failed to persist user message:', err.message);
-    }
-
-    // SSE response headers
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders();
-
-    const emitSse = (obj) => {
-      if (!res.writableEnded) {
-        res.write(`data: ${JSON.stringify(obj)}\n\n`);
+    // Everything below runs asynchronously after the response is sent
+    ;(async () => {
+      // Update session title from first message
+      if (Object.hasOwn(sessions, id) && sessions[id].title === 'New Session') {
+        sessions[id].title = content.slice(0, 60).replace(/\n/g, ' ');
+        await saveSessions();
       }
-    };
 
-    // Emit session busy status
-    emitSse({ type: 'session.status', properties: { sessionID: id, status: 'busy' } });
+      // Persist user message and emit it
+      const existingMessages = await loadMessages(id);
+      existingMessages.push({ id: userMessageId, role: 'user', content, createdAt: new Date().toISOString() });
+      await saveMessages(id, existingMessages);
 
-    // Spawn claude subprocess
-    const args = [
-      '--print',
-      '--output-format', 'stream-json',
-      '--resume', id,
-      '--permission-mode', _permissionMode,
-    ];
-    const claudeProc = spawn(_claudeBinary, args, {
-      cwd: sessions[id].path || _cwd,
-      env: process.env,
-    });
+      broadcastGlobalEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: userMessageId,
+            sessionID: id,
+            role: 'user',
+            status: 'completed',
+            parts: [{ id: crypto.randomUUID(), type: 'text', text: content }],
+          }
+        }
+      });
 
-    // Write user message text to stdin then close it
-    claudeProc.stdin.write(content, 'utf8');
-    claudeProc.stdin.end();
-    claudeProc.stdin.on('error', () => {
-      // stdin errors are handled via the process 'error' or 'close' event
-    });
+      // Mark session busy
+      broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: 'busy' } });
 
-    // Handle client disconnect
-    const onClose = () => {
-      if (!claudeProc.killed) {
-        claudeProc.kill();
-      }
-    };
-    res.on('close', onClose);
+      // Spawn claude
+      const sessionCwd = (Object.hasOwn(sessions, id) && sessions[id].path) || _cwd;
+      const args = ['--print', '--output-format', 'stream-json', '--resume', id, '--permission-mode', _permissionMode];
+      const claudeProc = spawn(_claudeBinary, args, {
+        cwd: sessionCwd,
+        env: process.env,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
 
-    let stdoutBuf = '';
-    const assistantParts = [];
-    let assistantMsgId = crypto.randomUUID();
+      claudeProc.stdin.on('error', () => {});
+      claudeProc.stdin.write(content, 'utf8');
+      claudeProc.stdin.end();
 
-    // 5-minute timeout watchdog
-    const timeoutHandle = setTimeout(() => {
-      if (!claudeProc.killed) {
-        claudeProc.kill('SIGTERM');
-      }
-      emitSse({ type: 'session.status', properties: { sessionID: id, status: 'idle', error: 'Claude Code process timed out' } });
-      if (!res.writableEnded) res.end();
-    }, TIMEOUT_MS);
+      let stdoutBuf = '';
+      let stderrBuf = '';
+      let assistantText = '';
 
-    claudeProc.stdout.on('data', (chunk) => {
-      stdoutBuf += chunk.toString('utf8');
-      const lines = stdoutBuf.split('\n');
-      stdoutBuf = lines.pop(); // keep incomplete last line
+      const timeoutHandle = setTimeout(() => {
+        if (!claudeProc.killed) claudeProc.kill('SIGTERM');
+        broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: 'idle', error: 'Claude Code timed out' } });
+      }, TIMEOUT_MS);
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
+      const processLine = (line) => {
+        if (!line.trim()) return;
+        let parsed;
+        try { parsed = JSON.parse(line); } catch { return; }
 
-        let event;
-        try {
-          event = JSON.parse(trimmed);
-        } catch {
-          // not JSON, skip
-          continue;
+        if (parsed.type === 'text') {
+          assistantText += parsed.text;
+          // Emit streaming text update — same partId so UI updates the part in-place
+          broadcastGlobalEvent({
+            type: 'message.part.updated',
+            properties: {
+              part: {
+                id: assistantPartId,
+                type: 'text',
+                text: assistantText,
+                messageID: assistantMessageId,
+                sessionID: id,
+              },
+              info: { id: assistantMessageId, sessionID: id }
+            }
+          });
+        }
+      };
+
+      claudeProc.stdout.on('data', (chunk) => {
+        stdoutBuf += chunk.toString('utf8');
+        const lines = stdoutBuf.split('\n');
+        stdoutBuf = lines.pop() ?? '';
+        for (const line of lines) processLine(line);
+      });
+
+      claudeProc.stderr.on('data', (chunk) => {
+        if (stderrBuf.length < STDERR_MAX) stderrBuf += chunk.toString('utf8');
+      });
+
+      claudeProc.on('error', (err) => {
+        clearTimeout(timeoutHandle);
+        broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: 'idle', error: err.message } });
+      });
+
+      claudeProc.on('close', async (code) => {
+        clearTimeout(timeoutHandle);
+
+        // Process any remaining buffered line
+        if (stdoutBuf.trim()) processLine(stdoutBuf.trim());
+
+        if (code !== 0 && !assistantText) {
+          const errDetail = stderrBuf.trim() || `Claude exited with code ${code}`;
+          broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: 'idle', error: errDetail } });
+          return;
         }
 
-        if (!event || typeof event.type !== 'string') continue;
-
-        if (event.type === 'text' && typeof event.text === 'string') {
-          const part = {
-            id: crypto.randomUUID(),
-            type: 'text',
-            text: event.text,
-            sessionID: id,
-            messageID: assistantMsgId,
-          };
-          assistantParts.push(part);
-
-          emitSse({
-            type: 'message.part.updated',
-            properties: {
-              sessionID: id,
-              messageID: assistantMsgId,
-              info: { id: assistantMsgId, sessionID: id, role: 'assistant' },
-              part,
-            },
-          });
-        } else if (event.type === 'tool_use') {
-          const part = {
-            id: event.id || crypto.randomUUID(),
-            type: 'tool',
-            tool: event.name,
-            input: event.input || {},
-            sessionID: id,
-            messageID: assistantMsgId,
-            state: { status: 'running' },
-          };
-          assistantParts.push(part);
-
-          emitSse({
-            type: 'message.part.updated',
-            properties: {
-              sessionID: id,
-              messageID: assistantMsgId,
-              info: { id: assistantMsgId, sessionID: id, role: 'assistant' },
-              part,
-            },
-          });
-        } else if (event.type === 'result' && event.subtype === 'success') {
-          // Persist assistant message
-          const fullText = assistantParts
-            .filter((p) => p.type === 'text')
-            .map((p) => p.text)
-            .join('');
-
-          const assistantText = fullText;
-
-          const assistantMessage = {
-            id: assistantMsgId,
-            role: 'assistant',
-            content: assistantText,
-            parts: assistantParts,
-            createdAt: new Date().toISOString(),
-            cost_usd: event.total_cost_usd,
-            duration_ms: event.duration_ms,
-          };
-
-          // Emit final message.updated event before persisting
-          emitSse({
-            type: 'message.updated',
-            properties: {
-              sessionID: id,
-              messageID: assistantMsgId,
-              info: {
-                id: assistantMsgId,
-                sessionID: id,
-                role: 'assistant',
-                finish: 'stop',
-                status: 'completed',
-              },
-              parts: assistantParts,
-            },
-          });
-
-          // Emit session idle
-          emitSse({ type: 'session.status', properties: { sessionID: id, status: 'idle' } });
-
-          async function persistAndClose() {
-            try {
-              const existing = [...existingMessages];
-              existing.push(assistantMessage);
-              await saveMessages(existing);
-              if (Object.hasOwn(sessions, id)) {
-                sessions[id].updatedAt = new Date().toISOString();
-                sessions[id].messageCount = existing.length;
-                await saveSessions();
-              }
-              broadcastGlobalEvent({ type: 'session.updated', properties: { sessionID: id } });
-            } catch (err) {
-              console.error('[claudecode-adapter] Failed to persist assistant message:', err.message);
-              broadcastGlobalEvent({ type: 'session.updated', properties: { sessionID: id } });
-            } finally {
-              res.removeListener('close', onClose);
-              if (!res.writableEnded) res.end();
-            }
-          }
-          persistAndClose();
-        } else if (event.type === 'result' && event.subtype === 'error') {
-          const errMsg = typeof event.error === 'string' ? event.error : 'Claude error';
-
-          // Persist error placeholder
-          const errEntry = {
-            role: 'assistant',
-            content: `[Error: ${event.error || 'Unknown error'}]`,
-            createdAt: new Date().toISOString(),
-            error: true,
-          };
-          const msgs = [...existingMessages, errEntry];
-          saveMessages(msgs).catch(() => {});
+        // Persist complete assistant message
+        try {
+          const msgs = await loadMessages(id);
+          msgs.push({ id: assistantMessageId, role: 'assistant', content: assistantText, createdAt: new Date().toISOString() });
+          await saveMessages(id, msgs);
           if (Object.hasOwn(sessions, id)) {
             sessions[id].updatedAt = new Date().toISOString();
             sessions[id].messageCount = msgs.length;
-            saveSessions();
+            await saveSessions();
           }
-
-          broadcastGlobalEvent({ type: 'session.updated', properties: { sessionID: id } });
-          emitSse({
-            type: 'session.status',
-            properties: { sessionID: id, status: 'idle', error: errMsg },
-          });
-          res.removeListener('close', onClose);
-          if (!res.writableEnded) {
-            res.end();
-          }
+        } catch (err) {
+          console.error('[claudecode-adapter] Failed to persist assistant message:', err.message);
         }
-      }
-    });
 
-    let stderrBuf = '';
-    claudeProc.stderr.on('data', (chunk) => {
-      if (stderrBuf.length < STDERR_MAX) {
-        stderrBuf += chunk.toString('utf8');
-      }
-    });
-
-    claudeProc.on('close', (code) => {
-      clearTimeout(timeoutHandle);
-
-      // Process any remaining stdout content not followed by a newline
-      if (stdoutBuf.trim()) {
-        try {
-          const parsed = JSON.parse(stdoutBuf.trim());
-          if (parsed && typeof parsed.type === 'string') {
-            if (parsed.type === 'result' && parsed.subtype === 'success') {
-              // If we get a success result here, emit the completion events
-              const fullText = assistantParts
-                .filter((p) => p.type === 'text')
-                .map((p) => p.text)
-                .join('');
-              const assistantMessage = {
-                id: assistantMsgId,
-                role: 'assistant',
-                content: fullText,
-                parts: assistantParts,
-                createdAt: new Date().toISOString(),
-                cost_usd: parsed.total_cost_usd,
-                duration_ms: parsed.duration_ms,
-              };
-              emitSse({
-                type: 'message.updated',
-                properties: {
-                  sessionID: id,
-                  messageID: assistantMsgId,
-                  info: { id: assistantMsgId, sessionID: id, role: 'assistant', finish: 'stop', status: 'completed' },
-                  parts: assistantParts,
-                },
-              });
-              async function persistTrailingAndClose() {
-                try {
-                  const existing = [...existingMessages];
-                  existing.push(assistantMessage);
-                  await saveMessages(existing);
-                  if (Object.hasOwn(sessions, id)) {
-                    sessions[id].updatedAt = new Date().toISOString();
-                    sessions[id].messageCount = existing.length;
-                    await saveSessions();
-                  }
-                  broadcastGlobalEvent({ type: 'session.updated', properties: { sessionID: id } });
-                } catch (err) {
-                  console.error('[claudecode-adapter] Failed to persist assistant message:', err.message);
-                  broadcastGlobalEvent({ type: 'session.updated', properties: { sessionID: id } });
-                }
-              }
-              persistTrailingAndClose();
-              emitSse({ type: 'session.status', properties: { sessionID: id, status: 'idle' } });
-              res.removeListener('close', onClose);
-              if (!res.writableEnded) res.end();
-              return;
+        // Emit final message.updated with complete content
+        broadcastGlobalEvent({
+          type: 'message.updated',
+          properties: {
+            info: {
+              id: assistantMessageId,
+              sessionID: id,
+              role: 'assistant',
+              status: 'completed',
+              parts: [{ id: assistantPartId, type: 'text', text: assistantText }],
             }
           }
-        } catch { /* ignore invalid JSON */ }
-      }
-
-      res.removeListener('close', onClose);
-
-      if (code !== 0 && !res.writableEnded) {
-        const errDetail = stderrBuf.trim() || `Claude exited with code ${code}`;
-        console.error('[claudecode-adapter] claude process error:', errDetail);
-        broadcastGlobalEvent({ type: 'session.updated', properties: { sessionID: id } });
-        emitSse({ type: 'session.status', properties: { sessionID: id, status: 'idle', error: errDetail } });
-        if (!res.writableEnded) res.end();
-      } else if (!res.writableEnded) {
-        // Clean exit but response not yet ended (shouldn't normally happen, but be safe)
-        broadcastGlobalEvent({ type: 'session.updated', properties: { sessionID: id } });
-        emitSse({ type: 'session.status', properties: { sessionID: id, status: 'idle' } });
-        res.end();
-      }
-    });
-
-    claudeProc.on('error', (err) => {
-      console.error('[claudecode-adapter] Failed to spawn claude:', err.message);
-      res.removeListener('close', onClose);
-      if (!res.writableEnded) {
-        emitSse({
-          type: 'session.status',
-          properties: { sessionID: id, status: 'idle', error: err.message },
         });
-        res.end();
-      }
+
+        broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: 'idle' } });
+        broadcastGlobalEvent({ type: 'session.updated', properties: { sessionID: id } });
+      });
+    })().catch((err) => {
+      console.error('[claudecode-adapter] Unhandled error in prompt_async handler:', err.message);
+      broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: 'idle', error: err.message } });
     });
   });
 

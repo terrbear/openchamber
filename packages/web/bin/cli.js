@@ -74,7 +74,7 @@ function buildTunnelUrl(baseUrl, password, includePassword) {
 function parseArgs() {
   const args = process.argv.slice(2);
   const envPassword = process.env.OPENCHAMBER_UI_PASSWORD || undefined;
-  const options = { port: DEFAULT_PORT, daemon: false, uiPassword: envPassword, tryCfTunnel: false, tunnelQr: false, tunnelPasswordUrl: false };
+  const options = { port: DEFAULT_PORT, daemon: false, uiPassword: envPassword, tryCfTunnel: false, tunnelQr: false, tunnelPasswordUrl: false, backend: 'opencode', claudeBinary: undefined };
   let command = 'serve';
 
   const consumeValue = (currentIndex, inlineValue) => {
@@ -132,6 +132,23 @@ function parseArgs() {
           options.uiPassword = typeof value === 'string' ? value : '';
           break;
         }
+        case 'backend': {
+          const { value, nextIndex } = consumeValue(i, inlineValue);
+          i = nextIndex;
+          if (value === 'opencode' || value === 'claudecode') {
+            options.backend = value;
+          } else if (value !== undefined) {
+            console.error(`Error: --backend must be 'opencode' or 'claudecode', got '${value}'`);
+            process.exit(1);
+          }
+          break;
+        }
+        case 'claude-binary': {
+          const { value, nextIndex } = consumeValue(i, inlineValue);
+          i = nextIndex;
+          options.claudeBinary = typeof value === 'string' ? value : undefined;
+          break;
+        }
         case 'help':
         case 'h':
           showHelp();
@@ -172,6 +189,8 @@ OPTIONS:
   --tunnel-qr             Display QR code for tunnel URL (use with --try-cf-tunnel)
   --tunnel-password-url   Include password in tunnel URL for auto-login
   -d, --daemon            Run in background (serve command)
+  --backend               Backend to use: opencode (default) or claudecode
+  --claude-binary         Path to the claude CLI binary (claudecode backend only)
   -h, --help              Show help
   -v, --version           Show version
 
@@ -179,6 +198,7 @@ ENVIRONMENT:
   OPENCHAMBER_UI_PASSWORD      Alternative to --ui-password flag
   OPENCODE_PORT               Port of external OpenCode server to connect to
   OPENCODE_SKIP_START          Skip starting OpenCode, use external server
+  CLAUDECODE_BINARY           Path to the claude CLI binary (claudecode backend)
 
 EXAMPLES:
   openchamber                    # Start on default port 3000 (or a free port)
@@ -313,6 +333,90 @@ async function checkOpenCodeCLI() {
   console.error('Error: Unable to locate the opencode CLI on PATH.');
   console.error(`Current PATH: ${process.env.PATH || '<empty>'}`);
   console.error('Ensure the CLI is installed and reachable, or set OPENCODE_BINARY to its full path.');
+  process.exit(1);
+}
+
+async function checkClaudeCodeCLI(claudeBinaryFlag) {
+  // Check explicit --claude-binary flag first
+  if (claudeBinaryFlag) {
+    const override = resolveExplicitBinary(claudeBinaryFlag);
+    if (override) {
+      process.env.CLAUDECODE_BINARY = override;
+      return override;
+    }
+    console.warn(`Warning: --claude-binary="${claudeBinaryFlag}" is not an executable file. Falling back to env/PATH lookup.`);
+  }
+
+  // Check CLAUDECODE_BINARY env var
+  if (process.env.CLAUDECODE_BINARY) {
+    const override = resolveExplicitBinary(process.env.CLAUDECODE_BINARY);
+    if (override) {
+      process.env.CLAUDECODE_BINARY = override;
+      return override;
+    }
+    console.warn(`Warning: CLAUDECODE_BINARY="${process.env.CLAUDECODE_BINARY}" is not an executable file. Falling back to PATH lookup.`);
+  }
+
+  const resolvedFromPath = searchPathFor('claude');
+  if (resolvedFromPath) {
+    process.env.CLAUDECODE_BINARY = resolvedFromPath;
+    return resolvedFromPath;
+  }
+
+  if (process.platform !== 'win32') {
+    const shellCandidates = [];
+    if (process.env.SHELL) {
+      shellCandidates.push(process.env.SHELL);
+    }
+    shellCandidates.push('/bin/bash', '/bin/zsh', '/bin/sh');
+
+    for (const shellPath of shellCandidates) {
+      if (!shellPath || !isExecutable(shellPath)) {
+        continue;
+      }
+      try {
+        const result = spawnSync(shellPath, ['-lic', 'command -v claude'], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        if (result.status === 0) {
+          const candidate = result.stdout.trim().split(/\s+/).pop();
+          if (candidate && isExecutable(candidate)) {
+            const dir = path.dirname(candidate);
+            const currentPath = process.env.PATH || '';
+            const segments = currentPath.split(path.delimiter).filter(Boolean);
+            if (!segments.includes(dir)) {
+              segments.unshift(dir);
+              process.env.PATH = segments.join(path.delimiter);
+            }
+            process.env.CLAUDECODE_BINARY = candidate;
+            return candidate;
+          }
+        }
+      } catch (error) {
+
+      }
+    }
+  } else {
+    try {
+      const result = spawnSync('where', ['claude'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      if (result.status === 0) {
+        const candidate = result.stdout.split(/\r?\n/).map((line) => line.trim()).find((line) => line.length > 0);
+        if (candidate && isExecutable(candidate)) {
+          process.env.CLAUDECODE_BINARY = candidate;
+          return candidate;
+        }
+      }
+    } catch (error) {
+
+    }
+  }
+
+  console.error('Error: Unable to locate the claude CLI. Specify its path with --claude-binary or CLAUDECODE_BINARY.');
+  console.error(`Current PATH: ${process.env.PATH || '<empty>'}`);
   process.exit(1);
 }
 
@@ -492,7 +596,13 @@ const commands = {
       // Explicitly requested port=0; nothing to persist.
     }
 
-    const opencodeBinary = await checkOpenCodeCLI();
+    let opencodeBinary;
+    let claudecodeBinary;
+    if (options.backend === 'claudecode') {
+      claudecodeBinary = await checkClaudeCodeCLI(options.claudeBinary);
+    } else {
+      opencodeBinary = await checkOpenCodeCLI();
+    }
 
     const serverPath = path.join(__dirname, '..', 'server', 'index.js');
 
@@ -522,7 +632,9 @@ const commands = {
         env: {
           ...process.env,
           OPENCHAMBER_PORT: options.port.toString(),
-          OPENCODE_BINARY: opencodeBinary,
+          OPENCHAMBER_BACKEND: options.backend || 'opencode',
+          ...(opencodeBinary ? { OPENCODE_BINARY: opencodeBinary } : {}),
+          ...(claudecodeBinary ? { CLAUDECODE_BINARY: claudecodeBinary } : {}),
           ...(typeof effectiveUiPassword === 'string' ? { OPENCHAMBER_UI_PASSWORD: effectiveUiPassword } : {}),
           OPENCHAMBER_TRY_CF_TUNNEL: options.tryCfTunnel ? 'true' : 'false',
           ...(process.env.OPENCODE_SKIP_START ? { OPENCHAMBER_SKIP_OPENCODE_START: process.env.OPENCODE_SKIP_START } : {}),
@@ -590,7 +702,13 @@ const commands = {
       return;
     }
 
-    process.env.OPENCODE_BINARY = opencodeBinary;
+    process.env.OPENCHAMBER_BACKEND = options.backend || 'opencode';
+    if (opencodeBinary) {
+      process.env.OPENCODE_BINARY = opencodeBinary;
+    }
+    if (claudecodeBinary) {
+      process.env.CLAUDECODE_BINARY = claudecodeBinary;
+    }
     if (typeof effectiveUiPassword === 'string') {
       process.env.OPENCHAMBER_UI_PASSWORD = effectiveUiPassword;
     }
@@ -610,7 +728,9 @@ const commands = {
         env: {
           ...process.env,
           OPENCHAMBER_PORT: options.port.toString(),
-          OPENCODE_BINARY: opencodeBinary,
+          OPENCHAMBER_BACKEND: options.backend || 'opencode',
+          ...(opencodeBinary ? { OPENCODE_BINARY: opencodeBinary } : {}),
+          ...(claudecodeBinary ? { CLAUDECODE_BINARY: claudecodeBinary } : {}),
           ...(typeof effectiveUiPassword === 'string' ? { OPENCHAMBER_UI_PASSWORD: effectiveUiPassword } : {}),
           OPENCHAMBER_TRY_CF_TUNNEL: options.tryCfTunnel ? 'true' : 'false',
           ...(process.env.OPENCODE_SKIP_START ? { OPENCHAMBER_SKIP_OPENCODE_START: process.env.OPENCODE_SKIP_START } : {}),
@@ -631,6 +751,8 @@ const commands = {
       exitOnShutdown: true,
       uiPassword: typeof effectiveUiPassword === 'string' ? effectiveUiPassword : null,
       tryCfTunnel: options.tryCfTunnel,
+      backend: options.backend || 'opencode',
+      claudeBinary: claudecodeBinary || undefined,
       onTunnelReady: async (url) => {
         const displayUrl = buildTunnelUrl(url, effectiveUiPassword, options.tunnelPasswordUrl);
         console.log(`\n🌐 Tunnel URL: \x1b[36m${displayUrl}\x1b[0m\n`);

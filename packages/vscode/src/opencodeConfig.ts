@@ -61,14 +61,104 @@ const getProjectAgentPath = (workingDirectory: string, agentName: string): strin
   return pluralPath;
 };
 
-const getUserAgentPath = (agentName: string): string => {
+type AgentLookupCache = {
+  userAgentIndexByName: Map<string, string>;
+  userAgentLookupByName: Map<string, string | null>;
+  userAgentIndexReady: boolean;
+  userAgentIndexBuiltAt: number;
+};
+
+const AGENT_LOOKUP_CACHE_TTL_MS = 1000;
+
+const createAgentLookupCache = (): AgentLookupCache => ({
+  userAgentIndexByName: new Map<string, string>(),
+  userAgentLookupByName: new Map<string, string | null>(),
+  userAgentIndexReady: false,
+  userAgentIndexBuiltAt: 0,
+});
+
+const globalAgentLookupCache = createAgentLookupCache();
+
+const resetAgentLookupCache = (cache: AgentLookupCache): void => {
+  cache.userAgentIndexByName.clear();
+  cache.userAgentLookupByName.clear();
+  cache.userAgentIndexReady = false;
+  cache.userAgentIndexBuiltAt = 0;
+};
+
+const buildUserAgentIndex = (cache: AgentLookupCache): void => {
+  if (cache.userAgentIndexReady && Date.now() - cache.userAgentIndexBuiltAt < AGENT_LOOKUP_CACHE_TTL_MS) {
+    return;
+  }
+
+  cache.userAgentIndexByName.clear();
+  cache.userAgentLookupByName.clear();
+  cache.userAgentIndexReady = true;
+  cache.userAgentIndexBuiltAt = Date.now();
+
+  if (!fs.existsSync(AGENT_DIR)) return;
+
+  const dirsToVisit: string[] = [AGENT_DIR];
+  while (dirsToVisit.length > 0) {
+    const dir = dirsToVisit.pop();
+    if (!dir) continue;
+
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.md')) continue;
+      const discoveredAgentName = entry.name.slice(0, -3);
+      if (!cache.userAgentIndexByName.has(discoveredAgentName)) {
+        cache.userAgentIndexByName.set(discoveredAgentName, path.join(dir, entry.name));
+      }
+    }
+
+    for (let i = entries.length - 1; i >= 0; i -= 1) {
+      const entry = entries[i];
+      if (entry?.isDirectory()) {
+        dirsToVisit.push(path.join(dir, entry.name));
+      }
+    }
+  }
+};
+
+const getIndexedUserAgentPath = (agentName: string, cache: AgentLookupCache): string | null => {
+  if (cache.userAgentLookupByName.has(agentName)) {
+    return cache.userAgentLookupByName.get(agentName) || null;
+  }
+
+  buildUserAgentIndex(cache);
+  const found = cache.userAgentIndexByName.get(agentName) || null;
+  cache.userAgentLookupByName.set(agentName, found);
+  return found;
+};
+
+const getUserAgentPath = (agentName: string, lookupCache: AgentLookupCache = globalAgentLookupCache): string => {
   const pluralPath = path.join(AGENT_DIR, `${agentName}.md`);
+
+  if (fs.existsSync(pluralPath)) return pluralPath;
+
   const legacyPath = path.join(OPENCODE_CONFIG_DIR, 'agent', `${agentName}.md`);
-  if (fs.existsSync(legacyPath) && !fs.existsSync(pluralPath)) return legacyPath;
+  if (fs.existsSync(legacyPath)) return legacyPath;
+
+  const found = getIndexedUserAgentPath(agentName, lookupCache);
+  if (found) return found;
+
   return pluralPath;
 };
 
-export const getAgentScope = (agentName: string, workingDirectory?: string): { scope: AgentScope | null; path: string | null } => {
+export const getAgentScope = (
+  agentName: string,
+  workingDirectory?: string,
+  lookupCache: AgentLookupCache = globalAgentLookupCache
+): { scope: AgentScope | null; path: string | null } => {
   if (workingDirectory) {
     const projectPath = getProjectAgentPath(workingDirectory, agentName);
     if (fs.existsSync(projectPath)) {
@@ -76,7 +166,7 @@ export const getAgentScope = (agentName: string, workingDirectory?: string): { s
     }
   }
   
-  const userPath = getUserAgentPath(agentName);
+  const userPath = getUserAgentPath(agentName, lookupCache);
   if (fs.existsSync(userPath)) {
     return { scope: AGENT_SCOPE.USER, path: userPath };
   }
@@ -84,8 +174,13 @@ export const getAgentScope = (agentName: string, workingDirectory?: string): { s
   return { scope: null, path: null };
 };
 
-const getAgentWritePath = (agentName: string, workingDirectory?: string, requestedScope?: AgentScope): { scope: AgentScope; path: string } => {
-  const existing = getAgentScope(agentName, workingDirectory);
+const getAgentWritePath = (
+  agentName: string,
+  workingDirectory?: string,
+  requestedScope?: AgentScope,
+  lookupCache: AgentLookupCache = globalAgentLookupCache
+): { scope: AgentScope; path: string } => {
+  const existing = getAgentScope(agentName, workingDirectory, lookupCache);
   if (existing.path) {
     return { scope: existing.scope!, path: existing.path };
   }
@@ -100,7 +195,7 @@ const getAgentWritePath = (agentName: string, workingDirectory?: string, request
   
   return { 
     scope: AGENT_SCOPE.USER, 
-    path: getUserAgentPath(agentName) 
+    path: getUserAgentPath(agentName, lookupCache) 
   };
 };
 
@@ -382,9 +477,192 @@ const writeConfig = (config: Record<string, unknown>, filePath: string = CONFIG_
   fs.writeFileSync(filePath, JSON.stringify(config, null, 2), 'utf8');
 };
 
+export type McpLocalConfig = {
+  type: 'local';
+  command?: string[];
+  environment?: Record<string, string>;
+  enabled?: boolean;
+};
+
+export type McpRemoteConfig = {
+  type: 'remote';
+  url?: string;
+  environment?: Record<string, string>;
+  enabled?: boolean;
+};
+
+export type McpConfigPayload = McpLocalConfig | McpRemoteConfig;
+
+export type McpConfigEntry = {
+  name: string;
+  scope?: AgentScope | null;
+  type: 'local' | 'remote';
+  command?: string[];
+  url?: string;
+  environment?: Record<string, string>;
+  enabled: boolean;
+};
+
+const resolveMcpScopeFromPath = (layers: ReturnType<typeof readConfigLayers>, sourcePath?: string | null): AgentScope | null => {
+  if (!sourcePath) return null;
+  return sourcePath === layers.paths.projectPath ? AGENT_SCOPE.PROJECT : AGENT_SCOPE.USER;
+};
+
+const ensureProjectMcpConfigPath = (workingDirectory: string): string => {
+  const projectConfigDir = path.join(workingDirectory, '.opencode');
+  if (!fs.existsSync(projectConfigDir)) {
+    fs.mkdirSync(projectConfigDir, { recursive: true });
+  }
+  return path.join(projectConfigDir, 'opencode.json');
+};
+
+const validateMcpName = (name: string): void => {
+  if (!name || typeof name !== 'string') {
+    throw new Error('MCP server name is required');
+  }
+  if (!/^[a-z0-9][a-z0-9_-]*[a-z0-9]$|^[a-z0-9]$/.test(name)) {
+    throw new Error('MCP server name must be lowercase alphanumeric with hyphens/underscores');
+  }
+};
+
+const buildMcpEntry = (data: Record<string, unknown>): Omit<McpConfigEntry, 'name'> => {
+  const entry: Omit<McpConfigEntry, 'name'> = {
+    type: data.type === 'remote' ? 'remote' : 'local',
+    enabled: data.enabled !== false,
+  };
+
+  if (entry.type === 'local') {
+    if (Array.isArray(data.command) && data.command.length > 0) {
+      entry.command = data.command.map((value) => String(value));
+    }
+  } else if (typeof data.url === 'string' && data.url.trim()) {
+    entry.url = data.url.trim();
+  }
+
+  if (isPlainObject(data.environment)) {
+    const cleaned: Record<string, string> = {};
+    for (const [key, value] of Object.entries(data.environment)) {
+      if (key && value != null) {
+        cleaned[key] = String(value);
+      }
+    }
+    if (Object.keys(cleaned).length > 0) {
+      entry.environment = cleaned;
+    }
+  }
+
+  return entry;
+};
+
+export const listMcpConfigs = (workingDirectory?: string): McpConfigEntry[] => {
+  const layers = readConfigLayers(workingDirectory);
+  const merged = (layers.mergedConfig as Record<string, unknown>) || {};
+  const mcp = isPlainObject(merged.mcp) ? merged.mcp : {};
+  return Object.entries(mcp)
+    .filter(([, value]) => isPlainObject(value))
+    .map(([name, value]) => {
+      const source = getJsonEntrySource(layers, 'mcp', name);
+      return {
+        name,
+        ...buildMcpEntry(value as Record<string, unknown>),
+        scope: resolveMcpScopeFromPath(layers, source.path),
+      };
+    });
+};
+
+export const getMcpConfig = (name: string, workingDirectory?: string): McpConfigEntry | null => {
+  const layers = readConfigLayers(workingDirectory);
+  const merged = (layers.mergedConfig as Record<string, unknown>) || {};
+  const mcp = isPlainObject(merged.mcp) ? merged.mcp : {};
+  const entry = mcp[name];
+  if (!isPlainObject(entry)) {
+    return null;
+  }
+  const source = getJsonEntrySource(layers, 'mcp', name);
+  return {
+    name,
+    ...buildMcpEntry(entry as Record<string, unknown>),
+    scope: resolveMcpScopeFromPath(layers, source.path),
+  };
+};
+
+export const createMcpConfig = (
+  name: string,
+  mcpConfig: Record<string, unknown>,
+  workingDirectory?: string,
+  scope?: AgentScope,
+): void => {
+  validateMcpName(name);
+
+  const layers = readConfigLayers(workingDirectory);
+  const source = getJsonEntrySource(layers, 'mcp', name);
+  if (source.exists) {
+    throw new Error(`MCP server "${name}" already exists`);
+  }
+
+  let targetPath = CONFIG_FILE;
+  let config: Record<string, unknown> = {};
+
+  if (scope === AGENT_SCOPE.PROJECT) {
+    if (!workingDirectory) {
+      throw new Error('Project scope requires working directory');
+    }
+    targetPath = ensureProjectMcpConfigPath(workingDirectory);
+    config = readConfigFile(targetPath);
+  } else {
+    const jsonTarget = getJsonWriteTarget(layers, AGENT_SCOPE.USER);
+    targetPath = jsonTarget.path || CONFIG_FILE;
+    config = (jsonTarget.config || {}) as Record<string, unknown>;
+  }
+
+  const mcp = isPlainObject(config.mcp) ? { ...config.mcp } : {};
+
+  const { name: _ignoredName, ...entryData } = mcpConfig;
+  void _ignoredName;
+  mcp[name] = buildMcpEntry(entryData);
+  config.mcp = mcp;
+  writeConfig(config, targetPath);
+};
+
+export const updateMcpConfig = (name: string, updates: Record<string, unknown>, workingDirectory?: string): void => {
+  const layers = readConfigLayers(workingDirectory);
+  const source = getJsonEntrySource(layers, 'mcp', name);
+  const targetPath = source.path || CONFIG_FILE;
+  const config = (source.config || readConfigFile(targetPath)) as Record<string, unknown>;
+  const mcp = isPlainObject(config.mcp) ? { ...config.mcp } : {};
+  const existing = isPlainObject(mcp[name]) ? mcp[name] : {};
+
+  const { name: _ignoredName, ...updateData } = updates;
+  void _ignoredName;
+  mcp[name] = buildMcpEntry({ ...(existing as Record<string, unknown>), ...updateData });
+  config.mcp = mcp;
+  writeConfig(config, targetPath);
+};
+
+export const deleteMcpConfig = (name: string, workingDirectory?: string): void => {
+  const layers = readConfigLayers(workingDirectory);
+  const source = getJsonEntrySource(layers, 'mcp', name);
+  const targetPath = source.path || CONFIG_FILE;
+  const config = (source.config || readConfigFile(targetPath)) as Record<string, unknown>;
+  const mcp = isPlainObject(config.mcp) ? { ...config.mcp } : {};
+
+  if (mcp[name] === undefined) {
+    throw new Error(`MCP server "${name}" not found`);
+  }
+
+  delete mcp[name];
+  if (Object.keys(mcp).length === 0) {
+    delete config.mcp;
+  } else {
+    config.mcp = mcp;
+  }
+
+  writeConfig(config, targetPath);
+};
+
 const getJsonEntrySource = (
   layers: ReturnType<typeof readConfigLayers>,
-  sectionKey: 'agent' | 'command',
+  sectionKey: 'agent' | 'command' | 'mcp',
   entryName: string
 ) => {
   const { userConfig, projectConfig, customConfig, paths } = layers;
@@ -520,6 +798,7 @@ export const createAgent = (agentName: string, config: Record<string, unknown>, 
   const { prompt, scope: _ignored, ...frontmatter } = config as Record<string, unknown> & { prompt?: unknown; scope?: unknown };
   void _ignored; // Scope is only used for path determination
   writeMdFile(targetPath, frontmatter, typeof prompt === 'string' ? prompt : '');
+  resetAgentLookupCache(globalAgentLookupCache);
 };
 
 export const updateAgent = (agentName: string, updates: Record<string, unknown>, workingDirectory?: string) => {
@@ -624,6 +903,10 @@ export const updateAgent = (agentName: string, updates: Record<string, unknown>,
   if (jsonModified) {
     writeConfig(config, jsonTarget.path || CONFIG_FILE);
   }
+
+  if (mdModified || isBuiltinOverride) {
+    resetAgentLookupCache(globalAgentLookupCache);
+  }
 };
 
 export const deleteAgent = (agentName: string, workingDirectory?: string) => {
@@ -666,6 +949,8 @@ export const deleteAgent = (agentName: string, workingDirectory?: string) => {
     targetConfig.agent = agentMap;
     writeConfig(targetConfig, jsonTarget.path || CONFIG_FILE);
   }
+
+  resetAgentLookupCache(globalAgentLookupCache);
 };
 
 export const getCommandSources = (commandName: string, workingDirectory?: string): ConfigSources => {

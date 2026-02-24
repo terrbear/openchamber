@@ -759,6 +759,7 @@ class OpencodeService {
       'application/x-sh',
       'application/x-shellscript',
       'application/octet-stream',
+      'image/svg+xml',
     ];
     
     return textBasedTypes.includes(lowerMime);
@@ -2081,7 +2082,7 @@ class OpencodeService {
     }
   }
 
-  async listCommandsWithDetails(): Promise<Array<{ name: string; description?: string; agent?: string; model?: string; template?: string; subtask?: boolean }>> {
+  async listCommandsWithDetails(): Promise<Array<{ name: string; description?: string; agent?: string; model?: string; template?: string }>> {
     try {
       const response = await this.client.command.list(
         this.currentDirectory ? { directory: this.currentDirectory } : undefined
@@ -2093,7 +2094,6 @@ class OpencodeService {
         agent: cmd.agent as string | undefined,
         model: cmd.model as string | undefined,
         template: cmd.template as string | undefined,
-        subtask: cmd.subtask as boolean | undefined
       }));
     } catch {
       return [];

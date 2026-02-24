@@ -11,7 +11,7 @@ import os from 'os';
 import crypto from 'crypto';
 import { createUiAuth } from './lib/opencode/ui-auth.js';
 import { startCloudflareTunnel, printTunnelWarning, checkCloudflaredAvailable } from './lib/cloudflare-tunnel.js';
-import { prepareNotificationLastMessage } from './lib/notification-message.js';
+import { prepareNotificationLastMessage } from './lib/notifications/index.js';
 import {
   TERMINAL_INPUT_WS_MAX_PAYLOAD_BYTES,
   TERMINAL_INPUT_WS_PATH,
@@ -21,7 +21,7 @@ import {
   parseRequestPathname,
   pruneRebindTimestamps,
   readTerminalInputWsControlFrame,
-} from './lib/terminal-input-ws-protocol.js';
+} from './lib/terminal/index.js';
 import webPush from 'web-push';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1527,6 +1527,9 @@ const sanitizeSettingsUpdate = (payload) => {
   }
   if (typeof candidate.showTextJustificationActivity === 'boolean') {
     result.showTextJustificationActivity = candidate.showTextJustificationActivity;
+  }
+  if (typeof candidate.showDeletionDialog === 'boolean') {
+    result.showDeletionDialog = candidate.showDeletionDialog;
   }
   if (typeof candidate.nativeNotificationsEnabled === 'boolean') {
     result.nativeNotificationsEnabled = candidate.nativeNotificationsEnabled;
@@ -5690,6 +5693,48 @@ function setupProxy(app) {
           proxyRes.headers['X-Accel-Buffering'] = 'no';
           proxyRes.headers['X-Content-Type-Options'] = 'nosniff';
         }
+      },
+    },
+  });
+
+  // Dedicated forwarder for large session message payloads.
+  // This avoids edge-cases in generic proxy streaming for multi-file attachments.
+  app.post('/api/session/:sessionId/message', express.raw({ type: '*/*', limit: '50mb' }), async (req, res) => {
+    try {
+      const upstreamPath = req.originalUrl.replace(/^\/api/, '');
+      const targetUrl = buildOpenCodeUrl(upstreamPath, '');
+      const authHeaders = getOpenCodeAuthHeaders();
+
+      const headers = {
+        ...(typeof req.headers['content-type'] === 'string' ? { 'content-type': req.headers['content-type'] } : { 'content-type': 'application/json' }),
+        ...(typeof req.headers.accept === 'string' ? { accept: req.headers.accept } : {}),
+        ...(authHeaders.Authorization ? { Authorization: authHeaders.Authorization } : {}),
+      };
+
+      const bodyBuffer = Buffer.isBuffer(req.body)
+        ? req.body
+        : Buffer.from(typeof req.body === 'string' ? req.body : '');
+
+      const upstreamResponse = await fetch(targetUrl, {
+        method: 'POST',
+        headers,
+        body: bodyBuffer,
+        signal: AbortSignal.timeout(LONG_REQUEST_TIMEOUT_MS),
+      });
+
+      const upstreamBody = Buffer.from(await upstreamResponse.arrayBuffer());
+
+      if (upstreamResponse.headers.has('content-type')) {
+        res.setHeader('content-type', upstreamResponse.headers.get('content-type'));
+      }
+
+      res.status(upstreamResponse.status).send(upstreamBody);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'OpenCode message forward timed out' : 'OpenCode message forward failed',
+        });
       }
     }
   });
@@ -5907,6 +5952,7 @@ async function main(options = {}) {
     if (
       req.path.startsWith('/api/config/agents') ||
       req.path.startsWith('/api/config/commands') ||
+      req.path.startsWith('/api/config/mcp') ||
       req.path.startsWith('/api/config/settings') ||
       req.path.startsWith('/api/config/skills') ||
       req.path.startsWith('/api/fs') ||
@@ -7166,7 +7212,12 @@ async function main(options = {}) {
     getProviderSources,
     removeProviderConfig,
     AGENT_SCOPE,
-    COMMAND_SCOPE
+    COMMAND_SCOPE,
+    listMcpConfigs,
+    getMcpConfig,
+    createMcpConfig,
+    updateMcpConfig,
+    deleteMcpConfig,
   } = await import('./lib/opencode/index.js');
 
   app.get('/api/config/agents/:name', async (req, res) => {
@@ -7291,6 +7342,116 @@ async function main(options = {}) {
     } catch (error) {
       console.error('Failed to delete agent:', error);
       res.status(500).json({ error: error.message || 'Failed to delete agent' });
+    }
+  });
+
+  // ============================================================
+  // MCP Config Routes
+  // ============================================================
+
+  app.get('/api/config/mcp', async (req, res) => {
+    try {
+      const { directory, error } = await resolveOptionalProjectDirectory(req);
+      if (error) {
+        return res.status(400).json({ error });
+      }
+      const configs = listMcpConfigs(directory);
+      res.json(configs);
+    } catch (error) {
+      console.error('[API:GET /api/config/mcp] Failed:', error);
+      res.status(500).json({ error: error.message || 'Failed to list MCP configs' });
+    }
+  });
+
+  app.get('/api/config/mcp/:name', async (req, res) => {
+    try {
+      const name = req.params.name;
+      const { directory, error } = await resolveOptionalProjectDirectory(req);
+      if (error) {
+        return res.status(400).json({ error });
+      }
+      const config = getMcpConfig(name, directory);
+      if (!config) {
+        return res.status(404).json({ error: `MCP server "${name}" not found` });
+      }
+      res.json(config);
+    } catch (error) {
+      console.error('[API:GET /api/config/mcp/:name] Failed:', error);
+      res.status(500).json({ error: error.message || 'Failed to get MCP config' });
+    }
+  });
+
+  app.post('/api/config/mcp/:name', async (req, res) => {
+    try {
+      const name = req.params.name;
+      const { scope, ...config } = req.body || {};
+      const { directory, error } = await resolveOptionalProjectDirectory(req);
+      if (error) {
+        return res.status(400).json({ error });
+      }
+      console.log(`[API:POST /api/config/mcp] Creating MCP server: ${name}`);
+
+      createMcpConfig(name, config, directory, scope);
+      await refreshOpenCodeAfterConfigChange('mcp creation', { mcpName: name });
+
+      res.json({
+        success: true,
+        requiresReload: true,
+        message: `MCP server "${name}" created. Reloading interface…`,
+        reloadDelayMs: CLIENT_RELOAD_DELAY_MS,
+      });
+    } catch (error) {
+      console.error('[API:POST /api/config/mcp/:name] Failed:', error);
+      res.status(500).json({ error: error.message || 'Failed to create MCP server' });
+    }
+  });
+
+  app.patch('/api/config/mcp/:name', async (req, res) => {
+    try {
+      const name = req.params.name;
+      const updates = req.body;
+      const { directory, error } = await resolveOptionalProjectDirectory(req);
+      if (error) {
+        return res.status(400).json({ error });
+      }
+      console.log(`[API:PATCH /api/config/mcp] Updating MCP server: ${name}`);
+
+      updateMcpConfig(name, updates, directory);
+      await refreshOpenCodeAfterConfigChange('mcp update');
+
+      res.json({
+        success: true,
+        requiresReload: true,
+        message: `MCP server "${name}" updated. Reloading interface…`,
+        reloadDelayMs: CLIENT_RELOAD_DELAY_MS,
+      });
+    } catch (error) {
+      console.error('[API:PATCH /api/config/mcp/:name] Failed:', error);
+      res.status(500).json({ error: error.message || 'Failed to update MCP server' });
+    }
+  });
+
+  app.delete('/api/config/mcp/:name', async (req, res) => {
+    try {
+      const name = req.params.name;
+      const { directory, error } = await resolveOptionalProjectDirectory(req);
+      if (error) {
+        return res.status(400).json({ error });
+      }
+      console.log(`[API:DELETE /api/config/mcp] Deleting MCP server: ${name}`);
+
+      deleteMcpConfig(name, directory);
+      await refreshOpenCodeAfterConfigChange('mcp deletion');
+
+      res.json({
+        success: true,
+        requiresReload: true,
+        message: `MCP server "${name}" deleted. Reloading interface…`,
+        reloadDelayMs: CLIENT_RELOAD_DELAY_MS,
+      });
+    } catch (error) {
+      console.error('[API:DELETE /api/config/mcp/:name] Failed:', error);
+      res.status(500).json({ error: error.message || 'Failed to delete MCP server' });
     }
   });
 
@@ -10712,17 +10873,26 @@ Context:
     }
 
     try {
-      const resolvedPath = path.resolve(normalizeDirectoryPath(filePath));
-      if (resolvedPath.includes('..')) {
-        return res.status(400).json({ error: 'Invalid path: path traversal not allowed' });
+      const resolved = await resolveWorkspacePathFromContext(req, filePath);
+      if (!resolved.ok) {
+        return res.status(400).json({ error: resolved.error });
       }
 
-      const stats = await fsPromises.stat(resolvedPath);
+      const [canonicalPath, canonicalBase] = await Promise.all([
+        fsPromises.realpath(resolved.resolved),
+        fsPromises.realpath(resolved.base).catch(() => path.resolve(resolved.base)),
+      ]);
+
+      if (!isPathWithinRoot(canonicalPath, canonicalBase)) {
+        return res.status(403).json({ error: 'Access to file denied' });
+      }
+
+      const stats = await fsPromises.stat(canonicalPath);
       if (!stats.isFile()) {
         return res.status(400).json({ error: 'Specified path is not a file' });
       }
 
-      const content = await fsPromises.readFile(resolvedPath, 'utf8');
+      const content = await fsPromises.readFile(canonicalPath, 'utf8');
       res.type('text/plain').send(content);
     } catch (error) {
       const err = error;
@@ -10745,17 +10915,26 @@ Context:
     }
 
     try {
-      const resolvedPath = path.resolve(normalizeDirectoryPath(filePath));
-      if (resolvedPath.includes('..')) {
-        return res.status(400).json({ error: 'Invalid path: path traversal not allowed' });
+      const resolved = await resolveWorkspacePathFromContext(req, filePath);
+      if (!resolved.ok) {
+        return res.status(400).json({ error: resolved.error });
       }
 
-      const stats = await fsPromises.stat(resolvedPath);
+      const [canonicalPath, canonicalBase] = await Promise.all([
+        fsPromises.realpath(resolved.resolved),
+        fsPromises.realpath(resolved.base).catch(() => path.resolve(resolved.base)),
+      ]);
+
+      if (!isPathWithinRoot(canonicalPath, canonicalBase)) {
+        return res.status(403).json({ error: 'Access to file denied' });
+      }
+
+      const stats = await fsPromises.stat(canonicalPath);
       if (!stats.isFile()) {
         return res.status(400).json({ error: 'Specified path is not a file' });
       }
 
-      const ext = path.extname(resolvedPath).toLowerCase();
+      const ext = path.extname(canonicalPath).toLowerCase();
       const mimeMap = {
         '.png': 'image/png',
         '.jpg': 'image/jpeg',
@@ -10769,7 +10948,7 @@ Context:
       };
       const mimeType = mimeMap[ext] || 'application/octet-stream';
 
-      const content = await fsPromises.readFile(resolvedPath);
+      const content = await fsPromises.readFile(canonicalPath);
       res.setHeader('Cache-Control', 'no-store');
       res.type(mimeType).send(content);
     } catch (error) {
@@ -10881,6 +11060,49 @@ Context:
       }
       console.error('Failed to rename path:', error);
       res.status(500).json({ error: (error && error.message) || 'Failed to rename path' });
+    }
+  });
+
+  // Reveal a file or folder in the system file manager (Finder on macOS, Explorer on Windows, etc.)
+  app.post('/api/fs/reveal', async (req, res) => {
+    const { path: targetPath } = req.body || {};
+    if (!targetPath || typeof targetPath !== 'string') {
+      return res.status(400).json({ error: 'Path is required' });
+    }
+
+    try {
+      const resolved = path.resolve(targetPath.trim());
+
+      // Verify path exists
+      await fsPromises.access(resolved);
+
+      const platform = process.platform;
+      if (platform === 'darwin') {
+        // macOS: open -R selects the file in Finder; open opens a folder
+        const stat = await fsPromises.stat(resolved);
+        if (stat.isDirectory()) {
+          spawn('open', [resolved], { stdio: 'ignore', detached: true }).unref();
+        } else {
+          spawn('open', ['-R', resolved], { stdio: 'ignore', detached: true }).unref();
+        }
+      } else if (platform === 'win32') {
+        // Windows: explorer /select, highlights the file
+        spawn('explorer', ['/select,', resolved], { stdio: 'ignore', detached: true }).unref();
+      } else {
+        // Linux: xdg-open opens the parent directory
+        const stat = await fsPromises.stat(resolved);
+        const dir = stat.isDirectory() ? resolved : path.dirname(resolved);
+        spawn('xdg-open', [dir], { stdio: 'ignore', detached: true }).unref();
+      }
+
+      res.json({ success: true, path: resolved });
+    } catch (error) {
+      const err = error;
+      if (err && typeof err === 'object' && err.code === 'ENOENT') {
+        return res.status(404).json({ error: 'Path not found' });
+      }
+      console.error('Failed to reveal path:', error);
+      res.status(500).json({ error: (error && error.message) || 'Failed to reveal path' });
     }
   });
 

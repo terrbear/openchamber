@@ -3276,6 +3276,7 @@ let resolvedOpencodeBinary = null;
 let resolvedOpencodeBinarySource = null;
 let resolvedNodeBinary = null;
 let resolvedBunBinary = null;
+let resolvedClaudeBinary = null;
 
 function isExecutable(filePath) {
   try {
@@ -3312,6 +3313,52 @@ function searchPathFor(binaryName) {
     }
   }
   return null;
+}
+
+/**
+ * Resolve the Claude Code CLI binary path.
+ * Checks CLAUDECODE_BINARY env var first, then searches PATH for 'claude'.
+ * Returns the resolved path or null if not found.
+ */
+function resolveClaudeCodeCliPath() {
+  const envBinary = (process.env.CLAUDECODE_BINARY || '').trim();
+  if (envBinary) {
+    if (path.isAbsolute(envBinary) || envBinary.includes(path.sep)) {
+      const resolved = path.isAbsolute(envBinary) ? envBinary : path.resolve(envBinary);
+      if (isExecutable(resolved)) {
+        return resolved;
+      }
+      console.warn(`[openchamber] CLAUDECODE_BINARY="${envBinary}" is not executable, falling back to PATH lookup`);
+    } else {
+      // Bare name like "claude" — search PATH for it
+      const found = searchPathFor(envBinary);
+      if (found) {
+        return found;
+      }
+      console.warn(`[openchamber] CLAUDECODE_BINARY="${envBinary}" not found on PATH, falling back to default lookup`);
+    }
+  }
+
+  return searchPathFor('claude');
+}
+
+/**
+ * Detect the Claude Code CLI binary asynchronously.
+ * Stores the result in resolvedClaudeBinary for use by other middleware.
+ * Does not block server startup.
+ */
+function detectClaudeCodeCli() {
+  try {
+    const resolved = resolveClaudeCodeCliPath();
+    if (resolved) {
+      resolvedClaudeBinary = resolved;
+      console.log(`[openchamber] Claude Code CLI detected: ${resolved}`);
+    } else {
+      console.debug('[openchamber] Claude Code CLI not found, Claude Code provider will not be available');
+    }
+  } catch (error) {
+    console.debug(`[openchamber] Claude Code CLI detection failed: ${error.message}`);
+  }
 }
 
 function resolveOpencodeCliPath() {
@@ -12119,6 +12166,9 @@ Context:
     console.log(`Force killed ${killedCount} terminal session(s)`);
     res.json({ success: true, killedCount });
   });
+
+  // Detect Claude Code CLI availability (non-blocking, runs before backend init)
+  detectClaudeCodeCli();
 
   if (ENV_BACKEND === 'claudecode') {
     try {

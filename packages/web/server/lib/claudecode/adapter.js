@@ -24,6 +24,12 @@ const pendingQuestions = {};
 // Track running claude processes per session to prevent concurrent prompts
 const runningProcesses = new Map();
 
+// Per-session promise chains for serializing message file writes.
+// Same pattern as `saveChain` for sessions, but keyed per session so
+// different sessions can write in parallel while writes to the same
+// session are serialized (preventing the read-modify-write race).
+const messagesSaveChains = new Map();
+
 const globalSseClients = new Set();
 
 function broadcastGlobalEvent(obj) {
@@ -85,6 +91,23 @@ async function loadMessages(sessionId) {
 
 async function saveMessages(sessionId, msgs) {
   await fs.promises.writeFile(messagesFile(sessionId), JSON.stringify(msgs, null, 2), 'utf8');
+}
+
+// Serialize a read-modify-write append to the messages file for a given session.
+// Returns the full messages array after the append (useful for getting the count).
+function chainedAppendMessage(sessionId, msg) {
+  const prev = messagesSaveChains.get(sessionId) || Promise.resolve();
+  const next = prev.then(async () => {
+    const msgs = await loadMessages(sessionId);
+    msgs.push(msg);
+    await saveMessages(sessionId, msgs);
+    return msgs;
+  }).catch((err) => {
+    console.error('[claudecode-adapter] Failed to persist message:', err.message);
+    return null;
+  });
+  messagesSaveChains.set(sessionId, next);
+  return next;
 }
 
 // Convert internal session to the SDK Session shape the UI expects.
@@ -251,9 +274,7 @@ function createApp(cwd) {
       }
 
       // Persist user message and emit it
-      const existingMessages = await loadMessages(id);
-      existingMessages.push({ id: userMessageId, role: 'user', content, createdAt: new Date().toISOString() });
-      await saveMessages(id, existingMessages);
+      await chainedAppendMessage(id, { id: userMessageId, role: 'user', content, createdAt: new Date().toISOString() });
 
       const userCreatedAt = Date.now();
       broadcastGlobalEvent({
@@ -516,10 +537,8 @@ function createApp(cwd) {
 
       // Persist complete assistant message
       try {
-        const msgs = await loadMessages(id);
-        msgs.push({ id: assistantMessageId, role: 'assistant', content: result.assistantText, createdAt: new Date().toISOString() });
-        await saveMessages(id, msgs);
-        if (Object.hasOwn(sessions, id)) {
+        const msgs = await chainedAppendMessage(id, { id: assistantMessageId, role: 'assistant', content: result.assistantText, createdAt: new Date().toISOString() });
+        if (msgs && Object.hasOwn(sessions, id)) {
           sessions[id].updatedAt = new Date().toISOString();
           sessions[id].messageCount = msgs.length;
           await saveSessions();

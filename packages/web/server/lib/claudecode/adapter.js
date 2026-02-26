@@ -205,8 +205,21 @@ function createApp(cwd) {
   // POST /session/:id/prompt_async — fire-and-forget; events delivered via SSE
   app.post('/session/:id/prompt_async', async (req, res) => {
     const { id } = req.params;
+
+    // Auto-create session entry when the adapter receives a prompt for an
+    // unknown session ID (e.g. routed from an OpenCode-managed session).
     if (!Object.hasOwn(sessions, id)) {
-      return res.status(404).json({ error: 'Session not found' });
+      const now = new Date().toISOString();
+      sessions[id] = {
+        id,
+        title: 'New Session',
+        directory: cwd,
+        createdAt: now,
+        updatedAt: now,
+        messageCount: 0,
+        claudeSessionId: null,
+      };
+      saveSessions().catch(() => {});
     }
 
     // Extract text from parts array (OpenCode API format)
@@ -257,181 +270,242 @@ function createApp(cwd) {
       // Mark session busy
       broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: { type: 'busy' } } });
 
-      // Spawn claude — use --resume only if we have a real claude session ID from a prior turn
-      const sessionCwd = (Object.hasOwn(sessions, id) && sessions[id].directory) || _cwd;
-      const claudeSessionId = Object.hasOwn(sessions, id) ? sessions[id].claudeSessionId : null;
-      const args = [
-        '--print', '--output-format', 'stream-json', '--verbose',
-        '--permission-mode', _permissionMode,
-        '--permission-prompt-tool', 'stdio',
-        ...(claudeSessionId ? ['--resume', claudeSessionId] : []),
-      ];
-      // Strip Claude Code's own env vars so nested sessions aren't blocked
-      // eslint-disable-next-line no-unused-vars
-      const { CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, ...spawnEnv } = process.env;
-      const claudeProc = spawn(_claudeBinary, args, {
-        cwd: sessionCwd,
-        env: spawnEnv,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
+      // runClaude spawns the claude process and returns a promise that resolves with
+      // { code, assistantText, usedResume } so the caller can decide whether to retry.
+      function runClaude({ useResume }) {
+        return new Promise((resolveRun) => {
+          const sessionCwd = (Object.hasOwn(sessions, id) && sessions[id].directory) || _cwd;
+          const claudeSessionId = useResume && Object.hasOwn(sessions, id) ? sessions[id].claudeSessionId : null;
+          const args = [
+            '--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
+            '--permission-mode', _permissionMode,
+            '--permission-prompt-tool', 'stdio',
+            ...(claudeSessionId ? ['--resume', claudeSessionId] : []),
+          ];
+          // Strip Claude Code's own env vars so nested sessions aren't blocked
+          const { CLAUDECODE: _cc, CLAUDE_CODE_ENTRYPOINT: _cce, ...spawnEnv } = process.env;
+          const claudeProc = spawn(_claudeBinary, args, {
+            cwd: sessionCwd,
+            env: spawnEnv,
+            stdio: ['pipe', 'pipe', 'pipe'],
+          });
 
-      claudeProc.stdin.on('error', () => {});
-      claudeProc.stdin.write(content, 'utf8');
-      claudeProc.stdin.end();
+          // Write the user prompt as a stream-json message and keep stdin open.
+          claudeProc.stdin.on('error', () => {});
+          const userMsg = JSON.stringify({ type: 'user', message: { role: 'user', content } }) + '\n';
+          claudeProc.stdin.write(userMsg, 'utf8');
 
-      let stdoutBuf = '';
-      let stderrBuf = '';
-      let assistantText = '';
+          let stdoutBuf = '';
+          let stderrBuf = '';
+          let assistantText = '';
 
-      const timeoutHandle = setTimeout(() => {
-        if (!claudeProc.killed) claudeProc.kill('SIGTERM');
-        broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: { type: 'idle' } } });
-      }, TIMEOUT_MS);
+          const timeoutHandle = setTimeout(() => {
+            if (!claudeProc.killed) claudeProc.kill('SIGTERM');
+          }, TIMEOUT_MS);
 
-      const processLine = (line) => {
-        if (!line.trim()) return;
-        let parsed;
-        try { parsed = JSON.parse(line); } catch { return; }
+          const processLine = (line) => {
+            if (!line.trim()) return;
+            let parsed;
+            try { parsed = JSON.parse(line); } catch { return; }
 
-        if (parsed.type === 'result' && parsed.session_id && Object.hasOwn(sessions, id) && !sessions[id].claudeSessionId) {
-          // Capture the real claude session ID on the first successful run so subsequent
-          // turns can use --resume to continue the same conversation.
-          sessions[id].claudeSessionId = parsed.session_id;
+            if (parsed.type === 'result') {
+              // Claude has finished — close stdin so the process can exit cleanly.
+              try { claudeProc.stdin.end(); } catch { /* already closed */ }
+
+              if (parsed.session_id && Object.hasOwn(sessions, id)) {
+                // Capture (or update) the real claude session ID so subsequent
+                // turns can use --resume to continue the same conversation.
+                sessions[id].claudeSessionId = parsed.session_id;
+                saveSessions().catch(() => {});
+              }
+            }
+
+            // Handle control_request events from --permission-prompt-tool stdio.
+            if (parsed.type === 'control_request') {
+              const requestId = parsed.request_id;
+              const req = parsed.request || {};
+              const toolName = req.tool_name || 'unknown';
+              const toolInput = req.input || {};
+
+              // AskUserQuestion: forward Claude's questions directly to the UI
+              if (toolName === 'AskUserQuestion' && Array.isArray(toolInput.questions)) {
+                const question = {
+                  id: requestId,
+                  sessionID: id,
+                  questions: toolInput.questions,
+                };
+
+                pendingQuestions[requestId] = {
+                  question,
+                  resolve: ({ answers }) => {
+                    const response = JSON.stringify({
+                      type: 'control_response',
+                      response: {
+                        request_id: requestId,
+                        subtype: 'success',
+                        response: {
+                          behavior: 'allow',
+                          updatedInput: { ...toolInput, answers: answers || {} },
+                        },
+                      },
+                    }) + '\n';
+                    claudeProc.stdin.write(response, 'utf8');
+                  },
+                };
+
+                broadcastGlobalEvent({ type: 'question.asked', properties: question });
+                return;
+              }
+
+              // Other tool permissions (Bash, Edit, etc.): show Yes/No
+              const inputSummary = typeof toolInput === 'object'
+                ? (toolInput.command || toolInput.path || JSON.stringify(toolInput).slice(0, 80))
+                : String(toolInput).slice(0, 80);
+
+              const question = {
+                id: requestId,
+                sessionID: id,
+                questions: [{
+                  question: `Allow ${toolName}?`,
+                  header: toolName,
+                  options: [
+                    { label: 'Yes', description: `Allow ${toolName}: ${inputSummary}` },
+                    { label: 'No', description: 'Deny this operation' },
+                  ],
+                }],
+              };
+
+              pendingQuestions[requestId] = {
+                question,
+                resolve: ({ allow }) => {
+                  const response = JSON.stringify({
+                    type: 'control_response',
+                    response: {
+                      request_id: requestId,
+                      subtype: 'success',
+                      response: allow
+                        ? { behavior: 'allow', updatedInput: toolInput }
+                        : { behavior: 'deny', message: 'User denied permission' },
+                    },
+                  }) + '\n';
+                  claudeProc.stdin.write(response, 'utf8');
+                },
+              };
+
+              broadcastGlobalEvent({ type: 'question.asked', properties: question });
+              return;
+            }
+
+            if (parsed.type === 'assistant' && parsed.message && Array.isArray(parsed.message.content)) {
+              for (const block of parsed.message.content) {
+                if (block.type === 'text' && typeof block.text === 'string') {
+                  assistantText += block.text;
+                }
+              }
+              broadcastGlobalEvent({
+                type: 'message.part.updated',
+                properties: {
+                  part: {
+                    id: assistantPartId,
+                    type: 'text',
+                    text: assistantText,
+                    messageID: assistantMessageId,
+                    sessionID: id,
+                  },
+                  info: { id: assistantMessageId, sessionID: id, role: 'assistant' }
+                }
+              });
+            }
+          };
+
+          claudeProc.stdout.on('data', (chunk) => {
+            stdoutBuf += chunk.toString('utf8');
+            const lines = stdoutBuf.split('\n');
+            stdoutBuf = lines.pop() ?? '';
+            for (const line of lines) processLine(line);
+          });
+
+          claudeProc.stderr.on('data', (chunk) => {
+            if (stderrBuf.length < STDERR_MAX) stderrBuf += chunk.toString('utf8');
+          });
+
+          claudeProc.on('error', (err) => {
+            clearTimeout(timeoutHandle);
+            console.error('[claudecode-adapter] Claude process error:', err.message);
+            resolveRun({ code: 1, assistantText: '', usedResume: !!claudeSessionId, stderr: err.message });
+          });
+
+          claudeProc.on('close', (code) => {
+            clearTimeout(timeoutHandle);
+            if (stdoutBuf.trim()) processLine(stdoutBuf.trim());
+            // Clean up any pending questions for this session
+            for (const [reqId, entry] of Object.entries(pendingQuestions)) {
+              if (entry.question.sessionID === id) {
+                delete pendingQuestions[reqId];
+              }
+            }
+            resolveRun({ code, assistantText, usedResume: !!claudeSessionId, stderr: stderrBuf });
+          });
+        });
+      }
+
+      // Run claude, retrying without --resume if resume fails
+      let result = await runClaude({ useResume: true });
+
+      if (result.code !== 0 && !result.assistantText && result.usedResume) {
+        // --resume failed — clear stale session ID and retry with a fresh conversation
+        console.error('[claudecode-adapter] --resume failed, retrying without --resume');
+        if (Object.hasOwn(sessions, id)) {
+          sessions[id].claudeSessionId = null;
           saveSessions().catch(() => {});
         }
+        result = await runClaude({ useResume: false });
+      }
 
-        // Handle permission requests from --permission-prompt-tool stdio
-        if (parsed.type === 'permission_request' || parsed.type === 'tool_permission_request') {
-          const requestId = parsed.id || parsed.request_id || crypto.randomUUID();
-          const toolName = parsed.tool_name || parsed.tool || parsed.name || 'unknown';
-          const toolInput = parsed.tool_input || parsed.input || parsed.arguments || {};
-          const inputSummary = typeof toolInput === 'object'
-            ? (toolInput.command || toolInput.path || JSON.stringify(toolInput).slice(0, 80))
-            : String(toolInput).slice(0, 80);
+      console.error(`[claudecode-adapter] Claude closed with code ${result.code}, assistantText.length=${result.assistantText.length}`);
 
-          const question = {
-            id: requestId,
-            sessionID: id,
-            questions: [{
-              question: `Allow ${toolName}?`,
-              header: toolName,
-              options: [
-                { label: 'Yes', description: `Allow ${toolName}: ${inputSummary}` },
-                { label: 'No', description: 'Deny this operation' },
-              ],
-            }],
-          };
-
-          pendingQuestions[requestId] = {
-            question,
-            resolve: ({ allow }) => {
-              const response = JSON.stringify({ type: 'permission_response', id: requestId, allow }) + '\n';
-              claudeProc.stdin.write(response, 'utf8');
-            },
-          };
-
-          broadcastGlobalEvent({ type: 'question.asked', properties: question });
-          return;
-        }
-
-        if (parsed.type === 'assistant' && parsed.message && Array.isArray(parsed.message.content)) {
-          // stream-json format: assistant message with content array
-          for (const block of parsed.message.content) {
-            if (block.type === 'text' && typeof block.text === 'string') {
-              assistantText += block.text;
-            }
-          }
-          // Emit streaming text update — same partId so UI updates the part in-place
-          broadcastGlobalEvent({
-            type: 'message.part.updated',
-            properties: {
-              part: {
-                id: assistantPartId,
-                type: 'text',
-                text: assistantText,
-                messageID: assistantMessageId,
-                sessionID: id,
-              },
-              info: { id: assistantMessageId, sessionID: id, role: 'assistant' }
-            }
-          });
-        }
-      };
-
-      claudeProc.stdout.on('data', (chunk) => {
-        stdoutBuf += chunk.toString('utf8');
-        const lines = stdoutBuf.split('\n');
-        stdoutBuf = lines.pop() ?? '';
-        for (const line of lines) processLine(line);
-      });
-
-      claudeProc.stderr.on('data', (chunk) => {
-        if (stderrBuf.length < STDERR_MAX) stderrBuf += chunk.toString('utf8');
-      });
-
-      claudeProc.on('error', (err) => {
-        clearTimeout(timeoutHandle);
+      if (result.code !== 0 && !result.assistantText) {
+        const errDetail = result.stderr.trim() || `Claude exited with code ${result.code}`;
+        console.error('[claudecode-adapter] Claude failed:', errDetail);
         broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: { type: 'idle' } } });
-        console.error('[claudecode-adapter] Claude process error:', err.message);
-      });
+        return;
+      }
 
-      claudeProc.on('close', async (code) => {
-        clearTimeout(timeoutHandle);
-        console.error(`[claudecode-adapter] Claude closed with code ${code}, assistantText.length=${assistantText.length}`);
-
-        // Process any remaining buffered line
-        if (stdoutBuf.trim()) processLine(stdoutBuf.trim());
-
-        if (code !== 0 && !assistantText) {
-          const errDetail = stderrBuf.trim() || `Claude exited with code ${code}`;
-          console.error('[claudecode-adapter] Claude failed:', errDetail);
-          broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: { type: 'idle' } } });
-          return;
-        }
-
-        // Persist complete assistant message
-        try {
-          const msgs = await loadMessages(id);
-          msgs.push({ id: assistantMessageId, role: 'assistant', content: assistantText, createdAt: new Date().toISOString() });
-          await saveMessages(id, msgs);
-          if (Object.hasOwn(sessions, id)) {
-            sessions[id].updatedAt = new Date().toISOString();
-            sessions[id].messageCount = msgs.length;
-            await saveSessions();
-          }
-        } catch (err) {
-          console.error('[claudecode-adapter] Failed to persist assistant message:', err.message);
-        }
-
-        // Emit final message.updated with complete content
-        const assistantCompletedAt = Date.now();
-        broadcastGlobalEvent({
-          type: 'message.updated',
-          properties: {
-            info: {
-              id: assistantMessageId,
-              sessionID: id,
-              role: 'assistant',
-              status: 'completed',
-              finish: 'stop',
-              time: { created: assistantCompletedAt, updated: assistantCompletedAt, completed: assistantCompletedAt },
-              parts: [{ id: assistantPartId, type: 'text', text: assistantText, messageID: assistantMessageId, sessionID: id }],
-            }
-          }
-        });
-
-        broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: { type: 'idle' } } });
+      // Persist complete assistant message
+      try {
+        const msgs = await loadMessages(id);
+        msgs.push({ id: assistantMessageId, role: 'assistant', content: result.assistantText, createdAt: new Date().toISOString() });
+        await saveMessages(id, msgs);
         if (Object.hasOwn(sessions, id)) {
-          broadcastGlobalEvent({ type: 'session.updated', properties: { info: toSdkSession(sessions[id]) } });
+          sessions[id].updatedAt = new Date().toISOString();
+          sessions[id].messageCount = msgs.length;
+          await saveSessions();
         }
+      } catch (err) {
+        console.error('[claudecode-adapter] Failed to persist assistant message:', err.message);
+      }
 
-        // Clean up any pending questions for this session (e.g. if process died mid-prompt)
-        for (const [reqId, entry] of Object.entries(pendingQuestions)) {
-          if (entry.question.sessionID === id) {
-            delete pendingQuestions[reqId];
+      // Emit final message.updated with complete content
+      const assistantCompletedAt = Date.now();
+      broadcastGlobalEvent({
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: assistantMessageId,
+            sessionID: id,
+            role: 'assistant',
+            status: 'completed',
+            finish: 'stop',
+            time: { created: assistantCompletedAt, updated: assistantCompletedAt, completed: assistantCompletedAt },
+            parts: [{ id: assistantPartId, type: 'text', text: result.assistantText, messageID: assistantMessageId, sessionID: id }],
           }
         }
       });
+
+      broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: { type: 'idle' } } });
+      if (Object.hasOwn(sessions, id)) {
+        broadcastGlobalEvent({ type: 'session.updated', properties: { info: toSdkSession(sessions[id]) } });
+      }
     })().catch((err) => {
       console.error('[claudecode-adapter] Unhandled error in prompt_async handler:', err.message);
       broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: { type: 'idle' } } });

@@ -14,6 +14,8 @@
 - Provider logos: local SVGs in packages/ui/src/assets/provider-logos/*.svg, fallback to https://models.dev/logos/{id}.svg
 - useProviderLogo.ts has alias map: 'claude' -> 'anthropic'; use 'claudecode' as provider ID to avoid conflict
 
+- Settings whitelist: `sanitizeSettingsUpdate()` in server/index.js controls which fields can be persisted. New settings must be added there (and also returned via `formatSettingsResponse`).
+- Adapter runtime config: module-level variables in adapter.js can be updated at runtime via exported setters (e.g., `setPermissionMode()`); new claude subprocess spawns pick up changes immediately
 - resolvedClaudeBinary is the module-level variable in server/index.js that holds the detected claude CLI path (null if not found)
 - detectClaudeCodeCli() is called once before the ENV_BACKEND if/else block in the startup section (~line 12170)
 - resolveClaudeCodeCliPath() checks CLAUDECODE_BINARY env first, then searchPathFor('claude')
@@ -162,4 +164,21 @@
   - To add provider-specific rendering in ProvidersPage, check `selectedProvider.id` and conditionally render sections. The component has three main sections: Authentication, Connection Details, Models.
   - The ProvidersSidebar's source-loading logic silently ignores fetch errors per provider, so injected providers that don't have OpenCode config sources work fine
   - Pre-existing lint errors in @openchamber/ui are unchanged (Header.tsx, NotificationSettings.tsx, SidebarFilesTree.tsx, SessionSidebar.tsx)
+---
+
+## 2026-02-26 - US-010
+- Added Claude Code permission mode configuration
+- Files changed: packages/web/server/index.js, packages/web/server/lib/claudecode/adapter.js, packages/ui/src/components/sections/providers/ProvidersPage.tsx
+- Added `claudeCodePermissionMode` to `sanitizeSettingsUpdate()` whitelist in server/index.js (validates 'default', 'acceptEdits', 'bypassPermissions')
+- Added `setPermissionMode()` export to adapter.js for runtime updates
+- On startup, reads `claudeCodePermissionMode` from `~/.config/openchamber/settings.json`, falls back to `ENV_CLAUDECODE_PERMISSION_MODE`, then 'acceptEdits'
+- PUT /api/config/settings handler now calls `setPermissionMode()` on the adapter when `claudeCodePermissionMode` is in the request body
+- Added dropdown UI in ProvidersPage.tsx Claude Code section: fetches current mode on mount, saves via PUT on change, shows toast feedback
+- The isClaudeCode branch now wrapped in a `<>...</>` fragment to accommodate both Status and Permission Mode sections
+- **Learnings for future iterations:**
+  - The ternary conditional in JSX needs a single root element per branch -- use `<>...</>` fragment when adding multiple sections to a branch
+  - `sanitizeSettingsUpdate()` is the whitelist for all persisted settings -- any new setting must be added there
+  - `mergePersistedSettings()` uses spread to merge, so simple scalar fields Just Work once whitelisted
+  - The adapter's `_permissionMode` module-level variable can be updated at runtime; new spawns pick up the change immediately
+  - `formatSettingsResponse()` calls `sanitizeSettingsUpdate()` which also acts as the output filter, so the new field is automatically included in GET responses
 ---

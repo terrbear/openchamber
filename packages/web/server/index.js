@@ -4912,6 +4912,96 @@ function writeSseEvent(res, payload) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
+/**
+ * Connect to the Claude Code adapter's /event SSE endpoint and forward events
+ * to the client response. Reconnects on drop with exponential backoff.
+ * Returns a cleanup function that stops the connection loop.
+ */
+function connectAdapterSse(res, abortSignal) {
+  // Only connect in hybrid mode (adapter running on a separate port from OpenCode).
+  // In legacy claudecode mode, openCodePort === claudeCodeAdapterPort and the
+  // upstream OpenCode connection already carries all adapter events.
+  if (!claudeCodeAdapterPort || claudeCodeAdapterPort === openCodePort) return () => {};
+
+  let stopped = false;
+  let currentReader = null;
+
+  const stop = () => {
+    stopped = true;
+    if (currentReader) {
+      try { currentReader.cancel(); } catch { /* ignore */ }
+    }
+  };
+
+  // Stop when the parent signal aborts (client disconnect)
+  const onAbort = () => stop();
+  abortSignal.addEventListener('abort', onAbort, { once: true });
+
+  const run = async () => {
+    let attempt = 0;
+    while (!stopped && !abortSignal.aborted) {
+      const port = claudeCodeAdapterPort;
+      if (!port) {
+        // Adapter went away, wait and retry
+        await new Promise((r) => setTimeout(r, 5000));
+        continue;
+      }
+      attempt += 1;
+      try {
+        const adapterUrl = `http://127.0.0.1:${port}/event`;
+        const adapterResponse = await fetch(adapterUrl, {
+          headers: { Accept: 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' },
+          signal: abortSignal,
+        });
+        if (!adapterResponse.ok || !adapterResponse.body) {
+          throw new Error(`adapter SSE bad status ${adapterResponse.status}`);
+        }
+        console.log('[AdapterSSE] connected to Claude Code adapter event stream');
+        attempt = 0; // reset backoff on successful connect
+
+        const decoder = new TextDecoder();
+        const reader = adapterResponse.body.getReader();
+        currentReader = reader;
+        let buffer = '';
+
+        while (!stopped && !abortSignal.aborted) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+
+          let separatorIndex = buffer.indexOf('\n\n');
+          while (separatorIndex !== -1) {
+            const block = buffer.slice(0, separatorIndex);
+            buffer = buffer.slice(separatorIndex + 2);
+            separatorIndex = buffer.indexOf('\n\n');
+            if (block && !res.writableEnded) {
+              try {
+                res.write(`${block}\n\n`);
+              } catch { /* client gone */ }
+            }
+          }
+        }
+        currentReader = null;
+      } catch (error) {
+        currentReader = null;
+        if (stopped || abortSignal.aborted) return;
+        console.warn('[AdapterSSE] disconnected from Claude Code adapter:', error?.message || error);
+      }
+
+      if (stopped || abortSignal.aborted) return;
+      const backoffMs = Math.min(1000 * Math.pow(2, Math.min(attempt, 4)), 16000);
+      await new Promise((r) => setTimeout(r, backoffMs));
+    }
+  };
+
+  void run();
+
+  return () => {
+    stop();
+    abortSignal.removeEventListener('abort', onAbort);
+  };
+}
+
 function extractApiPrefixFromUrl() {
   return '';
 }
@@ -5622,6 +5712,9 @@ function setupProxy(app) {
         }
       }, 30 * 1000);
 
+      // Merge Claude Code adapter events into this SSE stream
+      const stopAdapterSse = connectAdapterSse(res, controller.signal);
+
       const reader = upstreamResponse.body.getReader();
       try {
         while (true) {
@@ -5645,6 +5738,7 @@ function setupProxy(app) {
         }
       }
 
+      stopAdapterSse();
       cleanup();
       if (!res.writableEnded) {
         res.end();
@@ -7109,6 +7203,9 @@ async function main(options = {}) {
       writeSseEvent(res, { type: 'openchamber:heartbeat', timestamp: Date.now() });
     }, 15000);
 
+    // Merge Claude Code adapter events into this SSE stream
+    const stopAdapterSse = connectAdapterSse(res, controller.signal);
+
     const decoder = new TextDecoder();
     const reader = upstream.body.getReader();
     let buffer = '';
@@ -7181,6 +7278,7 @@ async function main(options = {}) {
         console.warn('SSE proxy stream error:', error);
       }
     } finally {
+      stopAdapterSse();
       clearInterval(heartbeatInterval);
       cleanupClient();
       cleanup();
@@ -7258,6 +7356,9 @@ async function main(options = {}) {
       writeSseEvent(res, { type: 'openchamber:heartbeat', timestamp: Date.now() });
     }, 15000);
 
+    // Merge Claude Code adapter events into this SSE stream
+    const stopAdapterSse = connectAdapterSse(res, controller.signal);
+
     const decoder = new TextDecoder();
     const reader = upstream.body.getReader();
     let buffer = '';
@@ -7328,6 +7429,7 @@ async function main(options = {}) {
         console.warn('SSE proxy stream error:', error);
       }
     } finally {
+      stopAdapterSse();
       clearInterval(heartbeatInterval);
       cleanup();
       try {

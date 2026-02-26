@@ -5626,6 +5626,7 @@ function setupProxy(app) {
     let idleTimer = null;
     let heartbeatTimer = null;
     let endedBy = 'upstream-end';
+    let stopAdapterSse = null;
 
     const cleanup = () => {
       if (connectTimer) {
@@ -5713,7 +5714,7 @@ function setupProxy(app) {
       }, 30 * 1000);
 
       // Merge Claude Code adapter events into this SSE stream
-      const stopAdapterSse = connectAdapterSse(res, controller.signal);
+      stopAdapterSse = connectAdapterSse(res, controller.signal);
 
       const reader = upstreamResponse.body.getReader();
       try {
@@ -5745,6 +5746,9 @@ function setupProxy(app) {
       }
       console.log(`SSE forward ${upstreamPath} closed (${endedBy}) in ${Date.now() - startedAt}ms`);
     } catch (error) {
+      if (stopAdapterSse) {
+        stopAdapterSse();
+      }
       cleanup();
       const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
       if (!res.headersSent) {
@@ -6033,6 +6037,214 @@ function setupProxy(app) {
         });
       }
     }
+  });
+
+  // Merge GET /api/question from both OpenCode and Claude Code adapter
+  app.get('/api/question', async (req, res) => {
+    const queryString = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
+    const authHeaders = getOpenCodeAuthHeaders();
+
+    // Fetch from OpenCode
+    let openCodeQuestions = [];
+    try {
+      const openCodeUrl = buildOpenCodeUrl(`/question${queryString}`, '');
+      const ocResponse = await fetch(openCodeUrl, {
+        method: 'GET',
+        headers: { accept: 'application/json', ...authHeaders },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (ocResponse.ok) {
+        const data = await ocResponse.json();
+        openCodeQuestions = Array.isArray(data) ? data : [];
+      }
+    } catch (err) {
+      console.warn('[ClaudeCode] Failed to fetch questions from OpenCode:', err?.message || err);
+    }
+
+    // Fetch from Claude Code adapter (if running and not same as OpenCode)
+    let adapterQuestions = [];
+    if (claudeCodeAdapterPort != null && claudeCodeAdapterPort !== openCodePort) {
+      try {
+        const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/question`;
+        const adapterResponse = await fetch(adapterUrl, {
+          method: 'GET',
+          headers: { accept: 'application/json' },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (adapterResponse.ok) {
+          const data = await adapterResponse.json();
+          adapterQuestions = Array.isArray(data) ? data : [];
+        }
+      } catch (err) {
+        console.warn('[ClaudeCode] Failed to fetch questions from adapter:', err?.message || err);
+      }
+    }
+
+    res.json([...openCodeQuestions, ...adapterQuestions]);
+  });
+
+  // Route POST /api/question/:requestID/reply — try adapter first, then OpenCode
+  app.post('/api/question/:requestID/reply', express.raw({ type: '*/*', limit: '1mb' }), async (req, res) => {
+    const { requestID } = req.params;
+    const rawBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(typeof req.body === 'string' ? req.body : '');
+    let body;
+    try {
+      body = rawBuffer.length > 0 ? JSON.parse(rawBuffer.toString('utf8')) : {};
+    } catch {
+      body = {};
+    }
+
+    // Try Claude Code adapter first (if running and not same as OpenCode)
+    if (claudeCodeAdapterPort != null && claudeCodeAdapterPort !== openCodePort) {
+      try {
+        const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/question/reply`;
+        const adapterResponse = await fetch(adapterUrl, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ requestID, ...body }),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (adapterResponse.ok) {
+          const data = await adapterResponse.text();
+          res.setHeader('content-type', adapterResponse.headers.get('content-type') || 'application/json');
+          return res.status(200).send(data);
+        }
+        // 404 means adapter doesn't own this question — fall through to OpenCode
+        if (adapterResponse.status !== 404) {
+          const data = await adapterResponse.text();
+          res.setHeader('content-type', adapterResponse.headers.get('content-type') || 'application/json');
+          return res.status(adapterResponse.status).send(data);
+        }
+      } catch (err) {
+        console.warn('[ClaudeCode] Failed to forward question reply to adapter:', err?.message || err);
+      }
+    }
+
+    // Forward to OpenCode
+    try {
+      const upstreamUrl = buildOpenCodeUrl(`/question/${encodeURIComponent(requestID)}/reply`, '');
+      const authHeaders = getOpenCodeAuthHeaders();
+      const upstreamResponse = await fetch(upstreamUrl, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...authHeaders,
+        },
+        body: rawBuffer,
+        signal: AbortSignal.timeout(10000),
+      });
+      const upstreamBody = await upstreamResponse.text();
+      res.setHeader('content-type', upstreamResponse.headers.get('content-type') || 'application/json');
+      res.status(upstreamResponse.status).send(upstreamBody);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'Question reply forward timed out' : 'Question reply forward failed',
+        });
+      }
+    }
+  });
+
+  // Route POST /api/question/:requestID/reject — try adapter first, then OpenCode
+  app.post('/api/question/:requestID/reject', express.raw({ type: '*/*', limit: '1mb' }), async (req, res) => {
+    const { requestID } = req.params;
+    const rawBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(typeof req.body === 'string' ? req.body : '');
+
+    // Try Claude Code adapter first (if running and not same as OpenCode)
+    if (claudeCodeAdapterPort != null && claudeCodeAdapterPort !== openCodePort) {
+      try {
+        const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/question/reject`;
+        const adapterResponse = await fetch(adapterUrl, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ requestID }),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (adapterResponse.ok) {
+          const data = await adapterResponse.text();
+          res.setHeader('content-type', adapterResponse.headers.get('content-type') || 'application/json');
+          return res.status(200).send(data);
+        }
+        // 404 means adapter doesn't own this question — fall through to OpenCode
+        if (adapterResponse.status !== 404) {
+          const data = await adapterResponse.text();
+          res.setHeader('content-type', adapterResponse.headers.get('content-type') || 'application/json');
+          return res.status(adapterResponse.status).send(data);
+        }
+      } catch (err) {
+        console.warn('[ClaudeCode] Failed to forward question reject to adapter:', err?.message || err);
+      }
+    }
+
+    // Forward to OpenCode
+    try {
+      const upstreamUrl = buildOpenCodeUrl(`/question/${encodeURIComponent(requestID)}/reject`, '');
+      const authHeaders = getOpenCodeAuthHeaders();
+      const upstreamResponse = await fetch(upstreamUrl, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...authHeaders,
+        },
+        body: rawBuffer,
+        signal: AbortSignal.timeout(10000),
+      });
+      const upstreamBody = await upstreamResponse.text();
+      res.setHeader('content-type', upstreamResponse.headers.get('content-type') || 'application/json');
+      res.status(upstreamResponse.status).send(upstreamBody);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'Question reject forward timed out' : 'Question reject forward failed',
+        });
+      }
+    }
+  });
+
+  // Merge GET /api/permission from both OpenCode and Claude Code adapter
+  app.get('/api/permission', async (req, res) => {
+    const queryString = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
+    const authHeaders = getOpenCodeAuthHeaders();
+
+    // Fetch from OpenCode
+    let openCodePermissions = [];
+    try {
+      const openCodeUrl = buildOpenCodeUrl(`/permission${queryString}`, '');
+      const ocResponse = await fetch(openCodeUrl, {
+        method: 'GET',
+        headers: { accept: 'application/json', ...authHeaders },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (ocResponse.ok) {
+        const data = await ocResponse.json();
+        openCodePermissions = Array.isArray(data) ? data : [];
+      }
+    } catch (err) {
+      console.warn('[ClaudeCode] Failed to fetch permissions from OpenCode:', err?.message || err);
+    }
+
+    // Fetch from Claude Code adapter (if running and not same as OpenCode)
+    let adapterPermissions = [];
+    if (claudeCodeAdapterPort != null && claudeCodeAdapterPort !== openCodePort) {
+      try {
+        const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/permission`;
+        const adapterResponse = await fetch(adapterUrl, {
+          method: 'GET',
+          headers: { accept: 'application/json' },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (adapterResponse.ok) {
+          const data = await adapterResponse.json();
+          adapterPermissions = Array.isArray(data) ? data : [];
+        }
+      } catch (err) {
+        console.warn('[ClaudeCode] Failed to fetch permissions from adapter:', err?.message || err);
+      }
+    }
+
+    res.json([...openCodePermissions, ...adapterPermissions]);
   });
 
   app.use('/api', proxyMiddleware);

@@ -148,3 +148,18 @@
   - SVGs should use fill="#000000" since ProviderLogo.tsx applies dark:invert for dark mode support
   - The viewBox="0 0 24 24" format works well at small sizes (h-3.5 w-3.5 and h-4 w-4)
 ---
+
+## 2026-02-26 - US-009
+- Show Claude Code status in provider settings page
+- Files changed: packages/ui/src/components/sections/providers/ProvidersPage.tsx
+- Added `isClaudeCode` flag (`selectedProvider.id === 'claudecode'`) to conditionally render the provider detail view
+- When Claude Code is selected: shows "Status" section with green checkmark "Available" indicator and "Claude Code CLI detected" label, plus a note that no API key is needed
+- When Claude Code is selected: hides the Authentication section (API key input, OAuth, Reconnect button) and Connection Details section (config sources, Disconnect button)
+- The Models section renders normally for Claude Code (shows "Default (Claude Code manages model selection)")
+- Claude Code only appears if it's in the providers list (injected by the server in US-003 when CLI is detected)
+- ProvidersSidebar gracefully handles Claude Code: the /api/provider/:id/source fetch returns an error for claudecode which is silently ignored, so it shows under "User Providers"
+- **Learnings for future iterations:**
+  - To add provider-specific rendering in ProvidersPage, check `selectedProvider.id` and conditionally render sections. The component has three main sections: Authentication, Connection Details, Models.
+  - The ProvidersSidebar's source-loading logic silently ignores fetch errors per provider, so injected providers that don't have OpenCode config sources work fine
+  - Pre-existing lint errors in @openchamber/ui are unchanged (Header.tsx, NotificationSettings.tsx, SidebarFilesTree.tsx, SessionSidebar.tsx)
+---

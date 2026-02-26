@@ -163,6 +163,8 @@ export const ProvidersPage: React.FC = () => {
   const [providerDropdownOpen, setProviderDropdownOpen] = React.useState(false);
   const [providerSources, setProviderSources] = React.useState<Record<string, ProviderSources>>({});
   const [showAuthPanel, setShowAuthPanel] = React.useState(false);
+  const [claudeCodePermissionMode, setClaudeCodePermissionMode] = React.useState<string>('acceptEdits');
+  const [claudeCodePermissionLoading, setClaudeCodePermissionLoading] = React.useState(false);
 
   React.useEffect(() => {
     if (!selectedProviderId && providers.length > 0) {
@@ -319,8 +321,50 @@ export const ProvidersPage: React.FC = () => {
     };
   }, [selectedProviderId]);
 
+  // Load Claude Code permission mode when its provider is selected
+  React.useEffect(() => {
+    if (selectedProviderId !== 'claudecode') return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response = await fetch('/api/config/settings', {
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+        });
+        if (!response.ok) return;
+        const data = await response.json();
+        if (!cancelled && typeof data.claudeCodePermissionMode === 'string') {
+          setClaudeCodePermissionMode(data.claudeCodePermissionMode);
+        }
+      } catch {
+        // ignore
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [selectedProviderId]);
+
   const selectedProvider = providers.find((provider) => provider.id === selectedProviderId);
   const selectedSources = selectedProviderId ? providerSources[selectedProviderId] : undefined;
+
+  const handlePermissionModeChange = async (mode: string) => {
+    setClaudeCodePermissionMode(mode);
+    setClaudeCodePermissionLoading(true);
+    try {
+      const response = await fetch('/api/config/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ claudeCodePermissionMode: mode }),
+      });
+      if (!response.ok) {
+        throw new Error('Failed to save permission mode');
+      }
+      toast.success('Permission mode updated');
+    } catch {
+      toast.error('Failed to save permission mode');
+    } finally {
+      setClaudeCodePermissionLoading(false);
+    }
+  };
 
   const handleSaveApiKey = async (providerId: string) => {
     const apiKey = apiKeyInputs[providerId]?.trim() ?? '';
@@ -809,6 +853,7 @@ export const ProvidersPage: React.FC = () => {
 
         {/* Status / Authentication */}
         {isClaudeCode ? (
+          <>
           <div className="mb-8">
             <div className="mb-1 px-1">
               <h3 className="typography-ui-header font-medium text-foreground">Status</h3>
@@ -824,6 +869,65 @@ export const ProvidersPage: React.FC = () => {
               </p>
             </section>
           </div>
+
+          {/* Permission Mode */}
+          <div className="mb-8">
+            <div className="mb-1 px-1">
+              <h3 className="typography-ui-header font-medium text-foreground">Permission Mode</h3>
+            </div>
+            <section className="px-2 pb-2 pt-0">
+              <p className="typography-meta text-muted-foreground mb-2">
+                Controls how much autonomy Claude Code has when executing tools. Changes apply to new subprocess spawns.
+              </p>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    className={cn(
+                      'flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 typography-ui-label',
+                      'border-border bg-background text-foreground hover:bg-muted/50',
+                      'focus:outline-none focus:ring-1 focus:ring-ring',
+                      claudeCodePermissionLoading && 'opacity-50 pointer-events-none'
+                    )}
+                    disabled={claudeCodePermissionLoading}
+                  >
+                    <span>
+                      {claudeCodePermissionMode === 'default' && 'Default'}
+                      {claudeCodePermissionMode === 'acceptEdits' && 'Accept Edits'}
+                      {claudeCodePermissionMode === 'bypassPermissions' && 'Bypass Permissions'}
+                    </span>
+                    <RiArrowDownSLine className="h-3.5 w-3.5 text-muted-foreground" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="min-w-[200px]">
+                  <DropdownMenuItem
+                    onSelect={() => handlePermissionModeChange('default')}
+                  >
+                    <div className="flex items-center gap-2">
+                      {claudeCodePermissionMode === 'default' && <RiCheckLine className="h-3.5 w-3.5" />}
+                      <span className={claudeCodePermissionMode !== 'default' ? 'ml-5.5' : ''}>Default</span>
+                    </div>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => handlePermissionModeChange('acceptEdits')}
+                  >
+                    <div className="flex items-center gap-2">
+                      {claudeCodePermissionMode === 'acceptEdits' && <RiCheckLine className="h-3.5 w-3.5" />}
+                      <span className={claudeCodePermissionMode !== 'acceptEdits' ? 'ml-5.5' : ''}>Accept Edits</span>
+                    </div>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => handlePermissionModeChange('bypassPermissions')}
+                  >
+                    <div className="flex items-center gap-2">
+                      {claudeCodePermissionMode === 'bypassPermissions' && <RiCheckLine className="h-3.5 w-3.5" />}
+                      <span className={claudeCodePermissionMode !== 'bypassPermissions' ? 'ml-5.5' : ''}>Bypass Permissions</span>
+                    </div>
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </section>
+          </div>
+          </>
         ) : (
           <>
             {/* Authentication */}

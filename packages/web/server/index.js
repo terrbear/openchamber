@@ -1618,6 +1618,12 @@ const sanitizeSettingsUpdate = (payload) => {
     const trimmed = candidate.zenModel.trim();
     result.zenModel = trimmed.length > 0 ? trimmed : undefined;
   }
+  if (typeof candidate.claudeCodePermissionMode === 'string') {
+    const mode = candidate.claudeCodePermissionMode.trim();
+    if (mode === 'default' || mode === 'acceptEdits' || mode === 'bypassPermissions') {
+      result.claudeCodePermissionMode = mode;
+    }
+  }
   if (typeof candidate.toolCallExpansion === 'string') {
     const mode = candidate.toolCallExpansion.trim();
     if (mode === 'collapsed' || mode === 'activity' || mode === 'detailed') {
@@ -7722,6 +7728,17 @@ async function main(options = {}) {
     try {
       const updated = await persistSettings(req.body ?? {});
       console.log(`[API:PUT /api/config/settings] Success, returning ${updated.projects?.length || 0} projects`);
+
+      // Update Claude Code adapter permission mode at runtime if it changed
+      if (typeof req.body?.claudeCodePermissionMode === 'string' && claudeCodeAdapterInstance) {
+        try {
+          const { setPermissionMode } = await import('./lib/claudecode/adapter.js');
+          setPermissionMode(req.body.claudeCodePermissionMode);
+        } catch {
+          // non-fatal
+        }
+      }
+
       res.json(updated);
     } catch (error) {
       console.error(`[API:PUT /api/config/settings] Failed to save settings:`, error);
@@ -12638,6 +12655,20 @@ Context:
   // Detect Claude Code CLI availability (runs before backend init)
   detectClaudeCodeCli();
 
+  // Read persisted permission mode; fall back to env var, then default
+  let claudeCodePermissionMode = ENV_CLAUDECODE_PERMISSION_MODE;
+  try {
+    const startupSettings = await readSettingsFromDisk();
+    if (typeof startupSettings.claudeCodePermissionMode === 'string') {
+      const mode = startupSettings.claudeCodePermissionMode.trim();
+      if (mode === 'default' || mode === 'acceptEdits' || mode === 'bypassPermissions') {
+        claudeCodePermissionMode = mode;
+      }
+    }
+  } catch {
+    // non-fatal, use env var default
+  }
+
   if (ENV_BACKEND === 'claudecode') {
     try {
       const binary = resolvedClaudeBinary || ENV_CLAUDECODE_BINARY;
@@ -12647,7 +12678,7 @@ Context:
         port: 0,
         claudeBinary: binary,
         cwd: process.cwd(),
-        permissionMode: ENV_CLAUDECODE_PERMISSION_MODE,
+        permissionMode: claudeCodePermissionMode,
       });
       console.log(`[openchamber] Claude Code adapter listening on port ${claudeCodeAdapterInstance.port}`);
       setOpenCodePort(claudeCodeAdapterInstance.port);
@@ -12725,7 +12756,7 @@ Context:
             port: 0,
             claudeBinary: resolvedClaudeBinary,
             cwd: process.cwd(),
-            permissionMode: ENV_CLAUDECODE_PERMISSION_MODE,
+            permissionMode: claudeCodePermissionMode,
           });
           claudeCodeAdapterPort = claudeCodeAdapterInstance.port;
           console.log(`[openchamber] Claude Code adapter (hybrid) listening on port ${claudeCodeAdapterPort}`);

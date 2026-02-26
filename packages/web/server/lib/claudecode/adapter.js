@@ -21,6 +21,9 @@ let _permissionMode = 'acceptEdits';
 // Pending permission questions keyed by requestId: { resolve, question }
 const pendingQuestions = {};
 
+// Track running claude processes per session to prevent concurrent prompts
+const runningProcesses = new Map();
+
 const globalSseClients = new Set();
 
 function broadcastGlobalEvent(obj) {
@@ -274,6 +277,14 @@ function createApp(cwd) {
       // { code, assistantText, usedResume } so the caller can decide whether to retry.
       function runClaude({ useResume }) {
         return new Promise((resolveRun) => {
+          // Kill any existing running process for this session to prevent
+          // concurrent prompts racing against each other.
+          const existing = runningProcesses.get(id);
+          if (existing && !existing.killed) {
+            try { existing.stdin.end(); } catch { /* already closed */ }
+            existing.kill('SIGTERM');
+          }
+
           const sessionCwd = (Object.hasOwn(sessions, id) && sessions[id].directory) || _cwd;
           const claudeSessionId = useResume && Object.hasOwn(sessions, id) ? sessions[id].claudeSessionId : null;
           const args = [
@@ -290,6 +301,9 @@ function createApp(cwd) {
             stdio: ['pipe', 'pipe', 'pipe'],
           });
 
+          // Track this process so concurrent prompts can kill it
+          runningProcesses.set(id, claudeProc);
+
           // Write the user prompt as a stream-json message and keep stdin open.
           claudeProc.stdin.on('error', () => {});
           const userMsg = JSON.stringify({ type: 'user', message: { role: 'user', content } }) + '\n';
@@ -300,7 +314,10 @@ function createApp(cwd) {
           let assistantText = '';
 
           const timeoutHandle = setTimeout(() => {
-            if (!claudeProc.killed) claudeProc.kill('SIGTERM');
+            if (!claudeProc.killed) {
+              try { claudeProc.stdin.end(); } catch { /* already closed */ }
+              claudeProc.kill('SIGTERM');
+            }
           }, TIMEOUT_MS);
 
           const processLine = (line) => {
@@ -431,12 +448,19 @@ function createApp(cwd) {
 
           claudeProc.on('error', (err) => {
             clearTimeout(timeoutHandle);
+            if (runningProcesses.get(id) === claudeProc) {
+              runningProcesses.delete(id);
+            }
             console.error('[claudecode-adapter] Claude process error:', err.message);
             resolveRun({ code: 1, assistantText: '', usedResume: !!claudeSessionId, stderr: err.message });
           });
 
           claudeProc.on('close', (code) => {
             clearTimeout(timeoutHandle);
+            // Remove from running processes tracking
+            if (runningProcesses.get(id) === claudeProc) {
+              runningProcesses.delete(id);
+            }
             if (stdoutBuf.trim()) processLine(stdoutBuf.trim());
             // Clean up any pending questions for this session
             for (const [reqId, entry] of Object.entries(pendingQuestions)) {
@@ -467,6 +491,25 @@ function createApp(cwd) {
       if (result.code !== 0 && !result.assistantText) {
         const errDetail = result.stderr.trim() || `Claude exited with code ${result.code}`;
         console.error('[claudecode-adapter] Claude failed:', errDetail);
+
+        // Emit an error message to the SSE stream so the user sees what went wrong
+        const errorText = `Error: ${errDetail}`;
+        const errorCompletedAt = Date.now();
+        broadcastGlobalEvent({
+          type: 'message.updated',
+          properties: {
+            info: {
+              id: assistantMessageId,
+              sessionID: id,
+              role: 'assistant',
+              status: 'completed',
+              finish: 'error',
+              time: { created: errorCompletedAt, updated: errorCompletedAt, completed: errorCompletedAt },
+              parts: [{ id: assistantPartId, type: 'text', text: errorText, messageID: assistantMessageId, sessionID: id }],
+            }
+          }
+        });
+
         broadcastGlobalEvent({ type: 'session.status', properties: { sessionID: id, status: { type: 'idle' } } });
         return;
       }
@@ -671,4 +714,10 @@ export async function startClaudeCodeAdapter({ port = 0, claudeBinary, cwd, perm
 
 export function getAdapterPort() {
   return _port;
+}
+
+export function setPermissionMode(mode) {
+  if (mode === 'default' || mode === 'acceptEdits' || mode === 'bypassPermissions') {
+    _permissionMode = mode;
+  }
 }

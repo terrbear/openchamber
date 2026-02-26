@@ -1,7 +1,12 @@
 .PHONY: package
 
-run:
-	bun run dev
+run-cc:
+	(kill $(shell (lsof -ti:6969)) && sleep 3) || true
+	OPENCHAMBER_BACKEND=claudecode bun run dev
+
+run-oc:
+	(kill $(shell (lsof -ti:6969)) && sleep 3) || true
+	OPENCHAMBER_BACKEND=opencode bun run dev
 
 # Detect platform and set appropriate bundle types
 UNAME_S := $(shell uname -s)

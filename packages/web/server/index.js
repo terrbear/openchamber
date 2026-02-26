@@ -11,7 +11,7 @@ import os from 'os';
 import crypto from 'crypto';
 import { createUiAuth } from './lib/opencode/ui-auth.js';
 import { startCloudflareTunnel, printTunnelWarning, checkCloudflaredAvailable } from './lib/cloudflare-tunnel.js';
-import { prepareNotificationLastMessage } from './lib/notification-message.js';
+import { prepareNotificationLastMessage } from './lib/notifications/index.js';
 import {
   TERMINAL_INPUT_WS_MAX_PAYLOAD_BYTES,
   TERMINAL_INPUT_WS_PATH,
@@ -21,7 +21,7 @@ import {
   parseRequestPathname,
   pruneRebindTimestamps,
   readTerminalInputWsControlFrame,
-} from './lib/terminal-input-ws-protocol.js';
+} from './lib/terminal/index.js';
 import webPush from 'web-push';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1528,6 +1528,9 @@ const sanitizeSettingsUpdate = (payload) => {
   if (typeof candidate.showTextJustificationActivity === 'boolean') {
     result.showTextJustificationActivity = candidate.showTextJustificationActivity;
   }
+  if (typeof candidate.showDeletionDialog === 'boolean') {
+    result.showDeletionDialog = candidate.showDeletionDialog;
+  }
   if (typeof candidate.nativeNotificationsEnabled === 'boolean') {
     result.nativeNotificationsEnabled = candidate.nativeNotificationsEnabled;
   }
@@ -1614,6 +1617,12 @@ const sanitizeSettingsUpdate = (payload) => {
   if (typeof candidate.zenModel === 'string') {
     const trimmed = candidate.zenModel.trim();
     result.zenModel = trimmed.length > 0 ? trimmed : undefined;
+  }
+  if (typeof candidate.claudeCodePermissionMode === 'string') {
+    const mode = candidate.claudeCodePermissionMode.trim();
+    if (mode === 'default' || mode === 'acceptEdits' || mode === 'bypassPermissions') {
+      result.claudeCodePermissionMode = mode;
+    }
   }
   if (typeof candidate.toolCallExpansion === 'string') {
     const mode = candidate.toolCallExpansion.trim();
@@ -2907,6 +2916,8 @@ let exitOnShutdown = true;
 let uiAuthController = null;
 let cloudflareTunnelController = null;
 let terminalInputWsServer = null;
+let claudeCodeAdapterInstance = null;
+let claudeCodeAdapterPort = null;
 const userProvidedOpenCodePassword =
   typeof hmrState.userProvidedOpenCodePassword === 'string' && hmrState.userProvidedOpenCodePassword.length > 0
     ? hmrState.userProvidedOpenCodePassword
@@ -3023,6 +3034,9 @@ const ENV_CONFIGURED_OPENCODE_PORT = (() => {
 const ENV_SKIP_OPENCODE_START = process.env.OPENCODE_SKIP_START === 'true' ||
                                     process.env.OPENCHAMBER_SKIP_OPENCODE_START === 'true';
 const ENV_DESKTOP_NOTIFY = process.env.OPENCHAMBER_DESKTOP_NOTIFY === 'true';
+const ENV_BACKEND = process.env.OPENCHAMBER_BACKEND || 'opencode';
+const ENV_CLAUDECODE_BINARY = (process.env.CLAUDECODE_BINARY || '').trim() || 'claude';
+const ENV_CLAUDECODE_PERMISSION_MODE = (process.env.CLAUDECODE_PERMISSION_MODE || '').trim() || 'acceptEdits';
 
 // OpenCode server authentication (Basic Auth with username "opencode")
 
@@ -3269,6 +3283,7 @@ let resolvedOpencodeBinary = null;
 let resolvedOpencodeBinarySource = null;
 let resolvedNodeBinary = null;
 let resolvedBunBinary = null;
+let resolvedClaudeBinary = null;
 
 function isExecutable(filePath) {
   try {
@@ -3305,6 +3320,51 @@ function searchPathFor(binaryName) {
     }
   }
   return null;
+}
+
+/**
+ * Resolve the Claude Code CLI binary path.
+ * Checks CLAUDECODE_BINARY env var first, then searches PATH for 'claude'.
+ * Returns the resolved path or null if not found.
+ */
+function resolveClaudeCodeCliPath() {
+  const envBinary = (process.env.CLAUDECODE_BINARY || '').trim();
+  if (envBinary) {
+    if (path.isAbsolute(envBinary) || envBinary.includes(path.sep)) {
+      const resolved = path.isAbsolute(envBinary) ? envBinary : path.resolve(envBinary);
+      if (isExecutable(resolved)) {
+        return resolved;
+      }
+      console.warn(`[openchamber] CLAUDECODE_BINARY="${envBinary}" is not executable, falling back to PATH lookup`);
+    } else {
+      // Bare name like "claude" — search PATH for it
+      const found = searchPathFor(envBinary);
+      if (found) {
+        return found;
+      }
+      console.warn(`[openchamber] CLAUDECODE_BINARY="${envBinary}" not found on PATH, falling back to default lookup`);
+    }
+  }
+
+  return searchPathFor('claude');
+}
+
+/**
+ * Detect the Claude Code CLI binary synchronously.
+ * Stores the result in resolvedClaudeBinary for use by the adapter and middleware.
+ */
+function detectClaudeCodeCli() {
+  try {
+    const resolved = resolveClaudeCodeCliPath();
+    if (resolved) {
+      resolvedClaudeBinary = resolved;
+      console.log(`[openchamber] Claude Code CLI detected: ${resolved}`);
+    } else {
+      console.debug('[openchamber] Claude Code CLI not found, Claude Code provider will not be available');
+    }
+  } catch (error) {
+    console.debug(`[openchamber] Claude Code CLI detection failed: ${error.message}`);
+  }
 }
 
 function resolveOpencodeCliPath() {
@@ -4858,6 +4918,96 @@ function writeSseEvent(res, payload) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
+/**
+ * Connect to the Claude Code adapter's /event SSE endpoint and forward events
+ * to the client response. Reconnects on drop with exponential backoff.
+ * Returns a cleanup function that stops the connection loop.
+ */
+function connectAdapterSse(res, abortSignal) {
+  // Only connect in hybrid mode (adapter running on a separate port from OpenCode).
+  // In legacy claudecode mode, openCodePort === claudeCodeAdapterPort and the
+  // upstream OpenCode connection already carries all adapter events.
+  if (!claudeCodeAdapterPort || claudeCodeAdapterPort === openCodePort) return () => {};
+
+  let stopped = false;
+  let currentReader = null;
+
+  const stop = () => {
+    stopped = true;
+    if (currentReader) {
+      try { currentReader.cancel(); } catch { /* ignore */ }
+    }
+  };
+
+  // Stop when the parent signal aborts (client disconnect)
+  const onAbort = () => stop();
+  abortSignal.addEventListener('abort', onAbort, { once: true });
+
+  const run = async () => {
+    let attempt = 0;
+    while (!stopped && !abortSignal.aborted) {
+      const port = claudeCodeAdapterPort;
+      if (!port) {
+        // Adapter went away, wait and retry
+        await new Promise((r) => setTimeout(r, 5000));
+        continue;
+      }
+      attempt += 1;
+      try {
+        const adapterUrl = `http://127.0.0.1:${port}/event`;
+        const adapterResponse = await fetch(adapterUrl, {
+          headers: { Accept: 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' },
+          signal: abortSignal,
+        });
+        if (!adapterResponse.ok || !adapterResponse.body) {
+          throw new Error(`adapter SSE bad status ${adapterResponse.status}`);
+        }
+        console.log('[AdapterSSE] connected to Claude Code adapter event stream');
+        attempt = 0; // reset backoff on successful connect
+
+        const decoder = new TextDecoder();
+        const reader = adapterResponse.body.getReader();
+        currentReader = reader;
+        let buffer = '';
+
+        while (!stopped && !abortSignal.aborted) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+
+          let separatorIndex = buffer.indexOf('\n\n');
+          while (separatorIndex !== -1) {
+            const block = buffer.slice(0, separatorIndex);
+            buffer = buffer.slice(separatorIndex + 2);
+            separatorIndex = buffer.indexOf('\n\n');
+            if (block && !res.writableEnded) {
+              try {
+                res.write(`${block}\n\n`);
+              } catch { /* client gone */ }
+            }
+          }
+        }
+        currentReader = null;
+      } catch (error) {
+        currentReader = null;
+        if (stopped || abortSignal.aborted) return;
+        console.warn('[AdapterSSE] disconnected from Claude Code adapter:', error?.message || error);
+      }
+
+      if (stopped || abortSignal.aborted) return;
+      const backoffMs = Math.min(1000 * Math.pow(2, Math.min(attempt, 4)), 16000);
+      await new Promise((r) => setTimeout(r, backoffMs));
+    }
+  };
+
+  void run();
+
+  return () => {
+    stop();
+    abortSignal.removeEventListener('abort', onAbort);
+  };
+}
+
 function extractApiPrefixFromUrl() {
   return '';
 }
@@ -5482,6 +5632,7 @@ function setupProxy(app) {
     let idleTimer = null;
     let heartbeatTimer = null;
     let endedBy = 'upstream-end';
+    let stopAdapterSse = null;
 
     const cleanup = () => {
       if (connectTimer) {
@@ -5568,6 +5719,9 @@ function setupProxy(app) {
         }
       }, 30 * 1000);
 
+      // Merge Claude Code adapter events into this SSE stream
+      stopAdapterSse = connectAdapterSse(res, controller.signal);
+
       const reader = upstreamResponse.body.getReader();
       try {
         while (true) {
@@ -5591,12 +5745,16 @@ function setupProxy(app) {
         }
       }
 
+      stopAdapterSse();
       cleanup();
       if (!res.writableEnded) {
         res.end();
       }
       console.log(`SSE forward ${upstreamPath} closed (${endedBy}) in ${Date.now() - startedAt}ms`);
     } catch (error) {
+      if (stopAdapterSse) {
+        stopAdapterSse();
+      }
       cleanup();
       const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
       if (!res.headersSent) {
@@ -5690,8 +5848,409 @@ function setupProxy(app) {
           proxyRes.headers['X-Accel-Buffering'] = 'no';
           proxyRes.headers['X-Content-Type-Options'] = 'nosniff';
         }
+      },
+    },
+  });
+
+  // Dedicated forwarder for large session message payloads.
+  // This avoids edge-cases in generic proxy streaming for multi-file attachments.
+  app.post('/api/session/:sessionId/message', express.raw({ type: '*/*', limit: '50mb' }), async (req, res) => {
+    try {
+      const upstreamPath = req.originalUrl.replace(/^\/api/, '');
+      const targetUrl = buildOpenCodeUrl(upstreamPath, '');
+      const authHeaders = getOpenCodeAuthHeaders();
+
+      const headers = {
+        ...(typeof req.headers['content-type'] === 'string' ? { 'content-type': req.headers['content-type'] } : { 'content-type': 'application/json' }),
+        ...(typeof req.headers.accept === 'string' ? { accept: req.headers.accept } : {}),
+        ...(authHeaders.Authorization ? { Authorization: authHeaders.Authorization } : {}),
+      };
+
+      const bodyBuffer = Buffer.isBuffer(req.body)
+        ? req.body
+        : Buffer.from(typeof req.body === 'string' ? req.body : '');
+
+      const upstreamResponse = await fetch(targetUrl, {
+        method: 'POST',
+        headers,
+        body: bodyBuffer,
+        signal: AbortSignal.timeout(LONG_REQUEST_TIMEOUT_MS),
+      });
+
+      const upstreamBody = Buffer.from(await upstreamResponse.arrayBuffer());
+
+      if (upstreamResponse.headers.has('content-type')) {
+        res.setHeader('content-type', upstreamResponse.headers.get('content-type'));
+      }
+
+      res.status(upstreamResponse.status).send(upstreamBody);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'OpenCode message forward timed out' : 'OpenCode message forward failed',
+        });
       }
     }
+  });
+
+  // Intercept GET /config/providers to inject Claude Code provider when adapter is running
+  app.get('/api/config/providers', async (req, res) => {
+    try {
+      const queryString = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
+      const upstreamUrl = buildOpenCodeUrl(`/config/providers${queryString}`, '');
+      const authHeaders = getOpenCodeAuthHeaders();
+
+      const upstreamResponse = await fetch(upstreamUrl, {
+        method: 'GET',
+        headers: {
+          accept: 'application/json',
+          ...(authHeaders.Authorization ? { Authorization: authHeaders.Authorization } : {}),
+        },
+        signal: AbortSignal.timeout(10000),
+      });
+
+      const contentType = upstreamResponse.headers.get('content-type') || 'application/json';
+      if (!upstreamResponse.ok) {
+        const body = await upstreamResponse.text().catch(() => '');
+        res.setHeader('content-type', contentType);
+        return res.status(upstreamResponse.status).send(body);
+      }
+
+      const data = await upstreamResponse.json();
+
+      if (claudeCodeAdapterPort != null) {
+        const providers = Array.isArray(data.providers) ? data.providers : [];
+        providers.push({
+          id: 'claudecode',
+          name: 'Claude Code',
+          source: 'custom',
+          env: [],
+          options: {},
+          models: {
+            default: {
+              id: 'default',
+              providerID: 'claudecode',
+              api: { id: 'claudecode', url: '', npm: '' },
+              name: 'Default (Claude Code manages model selection)',
+              capabilities: {
+                temperature: false,
+                reasoning: false,
+                attachment: true,
+                toolcall: true,
+                input: { text: true, audio: false, image: true, video: false, pdf: true },
+                output: { text: true, audio: false, image: false, video: false, pdf: false },
+                interleaved: false,
+              },
+              cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+              limit: { context: 200000, output: 16384 },
+              status: 'active',
+              options: {},
+              headers: {},
+              release_date: '2025-01-01',
+            },
+          },
+        });
+        data.providers = providers;
+      }
+
+      res.json(data);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'Provider list fetch timed out' : 'Provider list fetch failed',
+        });
+      }
+    }
+  });
+
+  // Route POST /api/session/:id/prompt_async to Claude Code adapter when providerID is 'claudecode',
+  // otherwise forward to OpenCode directly (we cannot call next() because express.raw() consumes the body stream).
+  app.post('/api/session/:id/prompt_async', express.raw({ type: '*/*', limit: '10mb' }), async (req, res) => {
+    const rawBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(typeof req.body === 'string' ? req.body : '');
+    let body;
+    try {
+      body = rawBuffer.length > 0 ? JSON.parse(rawBuffer.toString('utf8')) : {};
+    } catch {
+      // JSON parsing failed — forward raw payload to OpenCode and let it handle the error
+      body = {};
+    }
+
+    const providerID = body.model?.providerID;
+    const sessionId = req.params.id;
+
+    if (providerID !== 'claudecode' || claudeCodeAdapterPort == null) {
+      // Not a Claude Code request or adapter not running — forward to OpenCode directly
+      // (we cannot use next() because express.raw() already consumed the body stream)
+      try {
+        const upstreamPath = req.originalUrl.replace(/^\/api/, '');
+        const targetUrl = buildOpenCodeUrl(upstreamPath, '');
+        const authHeaders = getOpenCodeAuthHeaders();
+
+        const headers = {
+          ...(typeof req.headers['content-type'] === 'string' ? { 'content-type': req.headers['content-type'] } : { 'content-type': 'application/json' }),
+          ...(typeof req.headers.accept === 'string' ? { accept: req.headers.accept } : {}),
+          ...(authHeaders.Authorization ? { Authorization: authHeaders.Authorization } : {}),
+        };
+
+        const upstreamResponse = await fetch(targetUrl, {
+          method: 'POST',
+          headers,
+          body: rawBuffer,
+          signal: AbortSignal.timeout(LONG_REQUEST_TIMEOUT_MS),
+        });
+
+        const upstreamBody = Buffer.from(await upstreamResponse.arrayBuffer());
+
+        if (upstreamResponse.headers.has('content-type')) {
+          res.setHeader('content-type', upstreamResponse.headers.get('content-type'));
+        }
+
+        res.status(upstreamResponse.status).send(upstreamBody);
+      } catch (error) {
+        if (!res.headersSent) {
+          const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+          res.status(isTimeout ? 504 : 503).json({
+            error: isTimeout ? 'OpenCode prompt_async forward timed out' : 'OpenCode prompt_async forward failed',
+          });
+        }
+      }
+      return;
+    }
+
+    // Forward to Claude Code adapter
+    const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/session/${encodeURIComponent(sessionId)}/prompt_async`;
+    console.log(`[ClaudeCode] Forwarding prompt_async for session ${sessionId} to adapter at port ${claudeCodeAdapterPort}`);
+
+    try {
+      const upstreamResponse = await fetch(adapterUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: rawBuffer,
+        signal: AbortSignal.timeout(LONG_REQUEST_TIMEOUT_MS),
+      });
+
+      const responseBody = await upstreamResponse.text();
+      const contentType = upstreamResponse.headers.get('content-type') || 'application/json';
+      res.setHeader('content-type', contentType);
+      res.status(upstreamResponse.status).send(responseBody);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'Claude Code adapter request timed out' : 'Claude Code adapter unavailable',
+        });
+      }
+    }
+  });
+
+  // Merge GET /api/question from both OpenCode and Claude Code adapter
+  app.get('/api/question', async (req, res) => {
+    const queryString = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
+    const authHeaders = getOpenCodeAuthHeaders();
+
+    // Fetch from OpenCode
+    let openCodeQuestions = [];
+    try {
+      const openCodeUrl = buildOpenCodeUrl(`/question${queryString}`, '');
+      const ocResponse = await fetch(openCodeUrl, {
+        method: 'GET',
+        headers: { accept: 'application/json', ...authHeaders },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (ocResponse.ok) {
+        const data = await ocResponse.json();
+        openCodeQuestions = Array.isArray(data) ? data : [];
+      }
+    } catch (err) {
+      console.warn('[ClaudeCode] Failed to fetch questions from OpenCode:', err?.message || err);
+    }
+
+    // Fetch from Claude Code adapter (if running and not same as OpenCode)
+    let adapterQuestions = [];
+    if (claudeCodeAdapterPort != null && claudeCodeAdapterPort !== openCodePort) {
+      try {
+        const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/question`;
+        const adapterResponse = await fetch(adapterUrl, {
+          method: 'GET',
+          headers: { accept: 'application/json' },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (adapterResponse.ok) {
+          const data = await adapterResponse.json();
+          adapterQuestions = Array.isArray(data) ? data : [];
+        }
+      } catch (err) {
+        console.warn('[ClaudeCode] Failed to fetch questions from adapter:', err?.message || err);
+      }
+    }
+
+    res.json([...openCodeQuestions, ...adapterQuestions]);
+  });
+
+  // Route POST /api/question/:requestID/reply — try adapter first, then OpenCode
+  app.post('/api/question/:requestID/reply', express.raw({ type: '*/*', limit: '1mb' }), async (req, res) => {
+    const { requestID } = req.params;
+    const rawBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(typeof req.body === 'string' ? req.body : '');
+    let body;
+    try {
+      body = rawBuffer.length > 0 ? JSON.parse(rawBuffer.toString('utf8')) : {};
+    } catch {
+      body = {};
+    }
+
+    // Try Claude Code adapter first (if running and not same as OpenCode)
+    if (claudeCodeAdapterPort != null && claudeCodeAdapterPort !== openCodePort) {
+      try {
+        const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/question/reply`;
+        const adapterResponse = await fetch(adapterUrl, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ requestID, ...body }),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (adapterResponse.ok) {
+          const data = await adapterResponse.text();
+          res.setHeader('content-type', adapterResponse.headers.get('content-type') || 'application/json');
+          return res.status(200).send(data);
+        }
+        // 404 means adapter doesn't own this question — fall through to OpenCode
+        if (adapterResponse.status !== 404) {
+          const data = await adapterResponse.text();
+          res.setHeader('content-type', adapterResponse.headers.get('content-type') || 'application/json');
+          return res.status(adapterResponse.status).send(data);
+        }
+      } catch (err) {
+        console.warn('[ClaudeCode] Failed to forward question reply to adapter:', err?.message || err);
+      }
+    }
+
+    // Forward to OpenCode
+    try {
+      const upstreamUrl = buildOpenCodeUrl(`/question/${encodeURIComponent(requestID)}/reply`, '');
+      const authHeaders = getOpenCodeAuthHeaders();
+      const upstreamResponse = await fetch(upstreamUrl, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...authHeaders,
+        },
+        body: rawBuffer,
+        signal: AbortSignal.timeout(10000),
+      });
+      const upstreamBody = await upstreamResponse.text();
+      res.setHeader('content-type', upstreamResponse.headers.get('content-type') || 'application/json');
+      res.status(upstreamResponse.status).send(upstreamBody);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'Question reply forward timed out' : 'Question reply forward failed',
+        });
+      }
+    }
+  });
+
+  // Route POST /api/question/:requestID/reject — try adapter first, then OpenCode
+  app.post('/api/question/:requestID/reject', express.raw({ type: '*/*', limit: '1mb' }), async (req, res) => {
+    const { requestID } = req.params;
+    const rawBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(typeof req.body === 'string' ? req.body : '');
+
+    // Try Claude Code adapter first (if running and not same as OpenCode)
+    if (claudeCodeAdapterPort != null && claudeCodeAdapterPort !== openCodePort) {
+      try {
+        const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/question/reject`;
+        const adapterResponse = await fetch(adapterUrl, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ requestID }),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (adapterResponse.ok) {
+          const data = await adapterResponse.text();
+          res.setHeader('content-type', adapterResponse.headers.get('content-type') || 'application/json');
+          return res.status(200).send(data);
+        }
+        // 404 means adapter doesn't own this question — fall through to OpenCode
+        if (adapterResponse.status !== 404) {
+          const data = await adapterResponse.text();
+          res.setHeader('content-type', adapterResponse.headers.get('content-type') || 'application/json');
+          return res.status(adapterResponse.status).send(data);
+        }
+      } catch (err) {
+        console.warn('[ClaudeCode] Failed to forward question reject to adapter:', err?.message || err);
+      }
+    }
+
+    // Forward to OpenCode
+    try {
+      const upstreamUrl = buildOpenCodeUrl(`/question/${encodeURIComponent(requestID)}/reject`, '');
+      const authHeaders = getOpenCodeAuthHeaders();
+      const upstreamResponse = await fetch(upstreamUrl, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...authHeaders,
+        },
+        body: rawBuffer,
+        signal: AbortSignal.timeout(10000),
+      });
+      const upstreamBody = await upstreamResponse.text();
+      res.setHeader('content-type', upstreamResponse.headers.get('content-type') || 'application/json');
+      res.status(upstreamResponse.status).send(upstreamBody);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'Question reject forward timed out' : 'Question reject forward failed',
+        });
+      }
+    }
+  });
+
+  // Merge GET /api/permission from both OpenCode and Claude Code adapter
+  app.get('/api/permission', async (req, res) => {
+    const queryString = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
+    const authHeaders = getOpenCodeAuthHeaders();
+
+    // Fetch from OpenCode
+    let openCodePermissions = [];
+    try {
+      const openCodeUrl = buildOpenCodeUrl(`/permission${queryString}`, '');
+      const ocResponse = await fetch(openCodeUrl, {
+        method: 'GET',
+        headers: { accept: 'application/json', ...authHeaders },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (ocResponse.ok) {
+        const data = await ocResponse.json();
+        openCodePermissions = Array.isArray(data) ? data : [];
+      }
+    } catch (err) {
+      console.warn('[ClaudeCode] Failed to fetch permissions from OpenCode:', err?.message || err);
+    }
+
+    // Fetch from Claude Code adapter (if running and not same as OpenCode)
+    let adapterPermissions = [];
+    if (claudeCodeAdapterPort != null && claudeCodeAdapterPort !== openCodePort) {
+      try {
+        const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/permission`;
+        const adapterResponse = await fetch(adapterUrl, {
+          method: 'GET',
+          headers: { accept: 'application/json' },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (adapterResponse.ok) {
+          const data = await adapterResponse.json();
+          adapterPermissions = Array.isArray(data) ? data : [];
+        }
+      } catch (err) {
+        console.warn('[ClaudeCode] Failed to fetch permissions from adapter:', err?.message || err);
+      }
+    }
+
+    res.json([...openCodePermissions, ...adapterPermissions]);
   });
 
   app.use('/api', proxyMiddleware);
@@ -5749,6 +6308,18 @@ async function gracefulShutdown(options = {}) {
     }
   }
 
+  // Stop Claude Code adapter if running
+  if (claudeCodeAdapterInstance) {
+    console.log('Stopping Claude Code adapter...');
+    try {
+      await claudeCodeAdapterInstance.stop();
+    } catch (error) {
+      console.warn('Error stopping Claude Code adapter:', error);
+    }
+    claudeCodeAdapterInstance = null;
+    claudeCodeAdapterPort = null;
+  }
+
   // Only stop OpenCode if we started it ourselves (not when using external server)
   if (!ENV_SKIP_OPENCODE_START && !isExternalOpenCode) {
     const portToKill = openCodePort;
@@ -5763,7 +6334,9 @@ async function gracefulShutdown(options = {}) {
       openCodeProcess = null;
     }
 
-    killProcessOnPort(portToKill);
+    if (ENV_BACKEND !== 'claudecode') {
+      killProcessOnPort(portToKill);
+    }
   } else {
     console.log('Skipping OpenCode shutdown (external server)');
   }
@@ -5880,6 +6453,7 @@ async function main(options = {}) {
     res.json({
       status: 'ok',
       timestamp: new Date().toISOString(),
+      backend: ENV_BACKEND,
       openCodePort: openCodePort,
       openCodeRunning: Boolean(openCodePort && isOpenCodeReady && !isRestartingOpenCode),
       openCodeSecureConnection: isOpenCodeConnectionSecure(),
@@ -5893,6 +6467,8 @@ async function main(options = {}) {
       opencodeShimInterpreter: resolvedOpencodeBinary ? opencodeShimInterpreter(resolvedOpencodeBinary) : null,
       nodeBinaryResolved: resolvedNodeBinary || null,
       bunBinaryResolved: resolvedBunBinary || null,
+      claudeCodeAvailable: claudeCodeAdapterPort != null,
+      claudeCodeAdapterPort: claudeCodeAdapterPort,
     });
   });
 
@@ -5907,6 +6483,7 @@ async function main(options = {}) {
     if (
       req.path.startsWith('/api/config/agents') ||
       req.path.startsWith('/api/config/commands') ||
+      req.path.startsWith('/api/config/mcp') ||
       req.path.startsWith('/api/config/settings') ||
       req.path.startsWith('/api/config/skills') ||
       req.path.startsWith('/api/fs') ||
@@ -6844,6 +7421,9 @@ async function main(options = {}) {
       writeSseEvent(res, { type: 'openchamber:heartbeat', timestamp: Date.now() });
     }, 15000);
 
+    // Merge Claude Code adapter events into this SSE stream
+    const stopAdapterSse = connectAdapterSse(res, controller.signal);
+
     const decoder = new TextDecoder();
     const reader = upstream.body.getReader();
     let buffer = '';
@@ -6916,6 +7496,7 @@ async function main(options = {}) {
         console.warn('SSE proxy stream error:', error);
       }
     } finally {
+      stopAdapterSse();
       clearInterval(heartbeatInterval);
       cleanupClient();
       cleanup();
@@ -6993,6 +7574,9 @@ async function main(options = {}) {
       writeSseEvent(res, { type: 'openchamber:heartbeat', timestamp: Date.now() });
     }, 15000);
 
+    // Merge Claude Code adapter events into this SSE stream
+    const stopAdapterSse = connectAdapterSse(res, controller.signal);
+
     const decoder = new TextDecoder();
     const reader = upstream.body.getReader();
     let buffer = '';
@@ -7063,6 +7647,7 @@ async function main(options = {}) {
         console.warn('SSE proxy stream error:', error);
       }
     } finally {
+      stopAdapterSse();
       clearInterval(heartbeatInterval);
       cleanup();
       try {
@@ -7143,6 +7728,17 @@ async function main(options = {}) {
     try {
       const updated = await persistSettings(req.body ?? {});
       console.log(`[API:PUT /api/config/settings] Success, returning ${updated.projects?.length || 0} projects`);
+
+      // Update Claude Code adapter permission mode at runtime if it changed
+      if (typeof req.body?.claudeCodePermissionMode === 'string' && claudeCodeAdapterInstance) {
+        try {
+          const { setPermissionMode } = await import('./lib/claudecode/adapter.js');
+          setPermissionMode(req.body.claudeCodePermissionMode);
+        } catch {
+          // non-fatal
+        }
+      }
+
       res.json(updated);
     } catch (error) {
       console.error(`[API:PUT /api/config/settings] Failed to save settings:`, error);
@@ -7166,7 +7762,12 @@ async function main(options = {}) {
     getProviderSources,
     removeProviderConfig,
     AGENT_SCOPE,
-    COMMAND_SCOPE
+    COMMAND_SCOPE,
+    listMcpConfigs,
+    getMcpConfig,
+    createMcpConfig,
+    updateMcpConfig,
+    deleteMcpConfig,
   } = await import('./lib/opencode/index.js');
 
   app.get('/api/config/agents/:name', async (req, res) => {
@@ -7291,6 +7892,116 @@ async function main(options = {}) {
     } catch (error) {
       console.error('Failed to delete agent:', error);
       res.status(500).json({ error: error.message || 'Failed to delete agent' });
+    }
+  });
+
+  // ============================================================
+  // MCP Config Routes
+  // ============================================================
+
+  app.get('/api/config/mcp', async (req, res) => {
+    try {
+      const { directory, error } = await resolveOptionalProjectDirectory(req);
+      if (error) {
+        return res.status(400).json({ error });
+      }
+      const configs = listMcpConfigs(directory);
+      res.json(configs);
+    } catch (error) {
+      console.error('[API:GET /api/config/mcp] Failed:', error);
+      res.status(500).json({ error: error.message || 'Failed to list MCP configs' });
+    }
+  });
+
+  app.get('/api/config/mcp/:name', async (req, res) => {
+    try {
+      const name = req.params.name;
+      const { directory, error } = await resolveOptionalProjectDirectory(req);
+      if (error) {
+        return res.status(400).json({ error });
+      }
+      const config = getMcpConfig(name, directory);
+      if (!config) {
+        return res.status(404).json({ error: `MCP server "${name}" not found` });
+      }
+      res.json(config);
+    } catch (error) {
+      console.error('[API:GET /api/config/mcp/:name] Failed:', error);
+      res.status(500).json({ error: error.message || 'Failed to get MCP config' });
+    }
+  });
+
+  app.post('/api/config/mcp/:name', async (req, res) => {
+    try {
+      const name = req.params.name;
+      const { scope, ...config } = req.body || {};
+      const { directory, error } = await resolveOptionalProjectDirectory(req);
+      if (error) {
+        return res.status(400).json({ error });
+      }
+      console.log(`[API:POST /api/config/mcp] Creating MCP server: ${name}`);
+
+      createMcpConfig(name, config, directory, scope);
+      await refreshOpenCodeAfterConfigChange('mcp creation', { mcpName: name });
+
+      res.json({
+        success: true,
+        requiresReload: true,
+        message: `MCP server "${name}" created. Reloading interface…`,
+        reloadDelayMs: CLIENT_RELOAD_DELAY_MS,
+      });
+    } catch (error) {
+      console.error('[API:POST /api/config/mcp/:name] Failed:', error);
+      res.status(500).json({ error: error.message || 'Failed to create MCP server' });
+    }
+  });
+
+  app.patch('/api/config/mcp/:name', async (req, res) => {
+    try {
+      const name = req.params.name;
+      const updates = req.body;
+      const { directory, error } = await resolveOptionalProjectDirectory(req);
+      if (error) {
+        return res.status(400).json({ error });
+      }
+      console.log(`[API:PATCH /api/config/mcp] Updating MCP server: ${name}`);
+
+      updateMcpConfig(name, updates, directory);
+      await refreshOpenCodeAfterConfigChange('mcp update');
+
+      res.json({
+        success: true,
+        requiresReload: true,
+        message: `MCP server "${name}" updated. Reloading interface…`,
+        reloadDelayMs: CLIENT_RELOAD_DELAY_MS,
+      });
+    } catch (error) {
+      console.error('[API:PATCH /api/config/mcp/:name] Failed:', error);
+      res.status(500).json({ error: error.message || 'Failed to update MCP server' });
+    }
+  });
+
+  app.delete('/api/config/mcp/:name', async (req, res) => {
+    try {
+      const name = req.params.name;
+      const { directory, error } = await resolveOptionalProjectDirectory(req);
+      if (error) {
+        return res.status(400).json({ error });
+      }
+      console.log(`[API:DELETE /api/config/mcp] Deleting MCP server: ${name}`);
+
+      deleteMcpConfig(name, directory);
+      await refreshOpenCodeAfterConfigChange('mcp deletion');
+
+      res.json({
+        success: true,
+        requiresReload: true,
+        message: `MCP server "${name}" deleted. Reloading interface…`,
+        reloadDelayMs: CLIENT_RELOAD_DELAY_MS,
+      });
+    } catch (error) {
+      console.error('[API:DELETE /api/config/mcp/:name] Failed:', error);
+      res.status(500).json({ error: error.message || 'Failed to delete MCP server' });
     }
   });
 
@@ -10712,17 +11423,26 @@ Context:
     }
 
     try {
-      const resolvedPath = path.resolve(normalizeDirectoryPath(filePath));
-      if (resolvedPath.includes('..')) {
-        return res.status(400).json({ error: 'Invalid path: path traversal not allowed' });
+      const resolved = await resolveWorkspacePathFromContext(req, filePath);
+      if (!resolved.ok) {
+        return res.status(400).json({ error: resolved.error });
       }
 
-      const stats = await fsPromises.stat(resolvedPath);
+      const [canonicalPath, canonicalBase] = await Promise.all([
+        fsPromises.realpath(resolved.resolved),
+        fsPromises.realpath(resolved.base).catch(() => path.resolve(resolved.base)),
+      ]);
+
+      if (!isPathWithinRoot(canonicalPath, canonicalBase)) {
+        return res.status(403).json({ error: 'Access to file denied' });
+      }
+
+      const stats = await fsPromises.stat(canonicalPath);
       if (!stats.isFile()) {
         return res.status(400).json({ error: 'Specified path is not a file' });
       }
 
-      const content = await fsPromises.readFile(resolvedPath, 'utf8');
+      const content = await fsPromises.readFile(canonicalPath, 'utf8');
       res.type('text/plain').send(content);
     } catch (error) {
       const err = error;
@@ -10745,17 +11465,26 @@ Context:
     }
 
     try {
-      const resolvedPath = path.resolve(normalizeDirectoryPath(filePath));
-      if (resolvedPath.includes('..')) {
-        return res.status(400).json({ error: 'Invalid path: path traversal not allowed' });
+      const resolved = await resolveWorkspacePathFromContext(req, filePath);
+      if (!resolved.ok) {
+        return res.status(400).json({ error: resolved.error });
       }
 
-      const stats = await fsPromises.stat(resolvedPath);
+      const [canonicalPath, canonicalBase] = await Promise.all([
+        fsPromises.realpath(resolved.resolved),
+        fsPromises.realpath(resolved.base).catch(() => path.resolve(resolved.base)),
+      ]);
+
+      if (!isPathWithinRoot(canonicalPath, canonicalBase)) {
+        return res.status(403).json({ error: 'Access to file denied' });
+      }
+
+      const stats = await fsPromises.stat(canonicalPath);
       if (!stats.isFile()) {
         return res.status(400).json({ error: 'Specified path is not a file' });
       }
 
-      const ext = path.extname(resolvedPath).toLowerCase();
+      const ext = path.extname(canonicalPath).toLowerCase();
       const mimeMap = {
         '.png': 'image/png',
         '.jpg': 'image/jpeg',
@@ -10769,7 +11498,7 @@ Context:
       };
       const mimeType = mimeMap[ext] || 'application/octet-stream';
 
-      const content = await fsPromises.readFile(resolvedPath);
+      const content = await fsPromises.readFile(canonicalPath);
       res.setHeader('Cache-Control', 'no-store');
       res.type(mimeType).send(content);
     } catch (error) {
@@ -10881,6 +11610,49 @@ Context:
       }
       console.error('Failed to rename path:', error);
       res.status(500).json({ error: (error && error.message) || 'Failed to rename path' });
+    }
+  });
+
+  // Reveal a file or folder in the system file manager (Finder on macOS, Explorer on Windows, etc.)
+  app.post('/api/fs/reveal', async (req, res) => {
+    const { path: targetPath } = req.body || {};
+    if (!targetPath || typeof targetPath !== 'string') {
+      return res.status(400).json({ error: 'Path is required' });
+    }
+
+    try {
+      const resolved = path.resolve(targetPath.trim());
+
+      // Verify path exists
+      await fsPromises.access(resolved);
+
+      const platform = process.platform;
+      if (platform === 'darwin') {
+        // macOS: open -R selects the file in Finder; open opens a folder
+        const stat = await fsPromises.stat(resolved);
+        if (stat.isDirectory()) {
+          spawn('open', [resolved], { stdio: 'ignore', detached: true }).unref();
+        } else {
+          spawn('open', ['-R', resolved], { stdio: 'ignore', detached: true }).unref();
+        }
+      } else if (platform === 'win32') {
+        // Windows: explorer /select, highlights the file
+        spawn('explorer', ['/select,', resolved], { stdio: 'ignore', detached: true }).unref();
+      } else {
+        // Linux: xdg-open opens the parent directory
+        const stat = await fsPromises.stat(resolved);
+        const dir = stat.isDirectory() ? resolved : path.dirname(resolved);
+        spawn('xdg-open', [dir], { stdio: 'ignore', detached: true }).unref();
+      }
+
+      res.json({ success: true, path: resolved });
+    } catch (error) {
+      const err = error;
+      if (err && typeof err === 'object' && err.code === 'ENOENT') {
+        return res.status(404).json({ error: 'Path not found' });
+      }
+      console.error('Failed to reveal path:', error);
+      res.status(500).json({ error: (error && error.message) || 'Failed to reveal path' });
     }
   });
 
@@ -11880,64 +12652,126 @@ Context:
     res.json({ success: true, killedCount });
   });
 
+  // Detect Claude Code CLI availability (runs before backend init)
+  detectClaudeCodeCli();
+
+  // Read persisted permission mode; fall back to env var, then default
+  let claudeCodePermissionMode = ENV_CLAUDECODE_PERMISSION_MODE;
   try {
-    syncFromHmrState();
-    if (await isOpenCodeProcessHealthy()) {
-      console.log(`[HMR] Reusing existing OpenCode process on port ${openCodePort}`);
-    } else if (ENV_SKIP_OPENCODE_START && ENV_CONFIGURED_OPENCODE_PORT) {
-      console.log(`Using external OpenCode server on port ${ENV_CONFIGURED_OPENCODE_PORT} (skip-start mode)`);
-      setOpenCodePort(ENV_CONFIGURED_OPENCODE_PORT);
+    const startupSettings = await readSettingsFromDisk();
+    if (typeof startupSettings.claudeCodePermissionMode === 'string') {
+      const mode = startupSettings.claudeCodePermissionMode.trim();
+      if (mode === 'default' || mode === 'acceptEdits' || mode === 'bypassPermissions') {
+        claudeCodePermissionMode = mode;
+      }
+    }
+  } catch {
+    // non-fatal, use env var default
+  }
+
+  if (ENV_BACKEND === 'claudecode') {
+    try {
+      const binary = resolvedClaudeBinary || ENV_CLAUDECODE_BINARY;
+      console.log(`[openchamber] Starting with Claude Code backend (binary: ${binary})`);
+      const { startClaudeCodeAdapter } = await import('./lib/claudecode/adapter.js');
+      claudeCodeAdapterInstance = await startClaudeCodeAdapter({
+        port: 0,
+        claudeBinary: binary,
+        cwd: process.cwd(),
+        permissionMode: claudeCodePermissionMode,
+      });
+      console.log(`[openchamber] Claude Code adapter listening on port ${claudeCodeAdapterInstance.port}`);
+      setOpenCodePort(claudeCodeAdapterInstance.port);
+      claudeCodeAdapterPort = claudeCodeAdapterInstance.port;
       isOpenCodeReady = true;
-      isExternalOpenCode = true;
+      isExternalOpenCode = false;
       lastOpenCodeError = null;
       openCodeNotReadySince = 0;
-      syncToHmrState();
-    } else if (ENV_CONFIGURED_OPENCODE_PORT && await probeExternalOpenCode(ENV_CONFIGURED_OPENCODE_PORT)) {
-      console.log(`Auto-detected existing OpenCode server on port ${ENV_CONFIGURED_OPENCODE_PORT}`);
-      setOpenCodePort(ENV_CONFIGURED_OPENCODE_PORT);
-      isOpenCodeReady = true;
-      isExternalOpenCode = true;
-      lastOpenCodeError = null;
-      openCodeNotReadySince = 0;
-      syncToHmrState();
-    } else if (!ENV_CONFIGURED_OPENCODE_PORT && await probeExternalOpenCode(4096)) {
-      console.log('Auto-detected existing OpenCode server on default port 4096');
-      setOpenCodePort(4096);
-      isOpenCodeReady = true;
-      isExternalOpenCode = true;
-      lastOpenCodeError = null;
-      openCodeNotReadySince = 0;
-      syncToHmrState();
-    } else {
-      if (ENV_CONFIGURED_OPENCODE_PORT) {
-        console.log(`Using OpenCode port from environment: ${ENV_CONFIGURED_OPENCODE_PORT}`);
+      setupProxy(app);
+    } catch (error) {
+      console.error(`Failed to start Claude Code adapter: ${error.message}`);
+      console.log('Continuing without Claude Code integration...');
+      lastOpenCodeError = error.message;
+      setupProxy(app);
+    }
+  } else {
+    try {
+      syncFromHmrState();
+      if (await isOpenCodeProcessHealthy()) {
+        console.log(`[HMR] Reusing existing OpenCode process on port ${openCodePort}`);
+      } else if (ENV_SKIP_OPENCODE_START && ENV_CONFIGURED_OPENCODE_PORT) {
+        console.log(`Using external OpenCode server on port ${ENV_CONFIGURED_OPENCODE_PORT} (skip-start mode)`);
         setOpenCodePort(ENV_CONFIGURED_OPENCODE_PORT);
+        isOpenCodeReady = true;
+        isExternalOpenCode = true;
+        lastOpenCodeError = null;
+        openCodeNotReadySince = 0;
+        syncToHmrState();
+      } else if (ENV_CONFIGURED_OPENCODE_PORT && await probeExternalOpenCode(ENV_CONFIGURED_OPENCODE_PORT)) {
+        console.log(`Auto-detected existing OpenCode server on port ${ENV_CONFIGURED_OPENCODE_PORT}`);
+        setOpenCodePort(ENV_CONFIGURED_OPENCODE_PORT);
+        isOpenCodeReady = true;
+        isExternalOpenCode = true;
+        lastOpenCodeError = null;
+        openCodeNotReadySince = 0;
+        syncToHmrState();
+      } else if (!ENV_CONFIGURED_OPENCODE_PORT && await probeExternalOpenCode(4096)) {
+        console.log('Auto-detected existing OpenCode server on default port 4096');
+        setOpenCodePort(4096);
+        isOpenCodeReady = true;
+        isExternalOpenCode = true;
+        lastOpenCodeError = null;
+        openCodeNotReadySince = 0;
+        syncToHmrState();
       } else {
-        openCodePort = null;
+        if (ENV_CONFIGURED_OPENCODE_PORT) {
+          console.log(`Using OpenCode port from environment: ${ENV_CONFIGURED_OPENCODE_PORT}`);
+          setOpenCodePort(ENV_CONFIGURED_OPENCODE_PORT);
+        } else {
+          openCodePort = null;
+          syncToHmrState();
+        }
+
+        lastOpenCodeError = null;
+        openCodeProcess = await startOpenCode();
         syncToHmrState();
       }
+      await waitForOpenCodePort();
+      try {
+        await waitForOpenCodeReady();
+      } catch (error) {
+        console.error(`OpenCode readiness check failed: ${error.message}`);
+        scheduleOpenCodeApiDetection();
+      }
+      setupProxy(app);
+      scheduleOpenCodeApiDetection();
+      startHealthMonitoring();
+      void startGlobalEventWatcher();
 
-      lastOpenCodeError = null;
-      openCodeProcess = await startOpenCode();
-      syncToHmrState();
-    }
-    await waitForOpenCodePort();
-    try {
-      await waitForOpenCodeReady();
+      // Start Claude Code adapter in hybrid mode if CLI was detected
+      if (resolvedClaudeBinary) {
+        try {
+          const { startClaudeCodeAdapter } = await import('./lib/claudecode/adapter.js');
+          claudeCodeAdapterInstance = await startClaudeCodeAdapter({
+            port: 0,
+            claudeBinary: resolvedClaudeBinary,
+            cwd: process.cwd(),
+            permissionMode: claudeCodePermissionMode,
+          });
+          claudeCodeAdapterPort = claudeCodeAdapterInstance.port;
+          console.log(`[openchamber] Claude Code adapter (hybrid) listening on port ${claudeCodeAdapterPort}`);
+        } catch (adapterError) {
+          console.warn(`[openchamber] Failed to start Claude Code adapter: ${adapterError.message}`);
+          claudeCodeAdapterPort = null;
+        }
+      }
     } catch (error) {
-      console.error(`OpenCode readiness check failed: ${error.message}`);
+      console.error(`Failed to start OpenCode: ${error.message}`);
+      console.log('Continuing without OpenCode integration...');
+      lastOpenCodeError = error.message;
+      setupProxy(app);
       scheduleOpenCodeApiDetection();
     }
-    setupProxy(app);
-    scheduleOpenCodeApiDetection();
-    startHealthMonitoring();
-    void startGlobalEventWatcher();
-  } catch (error) {
-    console.error(`Failed to start OpenCode: ${error.message}`);
-    console.log('Continuing without OpenCode integration...');
-    lastOpenCodeError = error.message;
-    setupProxy(app);
-    scheduleOpenCodeApiDetection();
   }
 
   const distPath = (() => {

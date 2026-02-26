@@ -5861,6 +5861,51 @@ function setupProxy(app) {
     }
   });
 
+  // Route POST /api/session/:id/prompt_async to Claude Code adapter when providerID is 'claudecode'
+  app.post('/api/session/:id/prompt_async', express.raw({ type: 'application/json', limit: '10mb' }), async (req, res, next) => {
+    // Parse the raw body to inspect providerID without consuming the stream
+    // (express.raw gives us a Buffer, which we can re-attach for the proxy if needed)
+    const rawBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(typeof req.body === 'string' ? req.body : '');
+    let body;
+    try {
+      body = rawBuffer.length > 0 ? JSON.parse(rawBuffer.toString('utf8')) : {};
+    } catch {
+      // If JSON parsing fails, let the proxy deal with it
+      return next();
+    }
+
+    const providerID = body.model?.providerID;
+
+    if (providerID !== 'claudecode' || claudeCodeAdapterPort == null) {
+      // Not a Claude Code request or adapter not running — fall through to OpenCode proxy
+      return next();
+    }
+
+    const sessionId = req.params.id;
+    const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/session/${encodeURIComponent(sessionId)}/prompt_async`;
+
+    try {
+      const upstreamResponse = await fetch(adapterUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: rawBuffer,
+        signal: AbortSignal.timeout(LONG_REQUEST_TIMEOUT_MS),
+      });
+
+      const responseBody = await upstreamResponse.text();
+      const contentType = upstreamResponse.headers.get('content-type') || 'application/json';
+      res.setHeader('content-type', contentType);
+      res.status(upstreamResponse.status).send(responseBody);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'Claude Code adapter request timed out' : 'Claude Code adapter unavailable',
+        });
+      }
+    }
+  });
+
   app.use('/api', proxyMiddleware);
 }
 

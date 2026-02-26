@@ -348,6 +348,45 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         }
     }, [isMobile]);
 
+    // When the user touches the input container area (padding, borders, footer dead space)
+    // but not directly on the textarea or a button, focus the textarea aggressively.
+    const handleContainerPointerDown = React.useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+        if (!isMobile || event.pointerType !== 'touch') {
+            return;
+        }
+
+        const textarea = textareaRef.current;
+        if (!textarea) {
+            return;
+        }
+
+        // Don't steal focus from buttons or other interactive elements
+        const target = event.target as HTMLElement;
+        if (target.closest('button, a, [role="button"], select, input')) {
+            return;
+        }
+
+        // If already focused, let normal touch behavior happen
+        if (document.activeElement === textarea) {
+            return;
+        }
+
+        event.preventDefault();
+
+        try {
+            textarea.focus({ preventScroll: true });
+        } catch {
+            textarea.focus();
+        }
+
+        const len = textarea.value.length;
+        try {
+            textarea.setSelectionRange(len, len);
+        } catch {
+            // ignored
+        }
+    }, [isMobile]);
+
     const handleOpenMobileControls = React.useCallback(() => {
         if (!isMobile) {
             return;
@@ -1465,9 +1504,17 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
     };
 
     React.useEffect(() => {
-
-        if (currentSessionId && textareaRef.current && !isMobile) {
-            textareaRef.current.focus();
+        if (currentSessionId && textareaRef.current) {
+            if (isMobile) {
+                // On touch screens, use preventScroll to avoid iOS viewport jump
+                try {
+                    textareaRef.current.focus({ preventScroll: true });
+                } catch {
+                    textareaRef.current.focus();
+                }
+            } else {
+                textareaRef.current.focus();
+            }
         }
     }, [currentSessionId, isMobile]);
 
@@ -2122,6 +2169,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                         backgroundColor: currentTheme?.colors?.surface?.subtle,
                     }}
                     ref={dropZoneRef}
+                    onPointerDown={handleContainerPointerDown}
                     onDragEnter={handleDragEnter}
                     onDragOver={handleDragOver}
                     onDragLeave={handleDragLeave}

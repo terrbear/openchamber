@@ -5790,6 +5790,77 @@ function setupProxy(app) {
     }
   });
 
+  // Intercept GET /config/providers to inject Claude Code provider when adapter is running
+  app.get('/api/config/providers', async (req, res) => {
+    try {
+      const queryString = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
+      const upstreamUrl = buildOpenCodeUrl(`/config/providers${queryString}`, '');
+      const authHeaders = getOpenCodeAuthHeaders();
+
+      const upstreamResponse = await fetch(upstreamUrl, {
+        method: 'GET',
+        headers: {
+          accept: 'application/json',
+          ...(authHeaders.Authorization ? { Authorization: authHeaders.Authorization } : {}),
+        },
+        signal: AbortSignal.timeout(10000),
+      });
+
+      const contentType = upstreamResponse.headers.get('content-type') || 'application/json';
+      if (!upstreamResponse.ok) {
+        const body = await upstreamResponse.text().catch(() => '');
+        res.setHeader('content-type', contentType);
+        return res.status(upstreamResponse.status).send(body);
+      }
+
+      const data = await upstreamResponse.json();
+
+      if (claudeCodeAdapterPort != null) {
+        const providers = Array.isArray(data.providers) ? data.providers : [];
+        providers.push({
+          id: 'claudecode',
+          name: 'Claude Code',
+          source: 'custom',
+          env: [],
+          options: {},
+          models: {
+            default: {
+              id: 'default',
+              providerID: 'claudecode',
+              api: { id: 'claudecode', url: '', npm: '' },
+              name: 'Default (Claude Code manages model selection)',
+              capabilities: {
+                temperature: false,
+                reasoning: false,
+                attachment: true,
+                toolcall: true,
+                input: { text: true, audio: false, image: true, video: false, pdf: true },
+                output: { text: true, audio: false, image: false, video: false, pdf: false },
+                interleaved: false,
+              },
+              cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+              limit: { context: 200000, output: 16384 },
+              status: 'active',
+              options: {},
+              headers: {},
+              release_date: '2025-01-01',
+            },
+          },
+        });
+        data.providers = providers;
+      }
+
+      res.json(data);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'Provider list fetch timed out' : 'Provider list fetch failed',
+        });
+      }
+    }
+  });
+
   app.use('/api', proxyMiddleware);
 }
 
@@ -6005,7 +6076,7 @@ async function main(options = {}) {
       nodeBinaryResolved: resolvedNodeBinary || null,
       bunBinaryResolved: resolvedBunBinary || null,
       claudeCodeAvailable: claudeCodeAdapterPort != null,
-      claudeCodeAdapterPort: claudeCodeAdapterPort || null,
+      claudeCodeAdapterPort: claudeCodeAdapterPort,
     });
   });
 
@@ -12186,6 +12257,7 @@ Context:
       });
       console.log(`[openchamber] Claude Code adapter listening on port ${claudeCodeAdapterInstance.port}`);
       setOpenCodePort(claudeCodeAdapterInstance.port);
+      claudeCodeAdapterPort = claudeCodeAdapterInstance.port;
       isOpenCodeReady = true;
       isExternalOpenCode = false;
       lastOpenCodeError = null;

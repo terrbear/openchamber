@@ -136,3 +136,15 @@
   - The adapter's prompt_async must auto-create sessions for hybrid mode since the server forwards OpenCode session IDs that the adapter hasn't seen
   - The `close` event handler cleanup (pending questions) must happen inside `runClaude` for each attempt, not just once at the end
 ---
+
+## 2026-02-26 - US-008
+- Added Claude Code provider logo (terminal/CLI-themed SVG icon)
+- Files changed: packages/ui/src/assets/provider-logos/claudecode.svg (new file)
+- The SVG is a terminal window icon with a `>` chevron prompt and `_` cursor, visually distinct from the Anthropic sparkle logo
+- No code changes needed: the useProviderLogo.ts hook auto-discovers local SVGs via import.meta.glob matching the provider ID
+- **Learnings for future iterations:**
+  - Adding a new provider logo only requires dropping a .svg file in packages/ui/src/assets/provider-logos/ with the filename matching the provider ID
+  - The useProviderLogo hook uses import.meta.glob for eager loading -- no index file or manual registration needed
+  - SVGs should use fill="#000000" since ProviderLogo.tsx applies dark:invert for dark mode support
+  - The viewBox="0 0 24 24" format works well at small sizes (h-3.5 w-3.5 and h-4 w-4)
+---

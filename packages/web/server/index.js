@@ -5861,28 +5861,63 @@ function setupProxy(app) {
     }
   });
 
-  // Route POST /api/session/:id/prompt_async to Claude Code adapter when providerID is 'claudecode'
-  app.post('/api/session/:id/prompt_async', express.raw({ type: 'application/json', limit: '10mb' }), async (req, res, next) => {
-    // Parse the raw body to inspect providerID without consuming the stream
-    // (express.raw gives us a Buffer, which we can re-attach for the proxy if needed)
+  // Route POST /api/session/:id/prompt_async to Claude Code adapter when providerID is 'claudecode',
+  // otherwise forward to OpenCode directly (we cannot call next() because express.raw() consumes the body stream).
+  app.post('/api/session/:id/prompt_async', express.raw({ type: '*/*', limit: '10mb' }), async (req, res) => {
     const rawBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(typeof req.body === 'string' ? req.body : '');
     let body;
     try {
       body = rawBuffer.length > 0 ? JSON.parse(rawBuffer.toString('utf8')) : {};
     } catch {
-      // If JSON parsing fails, let the proxy deal with it
-      return next();
+      // JSON parsing failed — forward raw payload to OpenCode and let it handle the error
+      body = {};
     }
 
     const providerID = body.model?.providerID;
+    const sessionId = req.params.id;
 
     if (providerID !== 'claudecode' || claudeCodeAdapterPort == null) {
-      // Not a Claude Code request or adapter not running — fall through to OpenCode proxy
-      return next();
+      // Not a Claude Code request or adapter not running — forward to OpenCode directly
+      // (we cannot use next() because express.raw() already consumed the body stream)
+      try {
+        const upstreamPath = req.originalUrl.replace(/^\/api/, '');
+        const targetUrl = buildOpenCodeUrl(upstreamPath, '');
+        const authHeaders = getOpenCodeAuthHeaders();
+
+        const headers = {
+          ...(typeof req.headers['content-type'] === 'string' ? { 'content-type': req.headers['content-type'] } : { 'content-type': 'application/json' }),
+          ...(typeof req.headers.accept === 'string' ? { accept: req.headers.accept } : {}),
+          ...(authHeaders.Authorization ? { Authorization: authHeaders.Authorization } : {}),
+        };
+
+        const upstreamResponse = await fetch(targetUrl, {
+          method: 'POST',
+          headers,
+          body: rawBuffer,
+          signal: AbortSignal.timeout(LONG_REQUEST_TIMEOUT_MS),
+        });
+
+        const upstreamBody = Buffer.from(await upstreamResponse.arrayBuffer());
+
+        if (upstreamResponse.headers.has('content-type')) {
+          res.setHeader('content-type', upstreamResponse.headers.get('content-type'));
+        }
+
+        res.status(upstreamResponse.status).send(upstreamBody);
+      } catch (error) {
+        if (!res.headersSent) {
+          const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+          res.status(isTimeout ? 504 : 503).json({
+            error: isTimeout ? 'OpenCode prompt_async forward timed out' : 'OpenCode prompt_async forward failed',
+          });
+        }
+      }
+      return;
     }
 
-    const sessionId = req.params.id;
+    // Forward to Claude Code adapter
     const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/session/${encodeURIComponent(sessionId)}/prompt_async`;
+    console.log(`[ClaudeCode] Forwarding prompt_async for session ${sessionId} to adapter at port ${claudeCodeAdapterPort}`);
 
     try {
       const upstreamResponse = await fetch(adapterUrl, {

@@ -2911,6 +2911,7 @@ let uiAuthController = null;
 let cloudflareTunnelController = null;
 let terminalInputWsServer = null;
 let claudeCodeAdapterInstance = null;
+let claudeCodeAdapterPort = null;
 const userProvidedOpenCodePassword =
   typeof hmrState.userProvidedOpenCodePassword === 'string' && hmrState.userProvidedOpenCodePassword.length > 0
     ? hmrState.userProvidedOpenCodePassword
@@ -3343,9 +3344,8 @@ function resolveClaudeCodeCliPath() {
 }
 
 /**
- * Detect the Claude Code CLI binary asynchronously.
- * Stores the result in resolvedClaudeBinary for use by other middleware.
- * Does not block server startup.
+ * Detect the Claude Code CLI binary synchronously.
+ * Stores the result in resolvedClaudeBinary for use by the adapter and middleware.
  */
 function detectClaudeCodeCli() {
   try {
@@ -5854,6 +5854,7 @@ async function gracefulShutdown(options = {}) {
       console.warn('Error stopping Claude Code adapter:', error);
     }
     claudeCodeAdapterInstance = null;
+    claudeCodeAdapterPort = null;
   }
 
   // Only stop OpenCode if we started it ourselves (not when using external server)
@@ -6003,6 +6004,8 @@ async function main(options = {}) {
       opencodeShimInterpreter: resolvedOpencodeBinary ? opencodeShimInterpreter(resolvedOpencodeBinary) : null,
       nodeBinaryResolved: resolvedNodeBinary || null,
       bunBinaryResolved: resolvedBunBinary || null,
+      claudeCodeAvailable: claudeCodeAdapterPort != null,
+      claudeCodeAdapterPort: claudeCodeAdapterPort || null,
     });
   });
 
@@ -12167,16 +12170,17 @@ Context:
     res.json({ success: true, killedCount });
   });
 
-  // Detect Claude Code CLI availability (non-blocking, runs before backend init)
+  // Detect Claude Code CLI availability (runs before backend init)
   detectClaudeCodeCli();
 
   if (ENV_BACKEND === 'claudecode') {
     try {
-      console.log(`[openchamber] Starting with Claude Code backend (binary: ${ENV_CLAUDECODE_BINARY})`);
+      const binary = resolvedClaudeBinary || ENV_CLAUDECODE_BINARY;
+      console.log(`[openchamber] Starting with Claude Code backend (binary: ${binary})`);
       const { startClaudeCodeAdapter } = await import('./lib/claudecode/adapter.js');
       claudeCodeAdapterInstance = await startClaudeCodeAdapter({
         port: 0,
-        claudeBinary: ENV_CLAUDECODE_BINARY,
+        claudeBinary: binary,
         cwd: process.cwd(),
         permissionMode: ENV_CLAUDECODE_PERMISSION_MODE,
       });
@@ -12246,6 +12250,24 @@ Context:
       scheduleOpenCodeApiDetection();
       startHealthMonitoring();
       void startGlobalEventWatcher();
+
+      // Start Claude Code adapter in hybrid mode if CLI was detected
+      if (resolvedClaudeBinary) {
+        try {
+          const { startClaudeCodeAdapter } = await import('./lib/claudecode/adapter.js');
+          claudeCodeAdapterInstance = await startClaudeCodeAdapter({
+            port: 0,
+            claudeBinary: resolvedClaudeBinary,
+            cwd: process.cwd(),
+            permissionMode: ENV_CLAUDECODE_PERMISSION_MODE,
+          });
+          claudeCodeAdapterPort = claudeCodeAdapterInstance.port;
+          console.log(`[openchamber] Claude Code adapter (hybrid) listening on port ${claudeCodeAdapterPort}`);
+        } catch (adapterError) {
+          console.warn(`[openchamber] Failed to start Claude Code adapter: ${adapterError.message}`);
+          claudeCodeAdapterPort = null;
+        }
+      }
     } catch (error) {
       console.error(`Failed to start OpenCode: ${error.message}`);
       console.log('Continuing without OpenCode integration...');

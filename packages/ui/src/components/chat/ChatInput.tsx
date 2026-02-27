@@ -633,6 +633,14 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
 
     // Primary action for send button - respects queue mode setting
     const handlePrimaryAction = React.useCallback(() => {
+        const sessionIsBusy = currentSessionId && sessionPhase !== 'idle';
+        // Never send directly while session is busy — always queue so auto-send fires when idle
+        if (sessionIsBusy) {
+            if (hasContent) {
+                handleQueueMessage();
+            }
+            return;
+        }
         const canQueue = hasContent && currentSessionId && sessionPhase !== 'idle';
         if (queueModeEnabled && canQueue) {
             handleQueueMessage();
@@ -770,7 +778,16 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             // Normal mode: Enter sends, Ctrl+Enter queues
             // Note: Queueing only works when there's an existing session (currentSessionId)
             // For new sessions (draft), always send immediately
+            const sessionIsBusy = currentSessionId && sessionPhase !== 'idle';
             const canQueue = hasContent && currentSessionId && sessionPhase !== 'idle';
+
+            // Never send directly while session is busy — always queue so auto-send fires when idle
+            if (sessionIsBusy) {
+                if (hasContent) {
+                    handleQueueMessage();
+                }
+                return;
+            }
 
             if (queueModeEnabled) {
                 if (isCtrlEnter || !canQueue) {

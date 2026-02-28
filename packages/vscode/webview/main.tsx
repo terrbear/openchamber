@@ -797,6 +797,63 @@ onCommand('addToContext', (payload) => {
   });
 });
 
+// Queue for messages that arrive while the current session is busy.
+// Each entry holds everything needed to send the message once the session goes idle.
+type QueuedPrompt = {
+  prompt: string;
+  providerId: string;
+  modelId: string;
+  agentName: string | undefined;
+};
+let pendingPromptQueue: QueuedPrompt[] = [];
+let promptQueueUnsubscribe: (() => void) | null = null;
+
+const isCurrentSessionBusy = (sessionStore: { currentSessionId: string | null; sessionStatus?: Map<string, { type: string }> }): boolean => {
+  const { currentSessionId, sessionStatus } = sessionStore;
+  if (!currentSessionId || !sessionStatus) return false;
+  const status = sessionStatus.get(currentSessionId);
+  return status?.type === 'busy' || status?.type === 'retry';
+};
+
+const flushPromptQueue = async (
+  sessionStore: { openNewSessionDraft: () => void; sendMessage: (content: string, providerID: string, modelID: string, agent?: string, attachments?: undefined, agentMentionName?: undefined, additionalParts?: undefined) => Promise<void>; setPendingInputText: (t: string) => void },
+): Promise<void> => {
+  if (pendingPromptQueue.length === 0) return;
+
+  const next = pendingPromptQueue.shift()!;
+  sessionStore.openNewSessionDraft();
+  try {
+    await sessionStore.sendMessage(
+      next.prompt, next.providerId, next.modelId,
+      next.agentName, undefined, undefined, undefined,
+    );
+  } catch (error: unknown) {
+    console.error('[OpenChamber] Failed to send queued prompt:', error);
+  }
+};
+
+const schedulePromptQueueFlush = (
+  useSessionStore: { getState: () => { currentSessionId: string | null; sessionStatus?: Map<string, { type: string }>; openNewSessionDraft: () => void; sendMessage: (content: string, providerID: string, modelID: string, agent?: string, attachments?: undefined, agentMentionName?: undefined, additionalParts?: undefined) => Promise<void>; setPendingInputText: (t: string) => void }; subscribe: (listener: () => void) => () => void },
+): void => {
+  // Already watching.
+  if (promptQueueUnsubscribe) return;
+
+  const unsubscribe = useSessionStore.subscribe(() => {
+    const store = useSessionStore.getState();
+    if (pendingPromptQueue.length === 0) {
+      // Nothing left — stop watching.
+      unsubscribe();
+      promptQueueUnsubscribe = null;
+      return;
+    }
+    if (!isCurrentSessionBusy(store)) {
+      void flushPromptQueue(store);
+    }
+  });
+
+  promptQueueUnsubscribe = unsubscribe;
+};
+
 // Listen for createSessionWithPrompt command from extension (Explain, Improve Code)
 onCommand('createSessionWithPrompt', (payload) => {
   const { prompt } = payload as { prompt: string };
@@ -807,30 +864,37 @@ onCommand('createSessionWithPrompt', (payload) => {
   ]).then(([{ useSessionStore }, { useConfigStore }]) => {
     const sessionStore = useSessionStore.getState();
     const configStore = useConfigStore.getState();
-    
-    // Open a new session draft first
-    sessionStore.openNewSessionDraft();
-    
+
     // Get current provider/model/agent configuration
     const { currentProviderId, currentModelId, currentAgentName } = configStore;
-    
-    if (currentProviderId && currentModelId) {
-      // Send the message - this will create the session from the draft and send
-      sessionStore.sendMessage(
-        prompt,
-        currentProviderId,
-        currentModelId,
-        currentAgentName ?? undefined,
-        undefined, // attachments
-        undefined, // agentMentionName
-        undefined  // additionalParts
-      ).catch((error: unknown) => {
-        console.error('[OpenChamber] Failed to send prompt:', error);
-      });
-    } else {
+
+    if (!currentProviderId || !currentModelId) {
       // If no provider/model configured, just set the text and let user send manually
       sessionStore.setPendingInputText(prompt);
+      return;
     }
+
+    // If the current session is busy, queue the message and wait for idle.
+    if (isCurrentSessionBusy(sessionStore)) {
+      console.log('[OpenChamber] Session busy — queuing prompt until idle');
+      pendingPromptQueue.push({ prompt, providerId: currentProviderId, modelId: currentModelId, agentName: currentAgentName ?? undefined });
+      schedulePromptQueueFlush(useSessionStore);
+      return;
+    }
+
+    // Open a new session draft and send immediately.
+    sessionStore.openNewSessionDraft();
+    sessionStore.sendMessage(
+      prompt,
+      currentProviderId,
+      currentModelId,
+      currentAgentName ?? undefined,
+      undefined, // attachments
+      undefined, // agentMentionName
+      undefined  // additionalParts
+    ).catch((error: unknown) => {
+      console.error('[OpenChamber] Failed to send prompt:', error);
+    });
   });
 });
 

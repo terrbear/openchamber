@@ -6602,6 +6602,28 @@ function setupProxy(app) {
   });
 
 
+  const hopByHopRequestHeaders = new Set([
+    'host',
+    'connection',
+    'content-length',
+    'transfer-encoding',
+    'keep-alive',
+    'te',
+    'trailer',
+    'upgrade',
+  ]);
+
+  const hopByHopResponseHeaders = new Set([
+    'connection',
+    'content-length',
+    'transfer-encoding',
+    'keep-alive',
+    'te',
+    'trailer',
+    'upgrade',
+    'www-authenticate',
+  ]);
+
   const collectForwardHeaders = (req) => {
     const authHeaders = getOpenCodeAuthHeaders();
     const headers = {};
@@ -14098,6 +14120,7 @@ async function main(options = {}) {
       lastOpenCodeError = null;
       openCodeProcess = await startOpenCode();
       syncToHmrState();
+    }
       await waitForOpenCodePort();
       try {
         await waitForOpenCodeReady();

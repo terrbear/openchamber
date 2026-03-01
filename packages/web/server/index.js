@@ -4924,10 +4924,12 @@ function writeSseEvent(res, payload) {
  * Returns a cleanup function that stops the connection loop.
  */
 function connectAdapterSse(res, abortSignal) {
-  // Only connect in hybrid mode (adapter running on a separate port from OpenCode).
   // In legacy claudecode mode, openCodePort === claudeCodeAdapterPort and the
-  // upstream OpenCode connection already carries all adapter events.
-  if (!claudeCodeAdapterPort || claudeCodeAdapterPort === openCodePort) return () => {};
+  // upstream OpenCode connection already carries all adapter events — skip.
+  // NOTE: Do NOT bail when claudeCodeAdapterPort is null — the adapter may start
+  // after the SSE connection is established (hybrid mode startup order). The run()
+  // loop below handles null port with a wait-and-retry.
+  if (claudeCodeAdapterPort && claudeCodeAdapterPort === openCodePort) return () => {};
 
   let stopped = false;
   let currentReader = null;

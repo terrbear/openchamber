@@ -29,21 +29,38 @@ import { copyTextToClipboard } from '@/lib/clipboard';
 
 const ToolOutputDialog = React.lazy(() => import('./message/ToolOutputDialog'));
 
-const DETAILED_DEFAULT_TOOLS = new Set(['task', 'edit', 'multiedit', 'write', 'bash']);
+const DETAILED_DEFAULT_TOOLS = new Set(['task', 'edit', 'multiedit', 'write', 'apply_patch', 'bash', 'todowrite']);
+const EXPANDED_TOOLS_CACHE_MAX = 4000;
+const expandedToolsStateCache = new Map<string, Set<string>>();
+
+const readExpandedToolsCache = (messageId: string): Set<string> => {
+    const cached = expandedToolsStateCache.get(messageId);
+    return cached ? new Set(cached) : new Set();
+};
+
+const writeExpandedToolsCache = (messageId: string, value: Set<string>): void => {
+    if (expandedToolsStateCache.size >= EXPANDED_TOOLS_CACHE_MAX && !expandedToolsStateCache.has(messageId)) {
+        const oldest = expandedToolsStateCache.keys().next().value;
+        if (typeof oldest === 'string') {
+            expandedToolsStateCache.delete(oldest);
+        }
+    }
+    expandedToolsStateCache.set(messageId, new Set(value));
+};
 
 const isDetailedDefaultTool = (toolName: unknown): boolean =>
     typeof toolName === 'string' && DETAILED_DEFAULT_TOOLS.has(toolName.toLowerCase());
 
 function useStickyDisplayValue<T>(value: T | null | undefined): T | null | undefined {
-    const ref = React.useRef<{ hasValue: boolean; value: T | null | undefined }>({ hasValue: false, value: undefined as T | null | undefined });
+    const [stickyValue, setStickyValue] = React.useState<T | null | undefined>(value);
 
-    if (value !== undefined && value !== null) {
-        if (!ref.current.hasValue || ref.current.value !== value) {
-            ref.current = { hasValue: true, value };
+    React.useEffect(() => {
+        if (value !== undefined && value !== null) {
+            setStickyValue(value);
         }
-    }
+    }, [value]);
 
-    return ref.current.hasValue ? ref.current.value : value;
+    return value ?? stickyValue;
 }
 
 const getMessageInfoProp = (info: unknown, key: string): unknown => {
@@ -129,7 +146,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
 
     const [copiedCode, setCopiedCode] = React.useState<string | null>(null);
     const [copiedMessage, setCopiedMessage] = React.useState(false);
-    const [expandedTools, setExpandedTools] = React.useState<Set<string>>(new Set());
+    const [expandedTools, setExpandedTools] = React.useState<Set<string>>(() => readExpandedToolsCache(message.info.id));
     const [popupContent, setPopupContent] = React.useState<ToolPopupContent>({
         open: false,
         title: '',
@@ -137,8 +154,13 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
     });
 
     React.useEffect(() => {
+        setExpandedTools(readExpandedToolsCache(message.info.id));
+    }, [message.info.id]);
+
+    React.useEffect(() => {
+        expandedToolsStateCache.clear();
         setExpandedTools(new Set());
-    }, [message.info.id, toolCallExpansion]);
+    }, [toolCallExpansion]);
 
     const messageRole = React.useMemo(() => deriveMessageRole(message.info), [message.info]);
     const isUser = messageRole.isUser;
@@ -369,7 +391,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
 
     const messageCreatedAt = React.useMemo(() => {
         const timeInfo = message.info.time as { created?: number } | undefined;
-        return typeof timeInfo?.created === 'number' ? timeInfo.created : undefined;
+        return typeof timeInfo?.created === 'number' ? timeInfo.created : null;
     }, [message.info.time]);
 
     const isMessageCompleted = React.useMemo(() => {
@@ -442,8 +464,13 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
                 }
 
                 const toolPart = activity.part as unknown as { id?: string; tool?: unknown };
-                if (toolPart.id && isDetailedDefaultTool(toolPart.tool)) {
-                    defaultExpandedToolIds.add(toolPart.id);
+                if (isDetailedDefaultTool(toolPart.tool)) {
+                    if (toolPart.id) {
+                        defaultExpandedToolIds.add(toolPart.id);
+                    }
+                    if (activity.id) {
+                        defaultExpandedToolIds.add(activity.id);
+                    }
                 }
             }
         }
@@ -517,8 +544,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
         return freshnessDetector.shouldAnimateMessage(message.info, currentSessionId || message.info.sessionID);
     }, [message.info, currentSessionId, isUser]);
 
-    // Track if this message should show header to prevent flickering
-    const shouldShowHeaderRef = React.useRef(false);
+    const [hasStartedStreamingHeader, setHasStartedStreamingHeader] = React.useState(false);
 
     const previousRole = React.useMemo(() => {
         if (!previousMessage) return null;
@@ -546,6 +572,22 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
         return isStreamingMessage ? 'streaming' : 'completed';
     }, [isMessageCompleted, lifecyclePhase, isStreamingMessage]);
 
+    React.useEffect(() => {
+        setHasStartedStreamingHeader(false);
+    }, [message.info.id]);
+
+    React.useEffect(() => {
+        const headerMessageId = turnGroupingContext?.headerMessageId;
+        if (isUser || !headerMessageId || headerMessageId !== message.info.id) {
+            return;
+        }
+
+        const isCurrentlyStreaming = streamPhase === 'streaming' || streamPhase === 'cooldown';
+        if (isCurrentlyStreaming) {
+            setHasStartedStreamingHeader(true);
+        }
+    }, [isUser, message.info.id, streamPhase, turnGroupingContext?.headerMessageId]);
+
     const shouldShowHeader = React.useMemo(() => {
         if (isUser) return true;
 
@@ -563,15 +605,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
 
                 // For streaming messages: show header when streaming starts and keep it visible
                 const isCurrentlyStreaming = streamPhase === 'streaming' || streamPhase === 'cooldown';
-                const hasStartedStreaming = shouldShowHeaderRef.current;
-
-                // Update the ref when streaming starts
-                if (isCurrentlyStreaming && !hasStartedStreaming) {
-                    shouldShowHeaderRef.current = true;
-                }
-
-                // Show header if streaming has started or is currently active
-                return hasStartedStreaming || isCurrentlyStreaming;
+                return hasStartedStreamingHeader || isCurrentlyStreaming;
             }
 
             // For non-first assistant messages, don't show header
@@ -581,7 +615,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
         // Fallback to original logic when turn grouping is not available
         if (!previousRole) return true;
         return previousRole.isUser;
-    }, [isUser, previousRole, turnGroupingContext, streamPhase, message.info]);
+    }, [hasStartedStreamingHeader, isUser, previousRole, turnGroupingContext, streamPhase, message.info]);
 
     const handleCopyCode = React.useCallback((code: string) => {
         void copyTextToClipboard(code).then((result) => {
@@ -626,16 +660,17 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
             ? turnGroupingContext.summaryBody
             : assistantSummaryFromStore;
 
-    const assistantSummaryRef = React.useRef<string | undefined>(undefined);
-    if (assistantSummaryCandidate && assistantSummaryCandidate.trim().length > 0) {
-        assistantSummaryRef.current = assistantSummaryCandidate;
-    }
-    const prevUserMessageIdForCopy = React.useRef(userMessageIdForTurn);
-    if (prevUserMessageIdForCopy.current !== userMessageIdForTurn) {
-        prevUserMessageIdForCopy.current = userMessageIdForTurn;
-        assistantSummaryRef.current = undefined;
-    }
-    const assistantSummaryForCopy = assistantSummaryRef.current;
+    const [assistantSummaryForCopy, setAssistantSummaryForCopy] = React.useState<string | undefined>(undefined);
+
+    React.useEffect(() => {
+        setAssistantSummaryForCopy(undefined);
+    }, [userMessageIdForTurn]);
+
+    React.useEffect(() => {
+        if (assistantSummaryCandidate && assistantSummaryCandidate.trim().length > 0) {
+            setAssistantSummaryForCopy(assistantSummaryCandidate);
+        }
+    }, [assistantSummaryCandidate]);
 
     const assistantErrorText = React.useMemo(() => {
         if (isUser) {
@@ -742,9 +777,10 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
             } else {
                 next.add(toolId);
             }
+            writeExpandedToolsCache(message.info.id, next);
             return next;
         });
-    }, []);
+    }, [message.info.id]);
 
     const resolvedAnimationHandlers = animationHandlers ?? null;
     const hasAnnouncedAuxiliaryScrollRef = React.useRef(false);
@@ -909,7 +945,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
             <div
                 className={cn(
                     'group w-full',
-                    shouldShowHeader ? (isMobile ? 'pt-10' : 'pt-6') : 'pt-0',
+                    isUser ? (isMobile ? 'pt-2' : 'pt-6') : (shouldShowHeader ? (isMobile ? 'pt-10' : 'pt-6') : 'pt-0'),
                     isUser ? 'pb-0' : isFollowedByAssistant ? 'pb-0' : 'pb-8'
                 )}
                 data-message-id={message.info.id}
@@ -920,7 +956,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
                         displayParts.length === 0 ? null : (
                         <FadeInOnReveal>
                             <div className="flex justify-end">
-                                <div style={{ backgroundColor: 'var(--chat-user-message-bg)' }} className="max-w-[85%] rounded-2xl rounded-br-sm px-5 py-3 shadow-sm border border-primary/5">
+                                <div style={{ backgroundColor: 'var(--chat-user-message-bg)' }} className="max-w-[85%] rounded-2xl rounded-br-sm px-5 py-3 shadow-none border border-primary/5">
                                     <MessageBody
                                         messageId={message.info.id}
                                         parts={displayParts}
@@ -974,6 +1010,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
                                 isMessageCompleted={isMessageCompleted}
                                 messageFinish={messageFinish}
                                 messageCompletedAt={messageCompletedAt ?? undefined}
+                                messageCreatedAt={messageCreatedAt ?? undefined}
                                 syntaxTheme={syntaxTheme}
                                 isMobile={isMobile}
                                 hasTouchInput={hasTouchInput}

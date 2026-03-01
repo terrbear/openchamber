@@ -137,7 +137,6 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
     const acknowledgeSessionAbort = useSessionStore((state) => state.acknowledgeSessionAbort);
     const abortPromptSessionId = useSessionStore((state) => state.abortPromptSessionId);
     const clearAbortPrompt = useSessionStore((state) => state.clearAbortPrompt);
-    const sessionAbortFlags = useSessionStore((state) => state.sessionAbortFlags);
     const attachedFiles = useSessionStore((state) => state.attachedFiles);
     const addAttachedFile = useSessionStore((state) => state.addAttachedFile);
     const addServerFile = useSessionStore((state) => state.addServerFile);
@@ -299,10 +298,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         saveStoredDraft(currentSessionId, message);
     }, [message, persistChatDraft, currentSessionId]);
 
-    // Session activity for auto-send on idle
+    // Session activity for queue availability and controls
     const { phase: sessionPhase } = useCurrentSessionActivity();
-    const prevSessionPhaseRef = React.useRef(sessionPhase);
-    const autoSendTriggeredRef = React.useRef(false);
 
     const handleTextareaPointerDownCapture = React.useCallback((event: React.PointerEvent<HTMLTextAreaElement>) => {
         if (!isMobile) {
@@ -729,45 +726,6 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             void handleSubmitRef.current();
         }
     }, [inputMode, hasContent, currentSessionId, sessionPhase, queueModeEnabled, handleQueueMessage]);
-
-    // Auto-send queued messages when session becomes idle (but not after abort)
-    React.useEffect(() => {
-        const wasWorking = prevSessionPhaseRef.current === 'busy' || prevSessionPhaseRef.current === 'retry';
-        const isNowIdle = sessionPhase === 'idle';
-
-        // Check if session was recently aborted (within last 2 seconds)
-        const wasRecentlyAborted = currentSessionId && sessionAbortFlags.has(currentSessionId) && (() => {
-            const abortRecord = sessionAbortFlags.get(currentSessionId);
-            if (!abortRecord) return false;
-            const timeSinceAbort = Date.now() - abortRecord.timestamp;
-            return timeSinceAbort < 2000;
-        })();
-
-        // Detect transition from working to idle, but skip if aborted
-        if (wasWorking && isNowIdle && queuedMessages.length > 0 && !autoSendTriggeredRef.current && !wasRecentlyAborted) {
-            // Prevent double-triggering
-            autoSendTriggeredRef.current = true;
-
-            const targetSessionId = currentSessionId;
-
-            // Use setTimeout to avoid calling during render
-            setTimeout(() => {
-                const activeSessionId = useSessionStore.getState().currentSessionId;
-                const currentStatus = targetSessionId
-                    ? useSessionStore.getState().sessionStatus?.get(targetSessionId)
-                    : null;
-                const stillIdle = currentStatus?.type === 'idle';
-                const sessionUnchanged = Boolean(targetSessionId) && activeSessionId === targetSessionId;
-
-                if (sessionUnchanged && stillIdle && targetSessionId && currentProviderId && currentModelId) {
-                    void handleSubmitRef.current({ queuedOnly: true });
-                }
-                autoSendTriggeredRef.current = false;
-            }, 100);
-        }
-
-        prevSessionPhaseRef.current = sessionPhase;
-    }, [sessionPhase, queuedMessages.length, currentSessionId, currentProviderId, currentModelId, sessionAbortFlags]);
 
     const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
         // Early return during IME composition to prevent interference with autocomplete.
@@ -1538,8 +1496,14 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
     const hasDraggedFiles = React.useCallback((dataTransfer: DataTransfer | null | undefined): boolean => {
         if (!dataTransfer) return false;
         if (dataTransfer.files && dataTransfer.files.length > 0) return true;
-        if (!dataTransfer.types) return false;
-        return Array.from(dataTransfer.types).includes('Files');
+        if (dataTransfer.types) {
+            const types = Array.from(dataTransfer.types);
+            if (types.includes('Files')) return true;
+            if (types.includes('text/uri-list')) return true;
+        }
+
+        const uriList = dataTransfer.getData('text/uri-list') || dataTransfer.getData('text/plain');
+        return typeof uriList === 'string' && uriList.toLowerCase().includes('file://');
     }, []);
 
     const collectDroppedFiles = React.useCallback((dataTransfer: DataTransfer | null | undefined): File[] => {
@@ -1557,6 +1521,87 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
 
         return fromItems;
     }, []);
+
+    const collectDroppedFileUris = React.useCallback((dataTransfer: DataTransfer | null | undefined): string[] => {
+        if (!dataTransfer || typeof dataTransfer.getData !== 'function') return [];
+
+        const rawUriList = dataTransfer.getData('text/uri-list') || dataTransfer.getData('text/plain');
+        if (!rawUriList) return [];
+
+        const candidates = rawUriList
+            .split(/\r?\n/)
+            .map((value) => value.trim())
+            .filter((value) => value.length > 0 && !value.startsWith('#'))
+            .filter((value) => value.toLowerCase().startsWith('file://'));
+
+        return Array.from(new Set(candidates));
+    }, []);
+
+    const attachVSCodeDroppedUris = React.useCallback(async (uris: string[]) => {
+        if (uris.length === 0) return;
+
+        try {
+            const response = await fetch('/api/vscode/drop-files', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ uris }),
+            });
+
+            if (!response.ok) {
+                throw new Error(`Failed to attach dropped files (${response.status})`);
+            }
+
+            const data = await response.json();
+            const picked = Array.isArray(data?.files) ? data.files : [];
+            const skipped = Array.isArray(data?.skipped) ? data.skipped : [];
+
+            if (skipped.length > 0) {
+                const summary = skipped
+                    .map((entry: { name?: string; reason?: string }) => `${entry?.name || 'file'}: ${entry?.reason || 'skipped'}`)
+                    .join('\n');
+                toast.error(`Some dropped files were skipped:\n${summary}`);
+            }
+
+            let attachedCount = 0;
+            for (const file of picked as Array<{ name: string; mimeType?: string; dataUrl?: string }>) {
+                if (!file?.dataUrl) continue;
+
+                const sizeBefore = useSessionStore.getState().attachedFiles.length;
+                try {
+                    const [meta, base64] = file.dataUrl.split(',');
+                    const mime = file.mimeType || (meta?.match(/data:(.*);base64/)?.[1] || 'application/octet-stream');
+                    if (!base64) continue;
+
+                    const binary = atob(base64);
+                    const bytes = new Uint8Array(binary.length);
+                    for (let i = 0; i < binary.length; i++) {
+                        bytes[i] = binary.charCodeAt(i);
+                    }
+
+                    const blob = new Blob([bytes], { type: mime });
+                    const localFile = new File([blob], file.name || 'file', { type: mime });
+                    await addAttachedFile(localFile);
+
+                    const sizeAfter = useSessionStore.getState().attachedFiles.length;
+                    if (sizeAfter > sizeBefore) {
+                        attachedCount += 1;
+                    }
+                } catch (error) {
+                    console.error('Dropped file attach failed', error);
+                    toast.error(error instanceof Error ? error.message : 'Failed to attach dropped file');
+                }
+            }
+
+            if (attachedCount > 0) {
+                toast.success(`Attached ${attachedCount} file${attachedCount > 1 ? 's' : ''}`);
+            }
+        } catch (error) {
+            console.error('VS Code dropped file attach failed', error);
+            toast.error(error instanceof Error ? error.message : 'Failed to attach dropped files');
+        }
+    }, [addAttachedFile]);
 
     const normalizeDroppedPath = React.useCallback((rawPath: string): string => {
         const input = rawPath.trim();
@@ -1622,6 +1667,15 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         if (!currentSessionId && !newSessionDraftOpen) return;
 
         const files = collectDroppedFiles(e.dataTransfer);
+
+        if (files.length === 0 && isVSCodeRuntime()) {
+            const droppedUris = collectDroppedFileUris(e.dataTransfer);
+            if (droppedUris.length > 0) {
+                await attachVSCodeDroppedUris(droppedUris);
+            }
+            return;
+        }
+
         let attachedCount = 0;
 
         if (files.length > 0) {
@@ -1874,7 +1928,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
     const stopIconSizeClass = isMobile ? 'h-6 w-6' : (isVSCode ? 'h-4 w-4' : 'h-5 w-5');
     const iconSizeClass = isMobile ? 'h-[18px] w-[18px]' : (isVSCode ? 'h-4 w-4' : 'h-[18px] w-[18px]');
 
-    const iconButtonBaseClass = 'flex items-center justify-center text-muted-foreground transition-none outline-none focus:outline-none flex-shrink-0';
+    const iconButtonBaseClass = 'flex items-center justify-center text-foreground transition-none outline-none focus:outline-none flex-shrink-0';
     const footerIconButtonClass = cn(iconButtonBaseClass, buttonSizeClass);
 
     // Send button - respects queue mode setting
@@ -2053,8 +2107,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                     type="button"
                     className={cn(
                         footerIconButtonClass,
-                        'rounded-md text-muted-foreground',
-                        'hover:bg-interactive-hover/40 hover:text-foreground'
+                        'rounded-md',
+                        'hover:bg-interactive-hover/40'
                     )}
                     onPointerDownCapture={(event) => {
                         if (event.pointerType === 'touch') {
@@ -2322,7 +2376,11 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                                     <div className="flex items-center min-w-0 gap-x-1 justify-end">
                                         <div className="flex items-center gap-x-1 min-w-0 max-w-[60vw] flex-shrink">
                                             <MobileModelButton onOpenModel={handleOpenMobileControls} className="min-w-0 flex-shrink" />
-                                            <MobileAgentButton onOpenAgentPanel={() => setMobileControlsPanel('agent')} className="min-w-0 flex-shrink" />
+                                            <MobileAgentButton
+                                                onOpenAgentPanel={() => setMobileControlsPanel('agent')}
+                                                onCycleAgent={handleCycleAgent}
+                                                className="min-w-0 flex-shrink"
+                                            />
                                         </div>
                                         <div className="flex items-center gap-x-1 flex-shrink-0">
                                             <BrowserVoiceButton />
@@ -2357,7 +2415,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                                                     'rounded-md',
                                                     isExpandedInput
                                                         ? 'text-primary'
-                                                        : 'text-muted-foreground hover:bg-[var(--interactive-hover)]/40 hover:text-foreground'
+                                                        : 'text-foreground hover:bg-[var(--interactive-hover)]/40'
                                                 )}
                                                 onMouseDown={(event) => {
                                                     event.preventDefault();
@@ -2388,7 +2446,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                         )}
                     </div>
 
-                    {/* Mobile Session Status Bar - 在输入框上方 */}
+                    {/* Mobile Session Status Bar - above input */}
                     {isMobile && <MobileSessionStatusBar cornerRadius={cornerRadius} />}
                 </div>
             </div>

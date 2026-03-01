@@ -1,7 +1,7 @@
 import React from 'react';
 import { Streamdown } from 'streamdown';
-import { code } from '@streamdown/code';
-import { mermaid } from '@streamdown/mermaid';
+import { createCodePlugin } from '@streamdown/code';
+import { renderMermaidASCII, renderMermaidSVG } from 'beautiful-mermaid';
 import 'streamdown/styles.css';
 import { FadeInOnReveal } from './message/FadeInOnReveal';
 import type { Part } from '@opencode-ai/sdk/v2';
@@ -18,6 +18,8 @@ import { useEffectiveDirectory } from '@/hooks/useEffectiveDirectory';
 import { useUIStore } from '@/stores/useUIStore';
 import { useFilesViewTabsStore } from '@/stores/useFilesViewTabsStore';
 import type { ToolPopupContent } from './message/types';
+import { useUIStore } from '@/stores/useUIStore';
+import { useDeviceInfo } from '@/lib/device';
 
 const withStableStringId = <T extends object>(value: T, id: string): T => {
   const existingPrimitive = (value as Record<symbol, unknown>)[Symbol.toPrimitive];
@@ -125,47 +127,29 @@ const useMarkdownShikiThemes = (): readonly [string | object, string | object] =
   return isVSCode ? themes : fallbackThemes;
 };
 
-const useStreamdownMermaidOptions = () => {
+type StreamdownCodeThemes = NonNullable<Parameters<typeof createCodePlugin>[0]>['themes'];
+
+const useStreamdownPlugins = (shikiThemes: readonly [string | object, string | object]) => {
+  return React.useMemo(
+    () => ({
+      code: createCodePlugin({
+        // Streamdown code plugin runtime accepts theme objects, but current type only models bundled theme names.
+        themes: shikiThemes as unknown as StreamdownCodeThemes,
+      }),
+    }),
+    [shikiThemes],
+  );
+};
+
+const useCurrentMermaidTheme = () => {
   const themeSystem = useOptionalThemeSystem();
   const fallbackLight = getDefaultTheme(false);
   const fallbackDark = getDefaultTheme(true);
 
-  const currentTheme = themeSystem?.currentTheme
+  return themeSystem?.currentTheme
     ?? (typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches
       ? fallbackDark
       : fallbackLight);
-
-  const MERMAID_CONFIG_VERSION = 'sequence-nowrap-v1';
-  const mermaidRenderKey = `${currentTheme.metadata.id}:${currentTheme.metadata.variant}:${themeSystem?.themeMode ?? 'fallback'}:${MERMAID_CONFIG_VERSION}`;
-
-  const options = React.useMemo(() => {
-    const isDark = currentTheme.metadata.variant === 'dark';
-    return {
-      config: {
-        theme: isDark ? 'dark' : 'base',
-        sequence: {
-          useMaxWidth: false,
-        },
-        themeVariables: {
-          primaryColor: currentTheme.colors.surface.elevated,
-          primaryTextColor: currentTheme.colors.surface.foreground,
-          primaryBorderColor: currentTheme.colors.interactive.border,
-          lineColor: currentTheme.colors.interactive.border,
-          secondaryColor: currentTheme.colors.surface.muted,
-          tertiaryColor: currentTheme.colors.surface.subtle,
-          background: currentTheme.colors.surface.background,
-          mainBkg: currentTheme.colors.surface.elevated,
-          nodeTextColor: currentTheme.colors.surface.foreground,
-          edgeLabelBackground: currentTheme.colors.surface.background,
-        },
-      },
-    };
-  }, [currentTheme]);
-
-  return React.useMemo(
-    () => ({ options, mermaidRenderKey }),
-    [mermaidRenderKey, options],
-  );
 };
 
 // Table utility functions
@@ -306,7 +290,7 @@ const TableCopyButton: React.FC<{ tableRef: React.RefObject<HTMLDivElement | nul
         {copied ? <RiCheckLine className="size-3.5" /> : <RiFileCopyLine className="size-3.5" />}
       </button>
       {showMenu && (
-        <div className="absolute top-full right-0 z-10 mt-1 min-w-[100px] overflow-hidden rounded-md border border-border bg-background shadow-lg">
+        <div className="absolute top-full right-0 z-10 mt-1 min-w-[100px] overflow-hidden rounded-md border border-border bg-background shadow-none">
           <button
             className="w-full px-3 py-1.5 text-left text-sm transition-colors hover:bg-interactive-hover/40"
             onClick={() => handleCopy('csv')}
@@ -341,21 +325,17 @@ const TableDownloadButton: React.FC<{ tableRef: React.RefObject<HTMLDivElement |
   }, []);
 
    const handleDownload = (format: 'csv' | 'markdown') => {
-     const tableEl = tableRef.current?.querySelector('table');
-     if (!tableEl) return;
-     
-     try {
-       const data = extractTableData(tableEl);
-       const content = format === 'csv' ? tableToCSV(data) : tableToMarkdown(data);
-       const filename = format === 'csv' ? 'table.csv' : 'table.md';
-       const mimeType = format === 'csv' ? 'text/csv' : 'text/markdown';
-       downloadFile(filename, content, mimeType);
-       setShowMenu(false);
-       toast.success(`Table downloaded as ${format.toUpperCase()}`);
-     } catch (err) {
-       console.error('Failed to download table:', err);
-     }
-   };
+      const tableEl = tableRef.current?.querySelector('table');
+      if (!tableEl) return;
+
+      const data = extractTableData(tableEl);
+      const content = format === 'csv' ? tableToCSV(data) : tableToMarkdown(data);
+      const filename = format === 'csv' ? 'table.csv' : 'table.md';
+      const mimeType = format === 'csv' ? 'text/csv' : 'text/markdown';
+      downloadFile(filename, content, mimeType);
+      setShowMenu(false);
+      toast.success(`Table downloaded as ${format.toUpperCase()}`);
+    };
 
   return (
     <div className="relative" ref={menuRef}>
@@ -367,7 +347,7 @@ const TableDownloadButton: React.FC<{ tableRef: React.RefObject<HTMLDivElement |
         <RiDownloadLine className="size-3.5" />
       </button>
       {showMenu && (
-        <div className="absolute top-full right-0 z-10 mt-1 min-w-[100px] overflow-hidden rounded-md border border-border bg-background shadow-lg">
+        <div className="absolute top-full right-0 z-10 mt-1 min-w-[100px] overflow-hidden rounded-md border border-border bg-background shadow-none">
           <button
             className="w-full px-3 py-1.5 text-left text-sm transition-colors hover:bg-interactive-hover/40"
             onClick={() => handleDownload('csv')}
@@ -426,10 +406,162 @@ const getMermaidInfo = (children: React.ReactNode): { isMermaid: boolean; source
   return { isMermaid: true, source };
 };
 
-const CodeBlockWrapper: React.FC<CodeBlockWrapperProps> = ({ children, className, style, ...props }) => {
+const MermaidBlock: React.FC<{ source: string; mode: 'svg' | 'ascii' }> = ({ source, mode }) => {
+  const currentTheme = useCurrentMermaidTheme();
+  const { isMobile } = useDeviceInfo();
   const [copied, setCopied] = React.useState(false);
-  const codeRef = React.useRef<HTMLDivElement>(null);
+  const [downloaded, setDownloaded] = React.useState(false);
+
+  const svg = React.useMemo(() => {
+    if (mode !== 'svg') return '';
+    try {
+      return renderMermaidSVG(source, {
+        bg: currentTheme.colors.surface.elevated,
+        fg: currentTheme.colors.surface.foreground,
+        line: currentTheme.colors.interactive.border,
+        accent: currentTheme.colors.primary.base,
+        muted: currentTheme.colors.surface.mutedForeground,
+        surface: currentTheme.colors.surface.muted,
+        border: currentTheme.colors.interactive.border,
+        transparent: true,
+        font: 'IBM Plex Sans, sans-serif',
+      });
+    } catch {
+      return '';
+    }
+  }, [currentTheme, mode, source]);
+
+  const ascii = React.useMemo(() => {
+    if (mode !== 'ascii') return '';
+    try {
+      return renderMermaidASCII(source);
+    } catch {
+      return '';
+    }
+  }, [mode, source]);
+
+  const copyVisibilityClass = isMobile ? 'opacity-100' : 'opacity-0 group-hover:opacity-100';
+
+  const handleCopyAscii = async (asciiText: string) => {
+    if (!asciiText) return;
+    const result = await copyTextToClipboard(asciiText);
+    if (result.ok) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
+
+  const handleCopyMermaidSource = async () => {
+    if (!source) return;
+    const result = await copyTextToClipboard(source);
+    if (result.ok) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
+
+  const handleDownloadSvg = () => {
+    if (!svg) return;
+    try {
+      const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `diagram-${Date.now()}.svg`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      setDownloaded(true);
+      setTimeout(() => setDownloaded(false), 2000);
+    } catch {
+      toast.error('Failed to download diagram');
+    }
+  };
+
+  if (mode === 'ascii') {
+    const asciiText = ascii || source;
+
+    return (
+      <div data-streamdown="mermaid-block" className="group">
+        <div data-streamdown="mermaid-scroll">
+          <pre data-streamdown="mermaid-ascii">{asciiText}</pre>
+        </div>
+        <div
+          className={cn(
+            'absolute top-1 right-2 transition-opacity',
+            copyVisibilityClass,
+          )}
+        >
+          <button
+            onClick={() => handleCopyAscii(asciiText)}
+            className="p-1 rounded hover:bg-interactive-hover/60 text-muted-foreground hover:text-foreground transition-colors"
+            title="Copy"
+          >
+            {copied ? <RiCheckLine className="size-3.5" /> : <RiFileCopyLine className="size-3.5" />}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!svg) {
+    return (
+      <div data-streamdown="mermaid-block" className="group">
+        <div data-streamdown="mermaid-scroll">
+          <pre data-streamdown="mermaid-ascii">{source}</pre>
+        </div>
+        <div
+          className={cn(
+            'absolute top-1 right-2 transition-opacity',
+            copyVisibilityClass,
+          )}
+        >
+          <button
+            onClick={() => handleCopyAscii(source)}
+            className="p-1 rounded hover:bg-interactive-hover/60 text-muted-foreground hover:text-foreground transition-colors"
+            title="Copy"
+          >
+            {copied ? <RiCheckLine className="size-3.5" /> : <RiFileCopyLine className="size-3.5" />}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div data-streamdown="mermaid-block" className="group">
+      <div data-streamdown="mermaid-scroll">
+        <div data-streamdown="mermaid" dangerouslySetInnerHTML={{ __html: svg }} />
+      </div>
+      <div
+        className={cn(
+          'absolute top-1 right-2 flex items-center gap-1 transition-opacity',
+          copyVisibilityClass,
+        )}
+      >
+        <button
+          onClick={handleCopyMermaidSource}
+          className="p-1 rounded hover:bg-interactive-hover/60 text-muted-foreground hover:text-foreground transition-colors"
+          title="Copy source"
+        >
+          {copied ? <RiCheckLine className="size-3.5" /> : <RiFileCopyLine className="size-3.5" />}
+        </button>
+        <button
+          onClick={handleDownloadSvg}
+          className="p-1 rounded hover:bg-interactive-hover/60 text-muted-foreground hover:text-foreground transition-colors"
+          title="Download SVG"
+        >
+          {downloaded ? <RiCheckLine className="size-3.5" /> : <RiDownloadLine className="size-3.5" />}
+        </button>
+      </div>
+    </div>
+  );
+};
+
+const CodeBlockWrapper: React.FC<CodeBlockWrapperProps> = ({ children, className, style, ...props }) => {
   const mermaidInfo = getMermaidInfo(children);
+  const mermaidRenderingMode = useUIStore((state) => state.mermaidRenderingMode);
   const codeChild = React.useMemo(
     () => (
       React.isValidElement(children)
@@ -465,7 +597,6 @@ const CodeBlockWrapper: React.FC<CodeBlockWrapperProps> = ({ children, className
     const bg = normalizeDeclarationString((style as React.CSSProperties).backgroundColor);
     if (bg.value) {
       next.backgroundColor = bg.value;
-      (next as Record<string, string>)['--shiki-light-bg'] = bg.value;
     }
     for (const [k, v] of Object.entries(bg.vars)) {
       (next as Record<string, string>)[k] = v;
@@ -474,7 +605,6 @@ const CodeBlockWrapper: React.FC<CodeBlockWrapperProps> = ({ children, className
     const fg = normalizeDeclarationString((style as React.CSSProperties).color);
     if (fg.value) {
       next.color = fg.value;
-      (next as Record<string, string>)['--shiki-light'] = fg.value;
     }
     for (const [k, v] of Object.entries(fg.vars)) {
       (next as Record<string, string>)[k] = v;
@@ -483,49 +613,18 @@ const CodeBlockWrapper: React.FC<CodeBlockWrapperProps> = ({ children, className
     return next;
   }, [style]);
 
-  // Mermaid blocks are handled by Streamdown Mermaid controls.
   if (mermaidInfo.isMermaid) {
-    return codeChild;
+    return <MermaidBlock source={mermaidInfo.source} mode={mermaidRenderingMode} />;
   }
 
-  const getCodeContent = (): string => {
-    if (!codeRef.current) return '';
-    const codeEl = codeRef.current.querySelector('code');
-
-    return codeEl?.innerText || '';
-  };
-
-  const handleCopy = async () => {
-    const code = getCodeContent();
-    if (!code) return;
-    const result = await copyTextToClipboard(code);
-    if (result.ok) {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } else {
-      console.error('Failed to copy:', result.error);
-    }
-  };
-
   return (
-    <div className="group relative" ref={codeRef}>
-      <pre
-        {...props}
-        className={cn(className)}
-        style={normalizedStyle}
-      >
-        {codeChild}
-      </pre>
-      <div className="absolute top-1 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
-        <button
-          onClick={handleCopy}
-          className="p-1 rounded hover:bg-interactive-hover/60 text-muted-foreground hover:text-foreground transition-colors"
-          title="Copy"
-        >
-          {copied ? <RiCheckLine className="size-3.5" /> : <RiFileCopyLine className="size-3.5" />}
-        </button>
-      </div>
-    </div>
+    <pre
+      {...props}
+      className={cn(className, 'w-full min-w-full')}
+      style={normalizedStyle}
+    >
+      {codeChild}
+    </pre>
   );
 };
 
@@ -621,20 +720,9 @@ const streamdownComponents = {
   code: FilePathCode,
 };
 
-const streamdownPlugins = {
-  code,
-  mermaid,
-};
-
 const streamdownControls = {
-  code: false,
+  code: true,
   table: false,
-  mermaid: {
-    download: true,
-    copy: true,
-    fullscreen: false,
-    panZoom: false,
-  },
 };
 
 type MermaidControlOptions = {
@@ -656,6 +744,18 @@ const extractMermaidBlocks = (markdown: string): string[] => {
   }
 
   return blocks;
+};
+
+const stripLeadingFrontmatter = (markdown: string): string => {
+  const frontmatterMatch = markdown.match(
+    /^(?:\uFEFF)?(---|\+\+\+)[^\S\r\n]*\r?\n[\s\S]*?\r?\n\1[^\S\r\n]*(?:\r?\n|$)/,
+  );
+
+  if (!frontmatterMatch) {
+    return markdown;
+  }
+
+  return markdown.slice(frontmatterMatch[0].length);
 };
 
 export type MarkdownVariant = 'assistant' | 'tool';
@@ -781,28 +881,25 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
   useMermaidInlineInteractions({ containerRef: streamdownContainerRef, mermaidBlocks, onShowPopup });
 
   const shikiThemes = useMarkdownShikiThemes();
-  const { options: mermaidOptions, mermaidRenderKey } = useStreamdownMermaidOptions();
-  const componentKey = React.useMemo(() => {
-    const signature = part?.id ? `part-${part.id}` : `message-${messageId}`;
-    return `markdown-${signature}`;
-  }, [messageId, part?.id]);
+  const streamdownPlugins = useStreamdownPlugins(shikiThemes);
+  const currentMermaidTheme = useCurrentMermaidTheme();
+  const componentKey = `markdown-${part?.id ? `part-${part.id}` : `message-${messageId}`}`;
 
   const streamdownClassName = variant === 'tool'
     ? 'streamdown-content streamdown-tool'
     : 'streamdown-content';
 
   const markdownContent = (
-    <div className={cn('break-words', className)} ref={streamdownContainerRef}>
+    <div className={cn('break-words w-full min-w-0', className)} ref={streamdownContainerRef}>
       <Streamdown
-         key={`streamdown-${componentKey}-${mermaidRenderKey}`}
+         key={`streamdown-${componentKey}-${currentMermaidTheme.metadata.id}:${currentMermaidTheme.metadata.variant}`}
          mode={isStreaming ? 'streaming' : 'static'}
          shikiTheme={shikiThemes}
          className={streamdownClassName}
          controls={streamdownControls}
          plugins={streamdownPlugins}
-         mermaid={mermaidOptions}
          components={streamdownComponents}
-       >
+        >
         {content}
       </Streamdown>
     </div>
@@ -824,12 +921,25 @@ export const SimpleMarkdownRenderer: React.FC<{
   className?: string;
   variant?: MarkdownVariant;
   disableLinkSafety?: boolean;
+  stripFrontmatter?: boolean;
   onShowPopup?: (content: ToolPopupContent) => void;
   mermaidControls?: MermaidControlOptions;
   allowMermaidWheelZoom?: boolean;
-}> = ({ content, className, variant = 'assistant', disableLinkSafety, onShowPopup, mermaidControls, allowMermaidWheelZoom = false }) => {
+}> = ({
+  content,
+  className,
+  variant = 'assistant',
+  disableLinkSafety,
+  stripFrontmatter = false,
+  onShowPopup,
+  allowMermaidWheelZoom = false,
+}) => {
+  const renderedContent = React.useMemo(
+    () => (stripFrontmatter ? stripLeadingFrontmatter(content) : content),
+    [content, stripFrontmatter],
+  );
   const streamdownContainerRef = React.useRef<HTMLDivElement>(null);
-  const mermaidBlocks = React.useMemo(() => extractMermaidBlocks(content), [content]);
+  const mermaidBlocks = React.useMemo(() => extractMermaidBlocks(renderedContent), [renderedContent]);
   useMermaidInlineInteractions({
     containerRef: streamdownContainerRef,
     mermaidBlocks,
@@ -838,30 +948,27 @@ export const SimpleMarkdownRenderer: React.FC<{
   });
 
   const shikiThemes = useMarkdownShikiThemes();
-  const { options: mermaidOptions, mermaidRenderKey } = useStreamdownMermaidOptions();
+  const streamdownPlugins = useStreamdownPlugins(shikiThemes);
+  const currentMermaidTheme = useCurrentMermaidTheme();
 
   const streamdownClassName = variant === 'tool'
     ? 'streamdown-content streamdown-tool'
     : 'streamdown-content';
 
   return (
-    <div className={cn('break-words', className)} ref={streamdownContainerRef}>
+    <div className={cn('break-words w-full min-w-0', className)} ref={streamdownContainerRef}>
       <Streamdown
-        key={`streamdown-simple-${mermaidRenderKey}`}
+        key={`streamdown-simple-${currentMermaidTheme.metadata.id}:${currentMermaidTheme.metadata.variant}`}
         mode="static"
         shikiTheme={shikiThemes}
         className={streamdownClassName}
-        controls={{
-          ...streamdownControls,
-          mermaid: mermaidControls ?? streamdownControls.mermaid,
-        }}
+        controls={streamdownControls}
         plugins={streamdownPlugins}
-        mermaid={mermaidOptions}
         components={streamdownComponents}
         // @ts-expect-error Streamdown type missing linkSafety in older minor
         linkSafety={disableLinkSafety ? { enabled: false } : undefined}
       >
-        {content}
+        {renderedContent}
       </Streamdown>
     </div>
   );

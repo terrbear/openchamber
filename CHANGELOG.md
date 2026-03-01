@@ -4,6 +4,79 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-03-01
+
+- Updates: hardened the self-update flow with safer release handling and fallback behavior, reducing failed or stuck updates.
+- Chat: added a new "Share as image" action so you can quickly export and share important messages (thanks to @Jovines).
+- Chat: improved message readability with cleaner tool/reasoning rendering and less noisy activity timing in busy conversations (thanks to @nelsonPires5).
+- Desktop/Chat: permission toasts now include session context and a clearer permission preview, making approvals more accessible outside of a session (thanks to @nelsonPires5).
+- VSCode: fixed live streaming edge cases for event endpoints with query/trailing-slash variants, improving real-time updates in chat, session editor, and agent-manager views.
+- Reliability: improved event-stream/session visibility handling when the app is hidden or restored, reducing stale activity states and missed updates.
+- Windows: fixed CLI/runtime path and spawn edge cases to reduce startup and command failures on Windows (thanks to @plfavreau).
+- Notifications/Voice: consolidated TTS and summarization service wiring for steadier text-to-speech and summary flows (thanks to @nelsonPires5).
+- Deployment: fixed Docker build/runtime issues for more reliable containerized setups (thanks to @nzlov).
+
+
+## [1.8.1] - 2026-02-28
+
+- Web/Auth: fixed an issue where non-tunnel browser sessions could incorrectly show a tunnel-only lock screen; normal auth flow now appears unless a tunnel is actually active.
+
+
+## [1.8.0] - 2026-02-28
+
+- Desktop: added SSH remote instance support with dedicated lifecycle and UX flows, so you can work against remote machines more reliably (thanks to @shekohex).
+- Projects: added project icon customization with upload/remove and automatic favicon discovery from your repository (thanks to @shekohex).
+- Projects: added header project actions on Web and Mobile, so you can run and stop any configured project commands without leaving chat.
+- Projects/Desktop: project actions can also open SSH-forwarded URLs, making remote dev-server workflows quicker from inside the app.
+- Desktop: added dynamic window titles that reflect active project and remote context, so it is easier to track where you are working (thanks to @shekohex).
+- Remote Tunnel: added tunnel settings with quick/named modes, secure one-time connect links (with QR), and saved named-tunnel presets/tokens so enabling remote access is easier and safer (thanks to @yulia-ivashko).
+- UI: expanded sprite-based file and folder icons across Files, Diff, and Git views for faster visual scanning (thanks to @shekohex).
+- UI: added an expandable project rail with project names, a settings toggle, and saved expansion state for easier navigation in multi-project setups (thanks to @nguyenngothuong).
+- UI/Files: added file-type icons across file lists, tabs, and diffs, so you can identify files faster at a glance (thanks to @shekohex).
+- Files: added a read-only highlighted view with a quick toggle back to edit mode, so you can quickly review code with richer syntax rendering if you don't need to edit thing (thanks to @shekohex).
+- Files: markdown preview now handles frontmatter more cleanly, improving readability for docs-heavy repos (thanks to @shekohex).
+- Chat: improved long-session performance with virtualized message rendering, smoother scrolling, and more stable behavior in large histories (thanks to @shekohex).
+- Chat: enabled markdown rendering in user messages for clearer formatted prompts and notes (thanks to @haofeng0705).
+- Chat: enabled bueatiful diffs for edit tools in chat making this aligned with dedicated diffs view style (thanks to @shekohex).
+- Chat: pasted absolute paths are now treated as normal messages, reducing accidental command-like behavior when sharing paths.
+- Chat: fixed queued sends for inactive sessions, reducing stuck queues.
+- Chat: upgraded Mermaid rendering with a cleaner diagram view plus quick copy/download actions, making generated diagrams easier to read and share (thanks to @shekohex).
+- Notifications: improved child-session notification detection to reduce missed or misclassified subtask updates (thanks to @Jovines).
+- Deployment: added Docker deployment support with safer container defaults and terminal shell fallback, making self-hosted setups easier to run (thanks to @nzlov).
+- Reliability: improved Windows compatibility across git status checks, OpenCode startup, path normalization, and session merge behavior (thanks to @mmereu).
+- Usage: added MiniMax coding-plan quota provider support for broader usage tracking coverage (thanks to @nzlov).
+- Usage: added Ollama Cloud quota provider support for broader usage tracking coverage (thanks to @iamhenry).
+
+
+## [1.7.5] - 2026-02-25
+
+- UI: moved projects into a dedicated sidebar rail and tightened the layout so switching projects and sessions feels faster.
+- Chat: fixed an issue where messages could occasionally duplicate or disappear during active conversations.
+- Sessions: reduced session-switching overhead to make chat context changes feel more immediate.
+- Reliability/Auth: migrated session auth storage to signed JWTs with a persistent secret, reducing unexpected auth-state drift after reconnects or reloads (thanks to @Jovines).
+- Mobile: pending permission prompts now recover after reconnect/resume instead of getting lost mid-run (thanks to @nelsonPires5).
+- Mobile/Chat: refined message spacing and removed the top scroll shadow for a cleaner small-screen reading experience (thanks to @Jovines).
+- Web: added `OPENCODE_HOST` support so you can connect directly to an external OpenCode server using a full base URL (thanks to @colinmollenhour).
+- Web/Mobile: fixed in-app update flow in containerized setups so updates apply correctly.
+
+
+## [1.7.4] - 2026-02-24
+
+- Settings: redesigned the settings workspace with flatter, more consistent page layouts so configuration is faster to scan and edit.
+- Settings: improved agents and skills navigation by grouping entries by subfolder for easier management at scale (thanks to @nguyenngothuong).
+- Chat: improved streaming smoothness and stability with buffered updates and runtime fixes, reducing lag, stuck spinners, memory growth, and timeout-related interruptions in long runs (thanks to @nguyenngothuong).
+- Chat: added fullscreen Mermaid preview, persisted default thinking variant selection, and hardened file-preview safety checks for a safer, more predictable message experience (thanks to @yulia-ivashko).
+- Chat: draft text now persists per session, and the input supports an expanded focus mode for longer prompts (thanks to @nguyenngothuong).
+- Sessions: expanded folder management with subfolders, cleaner organization actions, and clearer delete confirmations (thanks to @nguyenngothuong).
+- Settings: added an MCP config manager UI to simplify editing and validating MCP server configuration (thanks to @nguyenngothuong).
+- Git/PR: moved commit-message and PR-description generation to active-session structured output, so generation uses current session context and avoids fragile backend polling.
+- Chat Activity: improved Structured Output tool rendering with dedicated title/icon, clearer result descriptions, and more reliable detailed expansion defaults.
+- Notifications/Voice: moved utility model controls into AI Summarization as a Zen-only Summarization Model setting.
+- Mobile: refreshed drawer and session-status layouts for better small-screen usability (thanks to @Jovines).
+- Desktop: improved remote instance URL handling for more reliable host/query matching (thanks to @shekohex).
+- Files: added C, C++, and Go language support for syntax-aware rendering in code-heavy workflows (thanks to @fomenks).
+
+
 ## [1.7.3] - 2026-02-21
 
 - Settings: added customizable keyboard shortcuts for chat actions, panel toggles, and services, so you can better match OpenChamber to your workflow (thanks to @nelsonPires5).

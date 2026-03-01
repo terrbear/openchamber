@@ -36,6 +36,108 @@ const timeoutRegistry = new Map<string, ReturnType<typeof setTimeout>>();
 const lastContentRegistry = new Map<string, string>();
 const streamingCooldownTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+// --- rAF batching for streaming parts ---
+// Buffer incoming streaming parts and flush them in a single requestAnimationFrame
+// callback. This coalesces N SSE tokens per frame into one synchronous flush,
+// which React 18 + Zustand batch into a single re-render.
+interface QueuedStreamingPart {
+    sessionId: string;
+    messageId: string;
+    part: Part;
+    role?: string;
+    currentSessionId?: string;
+}
+const streamingPartQueue: QueuedStreamingPart[] = [];
+let streamingFlushScheduled = false;
+let streamingFlushRafId: number | null = null;
+let streamingFlushTimeoutId: ReturnType<typeof setTimeout> | null = null;
+const STREAMING_FLUSH_TIMEOUT_MS = 50;
+const STREAMING_QUEUE_HARD_LIMIT = 3000;
+
+type StreamingPartImmediateHandler = (
+    sessionId: string,
+    messageId: string,
+    part: Part,
+    role?: string,
+    currentSessionId?: string,
+) => void;
+
+const cancelScheduledStreamingFlush = (): void => {
+    if (streamingFlushRafId !== null) {
+        cancelAnimationFrame(streamingFlushRafId);
+        streamingFlushRafId = null;
+    }
+    if (streamingFlushTimeoutId !== null) {
+        clearTimeout(streamingFlushTimeoutId);
+        streamingFlushTimeoutId = null;
+    }
+    streamingFlushScheduled = false;
+};
+
+const flushQueuedStreamingParts = (immediateHandler: StreamingPartImmediateHandler): void => {
+    if (streamingPartQueue.length === 0) {
+        cancelScheduledStreamingFlush();
+        return;
+    }
+
+    cancelScheduledStreamingFlush();
+
+    const batch = streamingPartQueue.splice(0);
+    if (batch.length === 0) {
+        return;
+    }
+
+    for (const entry of batch) {
+        immediateHandler(entry.sessionId, entry.messageId, entry.part, entry.role, entry.currentSessionId);
+    }
+};
+
+const discardQueuedStreamingPartsForSession = (sessionId: string): void => {
+    if (streamingPartQueue.length === 0) {
+        return;
+    }
+
+    for (let i = streamingPartQueue.length - 1; i >= 0; i--) {
+        if (streamingPartQueue[i].sessionId === sessionId) {
+            streamingPartQueue.splice(i, 1);
+        }
+    }
+
+    if (streamingPartQueue.length === 0) {
+        cancelScheduledStreamingFlush();
+    }
+};
+
+const scheduleStreamingFlush = (flush: () => void): void => {
+    if (streamingFlushScheduled) {
+        return;
+    }
+
+    streamingFlushScheduled = true;
+
+    const shouldUseRaf =
+        typeof requestAnimationFrame === "function" &&
+        (typeof document === "undefined" || !document.hidden);
+
+    if (shouldUseRaf) {
+        streamingFlushRafId = requestAnimationFrame(() => {
+            streamingFlushRafId = null;
+            if (!streamingFlushScheduled) {
+                return;
+            }
+            flush();
+        });
+    }
+
+    streamingFlushTimeoutId = setTimeout(() => {
+        streamingFlushTimeoutId = null;
+        if (!streamingFlushScheduled) {
+            return;
+        }
+        flush();
+    }, STREAMING_FLUSH_TIMEOUT_MS);
+};
+
 const MIN_SORTABLE_LENGTH = 10;
 
 const extractSortableId = (id: unknown): string | null => {
@@ -343,7 +445,7 @@ interface MessageState {
 
 interface MessageActions {
     loadMessages: (sessionId: string, limit?: number) => Promise<void>;
-    sendMessage: (content: string, providerID: string, modelID: string, agent?: string, currentSessionId?: string, attachments?: AttachedFile[], agentMentionName?: string | null, additionalParts?: Array<{ text: string; attachments?: AttachedFile[]; synthetic?: boolean }>, variant?: string, inputMode?: 'normal' | 'shell') => Promise<void>;
+    sendMessage: (content: string, providerID: string, modelID: string, agent?: string, currentSessionId?: string, attachments?: AttachedFile[], agentMentionName?: string | null, additionalParts?: Array<{ text: string; attachments?: AttachedFile[]; synthetic?: boolean }>, variant?: string, inputMode?: 'normal' | 'shell', format?: { type: 'json_schema'; schema: Record<string, unknown>; retryCount?: number }) => Promise<void>;
     abortCurrentOperation: (currentSessionId?: string) => Promise<void>;
     _addStreamingPartImmediate: (sessionId: string, messageId: string, part: Part, role?: string, currentSessionId?: string) => void;
     addStreamingPart: (sessionId: string, messageId: string, part: Part, role?: string, currentSessionId?: string) => void;
@@ -397,18 +499,19 @@ export const useMessageStore = create<MessageStore>()(
                                 : Math.max(baseLimit, userExpandedLimit ?? 0);
 
                         // Don't pass Infinity to API - use undefined for "fetch all".
-                        // For finite loads, overfetch by 1 so hasMoreAbove is accurate.
-                        const fetchLimit = noLimit ? undefined : targetLimit + 1;
+                        // Use targetLimit directly and infer "has more" when payload fills the window,
+                        // matching OpenCode behavior and avoiding hidden "load older" on exact-limit responses.
+                        const fetchLimit = noLimit ? undefined : targetLimit;
                         const allMessages = await executeWithSessionDirectory(sessionId, () => opencodeClient.getSessionMessages(sessionId, fetchLimit));
 
                         // Filter out reverted messages first
                         const revertMessageId = getSessionRevertMessageId(sessionId);
                         const messagesWithoutReverted = filterRevertedMessages(allMessages, revertMessageId);
 
-                        // Accurate older-history detection for finite loads.
-                        // If server returns > targetLimit, there are older messages above current window.
+                        // If server fills the requested window, assume there may be more above.
+                        // This is intentionally optimistic and corrected on subsequent load-more calls.
                         const hasMoreAbove = typeof fetchLimit === 'number'
-                            ? messagesWithoutReverted.length > targetLimit
+                            ? messagesWithoutReverted.length >= targetLimit
                             : false;
 
                         const watermark = get().sessionMemoryState.get(sessionId)?.trimmedHeadMaxId;
@@ -568,7 +671,7 @@ export const useMessageStore = create<MessageStore>()(
                         });
                 },
 
-                sendMessage: async (content: string, providerID: string, modelID: string, agent?: string, currentSessionId?: string, attachments?: AttachedFile[], agentMentionName?: string | null, additionalParts?: Array<{ text: string; attachments?: AttachedFile[]; synthetic?: boolean }>, variant?: string, inputMode: 'normal' | 'shell' = 'normal') => {
+                sendMessage: async (content: string, providerID: string, modelID: string, agent?: string, currentSessionId?: string, attachments?: AttachedFile[], agentMentionName?: string | null, additionalParts?: Array<{ text: string; attachments?: AttachedFile[]; synthetic?: boolean }>, variant?: string, inputMode: 'normal' | 'shell' = 'normal', format?: { type: 'json_schema'; schema: Record<string, unknown>; retryCount?: number }) => {
                     if (!currentSessionId) {
                         throw new Error("No session selected");
                     }
@@ -586,9 +689,21 @@ export const useMessageStore = create<MessageStore>()(
                     await executeWithSessionDirectory(sessionId, async () => {
                         try {
                             const trimmedContent = content.trimStart();
+                            const firstTokenLooksLikeAbsolutePath = (() => {
+                                if (!trimmedContent.startsWith('/')) return false;
+                                const firstWhitespaceIndex = trimmedContent.search(/\s/);
+                                const firstToken = firstWhitespaceIndex === -1
+                                    ? trimmedContent
+                                    : trimmedContent.slice(0, firstWhitespaceIndex);
+                                if (firstToken.length <= 1) return false;
+                                const tokenWithoutLeadingSlash = firstToken.slice(1);
+                                if (!tokenWithoutLeadingSlash.includes('/')) return false;
+                                return true;
+                            })();
                             const commandPayload = (() => {
                                 if (inputMode === 'shell') return null;
                                 if (!trimmedContent.startsWith("/")) return null;
+                                if (firstTokenLooksLikeAbsolutePath) return null;
                                 const firstLineEnd = trimmedContent.indexOf("\n");
                                 const firstLine = firstLineEnd === -1 ? trimmedContent : trimmedContent.slice(0, firstLineEnd);
                                 const [commandToken, ...firstLineArgs] = firstLine.split(" ");
@@ -613,6 +728,7 @@ export const useMessageStore = create<MessageStore>()(
                             })();
                             const slashShellPayload = (() => {
                                 if (!trimmedContent.startsWith("/")) return null;
+                                if (firstTokenLooksLikeAbsolutePath) return null;
                                 const firstLineEnd = trimmedContent.indexOf("\n");
                                 const firstLine = firstLineEnd === -1 ? trimmedContent : trimmedContent.slice(0, firstLineEnd);
                                 const [commandToken, ...firstLineArgs] = firstLine.split(" ");
@@ -738,6 +854,17 @@ export const useMessageStore = create<MessageStore>()(
                                         files: filePayloads.length > 0 ? filePayloads : undefined,
                                     });
                                 } else {
+                                    if (format) {
+                                        console.info('[git-generation][browser] dispatch structured sendMessage', {
+                                            sessionId,
+                                            providerID,
+                                            modelID,
+                                            agent,
+                                            variant,
+                                            directory,
+                                            formatType: format.type,
+                                        });
+                                    }
                                     await opencodeClient.sendMessage({
                                         id: sessionId,
                                         providerID,
@@ -745,6 +872,7 @@ export const useMessageStore = create<MessageStore>()(
                                         text: content,
                                         agent,
                                         variant,
+                                        ...(format ? { format } : {}),
                                         files: filePayloads.length > 0 ? filePayloads : undefined,
                                         additionalParts: additionalPartsPayload && additionalPartsPayload.length > 0 ? additionalPartsPayload : undefined,
                                         agentMentions: agentMentionName ? [{ name: agentMentionName }] : undefined,
@@ -830,6 +958,8 @@ export const useMessageStore = create<MessageStore>()(
                     if (!currentSessionId) {
                         return;
                     }
+
+                    discardQueuedStreamingPartsForSession(currentSessionId);
 
                     const stateSnapshot = get();
                     const { abortControllers, messages: storeMessages } = stateSnapshot;
@@ -1474,7 +1604,18 @@ export const useMessageStore = create<MessageStore>()(
                 },
 
                 addStreamingPart: (sessionId: string, messageId: string, part: Part, role?: string, currentSessionId?: string) => {
-                    get()._addStreamingPartImmediate(sessionId, messageId, part, role, currentSessionId);
+                    streamingPartQueue.push({ sessionId, messageId, part, role, currentSessionId });
+
+                    const flushQueuedParts = () => {
+                        flushQueuedStreamingParts(get()._addStreamingPartImmediate);
+                    };
+
+                    if (streamingPartQueue.length >= STREAMING_QUEUE_HARD_LIMIT) {
+                        flushQueuedParts();
+                        return;
+                    }
+
+                    scheduleStreamingFlush(flushQueuedParts);
                 },
 
                 forceCompleteMessage: (sessionId: string | null | undefined, messageId: string, source: "timeout" | "cooldown" = "timeout") => {
@@ -1958,6 +2099,8 @@ export const useMessageStore = create<MessageStore>()(
                 },
 
                 completeStreamingMessage: (sessionId: string, messageId: string) => {
+                    flushQueuedStreamingParts(get()._addStreamingPartImmediate);
+
                     const state = get();
 
                     (window as any).__messageTracker?.(
@@ -2497,7 +2640,7 @@ export const useMessageStore = create<MessageStore>()(
                     });
 
                     try {
-                        const fetchLimit = desiredLimit + 1;
+                        const fetchLimit = desiredLimit;
                         const allMessages = await executeWithSessionDirectory(
                             sessionId,
                             () => opencodeClient.getSessionMessages(sessionId, fetchLimit)
@@ -2505,7 +2648,7 @@ export const useMessageStore = create<MessageStore>()(
 
                         if (direction === "up" && currentMessages.length > 0) {
                             const dedupedMessages = dedupeMessagesById(allMessages);
-                            const hasPotentialMore = allMessages.length >= fetchLimit;
+                            const hasPotentialMore = allMessages.length >= desiredLimit;
                             const firstCurrentMessage = currentMessages[0];
                             const indexInAll = dedupedMessages.findIndex((message) => message.info.id === firstCurrentMessage.info.id);
 

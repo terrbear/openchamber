@@ -5,8 +5,8 @@ import { ErrorBoundary } from '../ui/ErrorBoundary';
 import { useUIStore } from '@/stores/useUIStore';
 import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
 
-export const SIDEBAR_CONTENT_WIDTH = 264;
-const SIDEBAR_MIN_WIDTH = 300;
+export const SIDEBAR_CONTENT_WIDTH = 250;
+const SIDEBAR_MIN_WIDTH = 250;
 const SIDEBAR_MAX_WIDTH = 500;
 
 interface SidebarProps {
@@ -34,6 +34,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen, isMobile, children }) 
         }
         setIsDesktopApp(Boolean((window as unknown as { __TAURI__?: unknown }).__TAURI__));
     }, []);
+
 
     React.useEffect(() => {
         if (isMobile || !isResizing) {
@@ -69,7 +70,6 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen, isMobile, children }) 
     }, [isMobile, isResizing]);
 
     if (isMobile) {
-
         return null;
     }
 
@@ -91,10 +91,8 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen, isMobile, children }) 
     return (
         <aside
             className={cn(
-                'relative flex h-full overflow-hidden border-r border-border',
-                isDesktopApp
-                    ? 'bg-[color:var(--sidebar-overlay-strong)] backdrop-blur supports-[backdrop-filter]:bg-[color:var(--sidebar-overlay-soft)]'
-                    : 'bg-sidebar',
+                'relative flex h-full overflow-hidden border-r border-border/40',
+                'bg-sidebar/50',
                 isResizing ? 'transition-none' : 'transition-[width] duration-300 ease-in-out',
                 !isOpen && 'border-r-0'
             )}

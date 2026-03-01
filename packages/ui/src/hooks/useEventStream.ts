@@ -20,6 +20,7 @@ import { useContextStore } from '@/stores/contextStore';
 import { getRegisteredRuntimeAPIs } from '@/contexts/runtimeAPIRegistry';
 import { isDesktopLocalOriginActive } from '@/lib/desktop';
 import { triggerSessionStatusPoll } from '@/hooks/useServerSessionStatus';
+import { PermissionToastActions } from '@/components/chat/PermissionToastActions';
 
 interface EventData {
   type: string;
@@ -36,6 +37,139 @@ const readStringProp = (obj: unknown, keys: string[]): string | null => {
   return null;
 };
 
+const readStringArrayProp = (value: unknown): string[] => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter((entry): entry is string => typeof entry === 'string')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+};
+
+const normalizePermissionRequest = (value: unknown): PermissionRequest | null => {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  const id = readStringProp(record, ['id']);
+  const sessionID = readStringProp(record, ['sessionID']);
+  if (!id || !sessionID) {
+    return null;
+  }
+
+  const permission = typeof record.permission === 'string' ? record.permission : '';
+  const patterns = readStringArrayProp(record.patterns);
+  const metadata = typeof record.metadata === 'object' && record.metadata !== null
+    ? record.metadata as Record<string, unknown>
+    : {};
+  const always = readStringArrayProp(record.always);
+
+  const toolValue = record.tool;
+  const tool = (toolValue && typeof toolValue === 'object')
+    ? {
+        messageID: readStringProp(toolValue, ['messageID']) ?? '',
+        callID: readStringProp(toolValue, ['callID']) ?? '',
+      }
+    : undefined;
+
+  return {
+    id,
+    sessionID,
+    permission,
+    patterns,
+    metadata,
+    always,
+    tool: tool && tool.messageID.length > 0 && tool.callID.length > 0 ? tool : undefined,
+  };
+};
+
+const readPermissionMetadataPreview = (metadata: Record<string, unknown>): string => {
+  const preferredKeys = [
+    'command',
+    'cmd',
+    'script',
+    'path',
+    'filePath',
+    'filepath',
+    'file_path',
+    'directory',
+    'working_directory',
+    'cwd',
+    'url',
+    'uri',
+    'endpoint',
+    'description',
+    'action',
+    'operation',
+  ];
+
+  for (let i = 0; i < preferredKeys.length; i++) {
+    const value = metadata[preferredKeys[i]];
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed.length > 0) {
+        return trimmed;
+      }
+      continue;
+    }
+
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      return String(value);
+    }
+
+    if (Array.isArray(value)) {
+      const joined = value
+        .filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+        .slice(0, 3)
+        .join(', ')
+        .trim();
+      if (joined.length > 0) {
+        return joined;
+      }
+    }
+  }
+
+  const metadataEntries = Object.entries(metadata);
+  if (metadataEntries.length === 0) {
+    return '';
+  }
+
+  try {
+    return JSON.stringify(metadata);
+  } catch {
+    return '';
+  }
+};
+
+const buildPermissionToastBody = (request: PermissionRequest): string => {
+  const patterns = Array.isArray(request.patterns) ? request.patterns : [];
+  const patternSummary = patterns
+    .filter((pattern): pattern is string => typeof pattern === 'string' && pattern.trim().length > 0)
+    .join(', ')
+    .trim();
+
+  const metadata = typeof request.metadata === 'object' && request.metadata !== null ? request.metadata : {};
+  const metadataSummary = readPermissionMetadataPreview(metadata);
+
+  if (patternSummary.length > 0 && metadataSummary.length > 0) {
+    return `${patternSummary} | ${metadataSummary}`;
+  }
+
+  if (patternSummary.length > 0) {
+    return patternSummary;
+  }
+
+  if (metadataSummary.length > 0) {
+    return metadataSummary;
+  }
+
+  const fallback = typeof request.permission === 'string' ? request.permission.trim() : '';
+  return fallback.length > 0 ? fallback : 'Permission details unavailable';
+};
+
 type MessageTracker = (messageId: string, event?: string, extraData?: Record<string, unknown>) => void;
 
 declare global {
@@ -47,6 +181,7 @@ declare global {
 const TEXT_SHRINK_TOLERANCE = 50;
 const RESYNC_DEBOUNCE_MS = 750;
 const QUESTION_RECONCILE_COOLDOWN_MS = 1500;
+const PERMISSION_RECONCILE_COOLDOWN_MS = 1500;
 
 const textLengthCache = new WeakMap<Part[], number>();
 const computeTextLength = (parts: Part[] | undefined | null): number => {
@@ -134,7 +269,6 @@ export const useEventStream = () => {
   } = useSessionStore();
 
   const { checkConnection } = useConfigStore();
-  const nativeNotificationsEnabled = useUIStore((state) => state.nativeNotificationsEnabled);
   const fallbackDirectory = useDirectoryStore((state) => state.currentDirectory);
 
   const activeSessionDirectory = React.useMemo(() => {
@@ -199,31 +333,51 @@ export const useEventStream = () => {
     void bootstrapPendingQuestions();
   }, [bootstrapPendingQuestions]);
 
-  React.useEffect(() => {
-    let cancelled = false;
+  const bootstrapPendingPermissions = React.useCallback(async () => {
+    try {
+      const projects = useProjectsStore.getState().projects;
+      const projectDirs = projects.map((project) => project.path);
+      // Use getState() to avoid sessions dependency which causes cascading updates
+      const currentSessions = useSessionStore.getState().sessions;
+      const sessionDirs = currentSessions.map((session) => (session as { directory?: string | null }).directory);
 
-    const bootstrapPendingPermissions = async () => {
-      try {
-        const pending = await opencodeClient.listPendingPermissions();
-        if (cancelled || pending.length === 0) {
-          return;
-        }
-
-        for (const request of pending) {
-          addPermission(request as unknown as PermissionRequest);
-        }
-      } catch {
-        // ignored
+      const directories = [effectiveDirectory, ...projectDirs, ...sessionDirs];
+      const pending = await opencodeClient.listPendingPermissions({ directories });
+      if (pending.length === 0) {
+        return;
       }
-    };
 
+      for (const request of pending) {
+        const normalizedRequest = normalizePermissionRequest(request);
+        if (!normalizedRequest) {
+          continue;
+        }
+        addPermission(normalizedRequest);
+      }
+    } catch {
+      // ignored
+    }
+  }, [addPermission, effectiveDirectory]);
+
+  const lastPermissionRefreshAtRef = React.useRef(0);
+  const requestPendingPermissionsRefresh = React.useCallback((force = false) => {
+    const now = Date.now();
+    if (!force && now - lastPermissionRefreshAtRef.current < PERMISSION_RECONCILE_COOLDOWN_MS) {
+      return;
+    }
+    lastPermissionRefreshAtRef.current = now;
     void bootstrapPendingPermissions();
-    requestPendingQuestionsRefresh(true);
+  }, [bootstrapPendingPermissions]);
 
-    return () => {
-      cancelled = true;
-    };
-  }, [addPermission, requestPendingQuestionsRefresh]);
+  const requestPendingPermissionsRefreshRef = React.useRef(requestPendingPermissionsRefresh);
+  React.useEffect(() => {
+    requestPendingPermissionsRefreshRef.current = requestPendingPermissionsRefresh;
+  }, [requestPendingPermissionsRefresh]);
+
+  React.useEffect(() => {
+    requestPendingPermissionsRefresh(true);
+    requestPendingQuestionsRefresh(true);
+  }, [requestPendingPermissionsRefresh, requestPendingQuestionsRefresh]);
 
   const normalizeDirectory = React.useCallback((value: string | null | undefined): string | null => {
     if (typeof value !== 'string') return null;
@@ -380,6 +534,7 @@ export const useEventStream = () => {
   const questionToastShownRef = React.useRef<Set<string>>(new Set());
   const notifiedMessagesRef = React.useRef<Set<string>>(new Set());
   const notifiedQuestionsRef = React.useRef<Set<string>>(new Set());
+  const serverNotificationEventSeenRef = React.useRef(false);
   const modeSwitchToastShownRef = React.useRef<Set<string>>(new Set());
   const lastUserAgentSelectionRef = React.useRef<Map<string, { created: number; messageId: string }>>(new Map());
 
@@ -404,6 +559,50 @@ export const useEventStream = () => {
     (sessionId: string, reason: string, limit?: number) => Promise<void>
   >(() => Promise.resolve());
   const scheduleReconnectRef = React.useRef<(hint?: string) => void>(() => {});
+
+  const isNotificationContextHidden = React.useCallback((isVSCodeRuntime: boolean): boolean => {
+    if (visibilityStateRef.current === 'hidden') {
+      return true;
+    }
+    if (isVSCodeRuntime && typeof document !== 'undefined') {
+      return !document.hasFocus();
+    }
+    return false;
+  }, []);
+
+  const dispatchRuntimeNotification = React.useCallback((payload: {
+    title: string;
+    body?: string;
+    tag?: string;
+    requireHidden?: boolean;
+  }) => {
+    const runtimeAPIs = getRegisteredRuntimeAPIs();
+    if (!runtimeAPIs?.notifications) {
+      return;
+    }
+
+    const title = typeof payload.title === 'string' ? payload.title.trim() : '';
+    if (!title) {
+      return;
+    }
+
+    const settings = useUIStore.getState();
+    if (!settings.nativeNotificationsEnabled) {
+      return;
+    }
+
+    const isVSCodeRuntime = Boolean(runtimeAPIs.runtime?.isVSCode);
+    const shouldRequireHidden = Boolean(payload.requireHidden) || settings.notificationMode === 'hidden-only';
+    if (shouldRequireHidden && !isNotificationContextHidden(isVSCodeRuntime)) {
+      return;
+    }
+
+    void runtimeAPIs.notifications.notifyAgentCompletion({
+      title,
+      body: typeof payload.body === 'string' ? payload.body : '',
+      tag: typeof payload.tag === 'string' ? payload.tag : undefined,
+    });
+  }, [isNotificationContextHidden]);
 
   const maybeBootstrapIfStale = React.useCallback(
     (reason: string) => {
@@ -1288,8 +1487,9 @@ export const useEventStream = () => {
         const finishCandidate = (message as { finish?: unknown }).finish;
         const finish = typeof finishCandidate === 'string' ? finishCandidate : null;
         const eventHasStopFinish = finish === 'stop';
+        const eventHasErrorFinish = finish === 'error';
 
-        if (!hasParts && !completedFromServer && !hasCompletedStatus && !eventHasStopFinish) break;
+        if (!hasParts && !completedFromServer && !hasCompletedStatus && !eventHasStopFinish && !eventHasErrorFinish) break;
 
         if ((messageExt as { role?: unknown }).role === 'assistant' && hasParts) {
           const hasQuestionTool = partsArray.some((part) => (
@@ -1311,6 +1511,44 @@ export const useEventStream = () => {
         }
 
         updateMessageInfo(sessionId, messageId, message as unknown as Message);
+
+        const messageRole = typeof (message as { role?: unknown }).role === 'string'
+          ? (message as { role: string }).role
+          : null;
+        const runtimeAPIs = getRegisteredRuntimeAPIs();
+        const shouldSynthesizeNotifications = Boolean(runtimeAPIs?.runtime?.isVSCode) && !serverNotificationEventSeenRef.current;
+        if (shouldSynthesizeNotifications && messageRole === 'assistant') {
+          const settings = useUIStore.getState();
+          const sessionInfo = useSessionStore.getState().sessions.find((entry) => entry.id === sessionId);
+          const sessionTitle = typeof sessionInfo?.title === 'string' ? sessionInfo.title.trim() : '';
+
+          if (eventHasStopFinish && settings.notifyOnCompletion !== false) {
+            const isSubtask = Boolean(sessionInfo?.parentID);
+            if (!(settings.notifyOnSubtasks === false && isSubtask)) {
+              const notificationKey = `ready:${sessionId}:${messageId}`;
+              if (!notifiedMessagesRef.current.has(notificationKey)) {
+                notifiedMessagesRef.current.add(notificationKey);
+                dispatchRuntimeNotification({
+                  title: 'Agent is ready',
+                  body: sessionTitle || 'Task completed',
+                  tag: `ready-${sessionId}`,
+                });
+              }
+            }
+          }
+
+          if (eventHasErrorFinish && settings.notifyOnError !== false) {
+            const notificationKey = `error:${sessionId}:${messageId}`;
+            if (!notifiedMessagesRef.current.has(notificationKey)) {
+              notifiedMessagesRef.current.add(notificationKey);
+              dispatchRuntimeNotification({
+                title: 'Tool error',
+                body: sessionTitle || 'An error occurred',
+                tag: `error-${sessionId}`,
+              });
+            }
+          }
+        }
 
         if (hasParts && (messageExt as { role?: unknown }).role !== 'user') {
           const storeState = useSessionStore.getState();
@@ -1472,13 +1710,31 @@ export const useEventStream = () => {
       }
 
       case 'permission.asked': {
-        if (!('sessionID' in props) || typeof props.sessionID !== 'string') {
+        const request = normalizePermissionRequest(props);
+        if (!request) {
           break;
         }
 
-        const request = props as unknown as PermissionRequest;
-
         addPermission(request);
+
+        const runtimeAPIs = getRegisteredRuntimeAPIs();
+        if (runtimeAPIs?.runtime?.isVSCode && !serverNotificationEventSeenRef.current) {
+          const settings = useUIStore.getState();
+          if (settings.notifyOnQuestion !== false) {
+            const notificationKey = `permission:${request.sessionID}:${request.id}`;
+            if (!notifiedQuestionsRef.current.has(notificationKey)) {
+              notifiedQuestionsRef.current.add(notificationKey);
+              const sessionTitle =
+                useSessionStore.getState().sessions.find((s) => s.id === request.sessionID)?.title ||
+                'Agent is waiting for your approval';
+              dispatchRuntimeNotification({
+                title: 'Permission required',
+                body: sessionTitle,
+                tag: `permission-${request.sessionID}:${request.id}`,
+              });
+            }
+          }
+        }
 
         // Notify if permission is for another session (common with child sessions).
         const toastKey = `${request.sessionID}:${request.id}`;
@@ -1509,20 +1765,58 @@ export const useEventStream = () => {
             const sessionTitle =
               useSessionStore.getState().sessions.find((s) => s.id === request.sessionID)?.title ||
               'Session';
+            const permissionBody = buildPermissionToastBody(request);
 
               import('sonner').then(({ toast }) => {
-                toast.warning('Permission required', {
-                  id: toastKey,
-                  description: sessionTitle,
-                  duration: 30000,
-                  action: {
-                    label: 'Open',
-                    onClick: () => {
-                      useUIStore.getState().setActiveMainTab('chat');
-                      void useSessionStore.getState().setCurrentSession(request.sessionID);
+                const isMobile = useUIStore.getState().isMobile;
+
+                if (isMobile) {
+                  toast.warning('Permission required', {
+                    id: toastKey,
+                    description: sessionTitle,
+                    duration: 30000,
+                    action: {
+                      label: 'Open',
+                      onClick: () => {
+                        useUIStore.getState().setActiveMainTab('chat');
+                        void useSessionStore.getState().setCurrentSession(request.sessionID);
+                      },
                     },
-                  },
-                });
+                  });
+                } else {
+                  toast.warning('Permission required', {
+                    id: toastKey,
+                    description: React.createElement(PermissionToastActions, {
+                      sessionTitle,
+                      permissionBody,
+                      onOnce: async () => {
+                        try {
+                          await useSessionStore.getState().respondToPermission(request.sessionID, request.id, 'once');
+                          toast.dismiss(toastKey);
+                        } catch (error) {
+                          console.error('Failed to respond to permission:', error);
+                        }
+                      },
+                      onAlways: async () => {
+                        try {
+                          await useSessionStore.getState().respondToPermission(request.sessionID, request.id, 'always');
+                          toast.dismiss(toastKey);
+                        } catch (error) {
+                          console.error('Failed to respond to permission:', error);
+                        }
+                      },
+                      onDeny: async () => {
+                        try {
+                          await useSessionStore.getState().respondToPermission(request.sessionID, request.id, 'reject');
+                          toast.dismiss(toastKey);
+                        } catch (error) {
+                          console.error('Failed to respond to permission:', error);
+                        }
+                      },
+                    }),
+                    duration: 30000,
+                  });
+                }
               });
 
           }, 0);
@@ -1550,9 +1844,28 @@ export const useEventStream = () => {
         const request = props as unknown as QuestionRequest;
         addQuestion(request);
 
+        const runtimeAPIs = getRegisteredRuntimeAPIs();
+        if (runtimeAPIs?.runtime?.isVSCode && !serverNotificationEventSeenRef.current) {
+          const settings = useUIStore.getState();
+          if (settings.notifyOnQuestion !== false) {
+            const notificationKey = `question:${request.sessionID}:${request.id}`;
+            if (!notifiedQuestionsRef.current.has(notificationKey)) {
+              notifiedQuestionsRef.current.add(notificationKey);
+              const firstQuestion = Array.isArray(request.questions) ? request.questions[0] : undefined;
+              const questionHeader = typeof firstQuestion?.header === 'string' ? firstQuestion.header.trim() : '';
+              const questionText = typeof firstQuestion?.question === 'string' ? firstQuestion.question.trim() : '';
+              dispatchRuntimeNotification({
+                title: questionHeader || 'Input needed',
+                body: questionText || 'Agent is waiting for your response',
+                tag: `question-${request.sessionID}:${request.id}`,
+              });
+            }
+          }
+        }
+
         const toastKey = `${request.sessionID}:${request.id}`;
 
-	        // notifications are emitted server-side (see openchamber:notification)
+	        // web/desktop use server-emitted notifications; VS Code may synthesize locally
 
         if (!questionToastShownRef.current.has(toastKey)) {
           setTimeout(() => {
@@ -1621,6 +1934,8 @@ export const useEventStream = () => {
       }
 
       case 'openchamber:notification': {
+        serverNotificationEventSeenRef.current = true;
+
         // Badge the project rail icon for non-active projects
         const notifProjectPath = typeof (props as { projectPath?: unknown }).projectPath === 'string'
           ? (props as { projectPath: string }).projectPath
@@ -1659,11 +1974,6 @@ export const useEventStream = () => {
           }
         }
 
-        // ✓ VERIFIED (US-014): notificationMode 'hidden-only' is respected via requireHidden check
-        if (requireHidden && visibilityStateRef.current !== 'hidden') {
-          break;
-        }
-
         // When the sidecar stdout notification channel is active (production desktop builds),
         // skip this SSE notification to avoid duplicating the native notification already
         // shown by the Tauri process. In dev mode the stdout channel is not available,
@@ -1672,19 +1982,7 @@ export const useEventStream = () => {
           break;
         }
 
-        // ✓ VERIFIED (US-014): nativeNotificationsEnabled is checked before dispatching notification
-        if (!nativeNotificationsEnabled) {
-          break;
-        }
-
-        // ✓ VERIFIED (US-014): Per-event toggles (notifyOnCompletion, notifyOnError, notifyOnQuestion)
-        // are handled server-side; server only emits 'openchamber:notification' events when toggles are enabled.
-        // ✓ VERIFIED (US-014): Server emits notification-relevant events only on final completion (not partial updates).
-
-        const runtimeAPIs = getRegisteredRuntimeAPIs();
-        if (runtimeAPIs?.notifications && title) {
-          void runtimeAPIs.notifications.notifyAgentCompletion({ title, body, tag });
-        }
+        dispatchRuntimeNotification({ title, body, tag, requireHidden });
 
         break;
       }
@@ -1703,7 +2001,6 @@ export const useEventStream = () => {
     }
   }, [
     currentSessionId,
-    nativeNotificationsEnabled,
     addStreamingPart,
     completeStreamingMessage,
     updateMessageInfo,
@@ -1718,13 +2015,14 @@ export const useEventStream = () => {
     trackMessage,
     reportMessage,
     requestPendingQuestionsRefresh,
-    
+
     updateSession,
     removeSessionFromStore,
     bootstrapState,
     effectiveDirectory,
     updateSessionStatus,
     resolveSessionDirectoryForStatus,
+    dispatchRuntimeNotification,
   ]);
 
   // --- Stable callback refs (Part A) ---
@@ -1839,9 +2137,7 @@ export const useEventStream = () => {
       checkConnection();
       triggerSessionStatusPoll();
 
-      // Always refresh session status on connect to detect any
-      // already-running sessions (e.g., started via CLI before UI opened)
-      // Removed: void refreshSessionStatus();
+      requestPendingPermissionsRefreshRef.current(shouldRefresh);
 
        if (shouldRefresh) {
          void stableBootstrapState('sse_reconnected');
@@ -1849,14 +2145,14 @@ export const useEventStream = () => {
          const sessionId = currentSessionIdRef.current;
          if (sessionId) {
            setTimeout(() => {
-            scheduleSoftResyncRef.current(sessionId, 'sse_reconnected', getMessageLimit())
-              .then(() => requestSessionMetadataRefresh(sessionId))
-              .catch((error: unknown) => {
-                console.warn('[useEventStream] Failed to resync messages after reconnect:', error);
-              });
-            }, 0);
-          }
-        }
+           scheduleSoftResyncRef.current(sessionId, 'sse_reconnected', getMessageLimit())
+             .then(() => requestSessionMetadataRefresh(sessionId))
+             .catch((error: unknown) => {
+               console.warn('[useEventStream] Failed to resync messages after reconnect:', error);
+             });
+           }, 0);
+         }
+       }
       };
 
     if (streamDebugEnabled()) {
@@ -2009,6 +2305,7 @@ export const useEventStream = () => {
           scheduleSoftResync(sessionId, 'visibility_restore', getMessageLimit());
           requestSessionMetadataRefresh(sessionId);
         }
+        requestPendingPermissionsRefreshRef.current(false);
 
         // Removed: void refreshSessionStatus();
         triggerSessionStatusPoll();
@@ -2037,18 +2334,20 @@ export const useEventStream = () => {
              requestSessionMetadataRefresh(sessionId);
              scheduleSoftResync(sessionId, 'window_focus', getMessageLimit());
            }
+           requestPendingPermissionsRefreshRef.current(false);
            // Removed: void refreshSessionStatus();
            triggerSessionStatusPoll();
 
-          publishStatus('connecting', 'Resuming stream');
-          startStream({ resetAttempts: true });
-        }
+           publishStatus('connecting', 'Resuming stream');
+           startStream({ resetAttempts: true });
+         }
       }
     };
 
       const handleOnline = () => {
         onlineStatusRef.current = true;
         maybeBootstrapIfStale('network_restored');
+        requestPendingPermissionsRefreshRef.current(false);
         if (pendingResumeRef.current || !unsubscribeRef.current) {
           triggerSessionStatusPoll();
           publishStatus('connecting', 'Network restored');
@@ -2079,6 +2378,7 @@ export const useEventStream = () => {
             void scheduleSoftResync(sessionId, 'page_show', getMessageLimit());
             requestSessionMetadataRefresh(sessionId);
           }
+          requestPendingPermissionsRefreshRef.current(false);
           // Removed: void refreshSessionStatus();
           triggerSessionStatusPoll();
           startStream({ resetAttempts: true });
@@ -2184,6 +2484,7 @@ export const useEventStream = () => {
       notifiedMessagesRef.current.clear();
       // eslint-disable-next-line react-hooks/exhaustive-deps -- Intentionally accessing current ref value at cleanup time
       notifiedQuestionsRef.current.clear();
+      serverNotificationEventSeenRef.current = false;
 
       pendingResumeRef.current = false;
       visibilityStateRef.current = resolveVisibilityState();

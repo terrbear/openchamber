@@ -1,3 +1,44 @@
+## [1.8.2] - 2026-03-01
+
+- Chat: improved message readability with cleaner tool/reasoning rendering and more polished markdown presentation in long responses.
+- Chat Activity: timing display is now less noisy, with detailed end timestamps shown on hover when you need them (thanks to @nelsonPires5).
+- Reliability: improved panel visibility/reconnect handling so session activity stays more consistent after hiding and reopening the extension.
+- Reliability: fixed live-streaming edge cases for event endpoints with query/trailing-slash variants, improving real-time updates across chat, session editor, and agent-manager views.
+
+## [1.8.1] - 2026-02-28
+
+- No notable changes.
+
+## [1.8.0] - 2026-02-28
+
+- Chat: improved long-session performance with virtualized message rendering, smoother scrolling, and more stable behavior in large histories (thanks to @shekohex).
+- Chat: added drag-and-drop file attachments, so dropping files from Explorer into chat is now a first-class flow (thanks to @Asuta).
+- Chat: enabled markdown rendering in user messages for clearer formatted prompts and notes (thanks to @haofeng0705).
+- Chat: pasted absolute paths are now treated as normal messages, reducing accidental command-like sends.
+- Chat: fixed queued send behavior for inactive sessions to reduce accidental sends to the wrong conversation.
+- Chat: enabled bueatiful diffs for edit tools in chat (thanks to @shekohex).
+- UI: improved long filename handling in file-mention autocomplete so results stay readable while typing (thanks to @haofeng0705).
+- Usage: added MiniMax coding-plan quota provider support for broader usage tracking coverage (thanks to @nzlov).
+- Usage: added Ollama Cloud quota provider support for broader usage tracking coverage (thanks to @iamhenry).
+
+## [1.7.5] - 2026-02-25
+
+- Sessions: improved switching performance so moving between chats feels more immediate.
+- Chat: fixed cases where messages could duplicate or disappear during active conversations.
+
+## [1.7.4] - 2026-02-24
+
+- Settings: redesigned the settings workspace with flatter, more consistent layouts so key options are easier to find.
+- Settings: grouped agents/skills navigation by subfolder to make larger setups easier to manage (thanks to @nguyenngothuong).
+- Chat: improved streaming smoothness and runtime stability with buffered updates and reliability fixes, reducing lag, stuck spinners, memory growth, and timeout-related interruptions in long runs (thanks to @nguyenngothuong).
+- Chat: draft text now persists per session, and the input supports an expanded focus mode for longer prompts (thanks to @nguyenngothuong).
+- Chat: added fullscreen Mermaid preview, improved default thinking-variant persistence, and hardened file-preview safety checks for a more predictable message experience (thanks to @yulia-ivashko).
+- Sessions: expanded folder management with subfolders, cleaner organization controls, and clearer delete confirmations (thanks to @nguyenngothuong).
+- Settings: added an MCP config manager UI to simplify editing and validating MCP server configuration (thanks to @nguyenngothuong).
+- Chat Activity: improved Structured Output tool rendering with dedicated title/icon, clearer result descriptions, and more reliable detailed expansion defaults.
+- Chat: added C, C++, and Go language support for syntax-aware rendering in code-heavy workflows (thanks to @fomenks).
+- Reliability: aligned file read/raw endpoint safety checks with other runtimes for more consistent extension behavior (thanks to @yulia-ivashko).
+
 ## [1.7.3] - 2026-02-21
 
 - Sessions: added custom folders to group chat sessions, with move/rename/delete flows and persisted collapse state per project (thanks to @nguyenngothuong).

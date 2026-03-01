@@ -20,7 +20,7 @@ import { RiAddLine, RiChatAi3Line, RiCheckLine, RiCodeLine, RiComputerLine, RiGi
 import { RiFolderLine } from '@remixicon/react';
 import { createWorktreeSession } from '@/lib/worktreeSessionCreator';
 import { formatShortcutForDisplay, getEffectiveShortcutCombo } from '@/lib/shortcuts';
-import { isVSCodeRuntime, isWebRuntime } from '@/lib/desktop';
+import { isDesktopShell, isVSCodeRuntime, isWebRuntime } from '@/lib/desktop';
 import { SETTINGS_PAGE_METADATA, SETTINGS_GROUP_LABELS, type SettingsRuntimeContext } from '@/lib/settings/metadata';
 
 export const CommandPalette: React.FC = () => {
@@ -126,8 +126,8 @@ export const CommandPalette: React.FC = () => {
   };
 
   const settingsRuntimeCtx = React.useMemo<SettingsRuntimeContext>(() => {
-    const isDesktop = typeof window !== 'undefined' && Boolean((window as unknown as { __TAURI__?: unknown }).__TAURI__);
-    return { isVSCode: isVSCodeRuntime(), isWeb: isWebRuntime(), isDesktop };
+    const isDesktop = isDesktopShell();
+    return { isVSCode: isVSCodeRuntime(), isWeb: !isDesktop && isWebRuntime(), isDesktop };
   }, []);
 
   const settingsPages = React.useMemo(() => {

@@ -249,7 +249,8 @@ const getMessageFromStore = (sessionId: string, messageId: string): { info: Mess
   return message;
 };
 
-export const useEventStream = () => {
+export const useEventStream = (options?: { enabled?: boolean }) => {
+  const enabled = options?.enabled ?? true;
   const {
     addStreamingPart,
     completeStreamingMessage,
@@ -375,9 +376,13 @@ export const useEventStream = () => {
   }, [requestPendingPermissionsRefresh]);
 
   React.useEffect(() => {
+    if (!enabled) {
+      return;
+    }
+
     requestPendingPermissionsRefresh(true);
     requestPendingQuestionsRefresh(true);
-  }, [requestPendingPermissionsRefresh, requestPendingQuestionsRefresh]);
+  }, [enabled, requestPendingPermissionsRefresh, requestPendingQuestionsRefresh]);
 
   const normalizeDirectory = React.useCallback((value: string | null | undefined): string | null => {
     if (typeof value !== 'string') return null;
@@ -2264,6 +2269,12 @@ export const useEventStream = () => {
   }, [scheduleReconnect]);
 
   React.useEffect(() => {
+    if (!enabled) {
+      stopStream();
+      publishStatus('idle', null);
+      return;
+    }
+
     if (typeof window !== 'undefined') {
       window.__messageTracker = trackMessage;
     }
@@ -2500,6 +2511,7 @@ export const useEventStream = () => {
       publishStatus('idle', null);
     };
   }, [
+    enabled,
     effectiveDirectory,
     trackMessage,
     resolveVisibilityState,

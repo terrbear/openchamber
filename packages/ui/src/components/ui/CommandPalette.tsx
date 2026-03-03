@@ -209,14 +209,14 @@ export const CommandPalette: React.FC = () => {
             <RiAddLine className="mr-2 h-4 w-4" />
             <span>New Session</span>
             <CommandShortcut>
-              {settingsAutoCreateWorktree ? shortcut('new_chat_worktree') : shortcut('new_chat')}
+              {shortcut('new_chat')}
             </CommandShortcut>
           </CommandItem>
           <CommandItem onSelect={handleCreateWorktreeSession}>
             <RiGitBranchLine className="mr-2 h-4 w-4" />
             <span>New Session with Worktree</span>
             <CommandShortcut>
-              {settingsAutoCreateWorktree ? shortcut('new_chat') : shortcut('new_chat_worktree')}
+              {shortcut('new_chat_worktree')}
             </CommandShortcut>
           </CommandItem>
           <CommandItem onSelect={handleToggleRightSidebar}>

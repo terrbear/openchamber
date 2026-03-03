@@ -1554,6 +1554,19 @@ const resolveProjectDirectory = async (req) => {
   return { directory: validated.directory, error: null };
 };
 
+const isUnsafeSkillRelativePath = (value) => {
+  if (typeof value !== 'string' || value.length === 0) {
+    return true;
+  }
+
+  const normalized = value.replace(/\\/g, '/');
+  if (path.posix.isAbsolute(normalized)) {
+    return true;
+  }
+
+  return normalized.split('/').some((segment) => segment === '..');
+};
+
 const resolveOptionalProjectDirectory = async (req) => {
   const headerDirectory = typeof req.get === 'function' ? req.get('x-opencode-directory') : null;
   const queryDirectory = Array.isArray(req.query?.directory)
@@ -2060,6 +2073,15 @@ const sanitizeSettingsUpdate = (payload) => {
     if (mode === 'collapsed' || mode === 'activity' || mode === 'detailed') {
       result.toolCallExpansion = mode;
     }
+  }
+  if (typeof candidate.userMessageRenderingMode === 'string') {
+    const mode = candidate.userMessageRenderingMode.trim();
+    if (mode === 'markdown' || mode === 'plain') {
+      result.userMessageRenderingMode = mode;
+    }
+  }
+  if (typeof candidate.stickyUserHeader === 'boolean') {
+    result.stickyUserHeader = candidate.stickyUserHeader;
   }
   if (typeof candidate.fontSize === 'number' && Number.isFinite(candidate.fontSize)) {
     result.fontSize = Math.max(50, Math.min(200, Math.round(candidate.fontSize)));
@@ -7667,7 +7689,9 @@ async function main(options = {}) {
 
   // Voice token endpoint - returns OpenAI TTS availability status
   app.post('/api/voice/token', async (req, res) => {
-    console.log('[Voice] Token request received:', { body: req.body, headers: req.headers['content-type'] });
+    console.log('[Voice] Token request received:', {
+      contentType: req.headers['content-type'] || null,
+    });
     try {
       const openaiApiKey = process.env.OPENAI_API_KEY;
       console.log('[Voice] OpenAI API Key present:', !!openaiApiKey);
@@ -10163,6 +10187,9 @@ async function main(options = {}) {
     try {
       const skillName = req.params.name;
       const filePath = decodeURIComponent(req.params.filePath); // Decode URL-encoded path
+      if (isUnsafeSkillRelativePath(filePath)) {
+        return res.status(400).json({ error: 'Invalid file path' });
+      }
       const { directory, error } = await resolveProjectDirectory(req);
       if (!directory) {
         return res.status(400).json({ error });
@@ -10182,6 +10209,9 @@ async function main(options = {}) {
 
       res.json({ path: filePath, content });
     } catch (error) {
+      if (error && typeof error === 'object' && (error.code === 'EACCES' || error.code === 'EPERM')) {
+        return res.status(403).json({ error: 'Access to file denied' });
+      }
       console.error('Failed to read skill file:', error);
       res.status(500).json({ error: 'Failed to read skill file' });
     }
@@ -10248,6 +10278,9 @@ async function main(options = {}) {
     try {
       const skillName = req.params.name;
       const filePath = decodeURIComponent(req.params.filePath); // Decode URL-encoded path
+      if (isUnsafeSkillRelativePath(filePath)) {
+        return res.status(400).json({ error: 'Invalid file path' });
+      }
       const { content } = req.body;
       const { directory, error } = await resolveProjectDirectory(req);
       if (!directory) {
@@ -10268,6 +10301,9 @@ async function main(options = {}) {
         message: `File ${filePath} saved successfully`,
       });
     } catch (error) {
+      if (error && typeof error === 'object' && (error.code === 'EACCES' || error.code === 'EPERM')) {
+        return res.status(403).json({ error: 'Access to file denied' });
+      }
       console.error('Failed to write skill file:', error);
       res.status(500).json({ error: error.message || 'Failed to write skill file' });
     }
@@ -10278,6 +10314,9 @@ async function main(options = {}) {
     try {
       const skillName = req.params.name;
       const filePath = decodeURIComponent(req.params.filePath); // Decode URL-encoded path
+      if (isUnsafeSkillRelativePath(filePath)) {
+        return res.status(400).json({ error: 'Invalid file path' });
+      }
       const { directory, error } = await resolveProjectDirectory(req);
       if (!directory) {
         return res.status(400).json({ error });
@@ -10297,6 +10336,9 @@ async function main(options = {}) {
         message: `File ${filePath} deleted successfully`,
       });
     } catch (error) {
+      if (error && typeof error === 'object' && (error.code === 'EACCES' || error.code === 'EPERM')) {
+        return res.status(403).json({ error: 'Access to file denied' });
+      }
       console.error('Failed to delete skill file:', error);
       res.status(500).json({ error: error.message || 'Failed to delete skill file' });
     }
@@ -13682,7 +13724,8 @@ async function main(options = {}) {
     const handleUpgrade = async () => {
       try {
         if (uiAuthController?.enabled) {
-          const sessionToken = uiAuthController?.ensureSessionToken?.(req, null);
+          // Must be awaited: this call performs async token verification.
+          const sessionToken = await uiAuthController?.ensureSessionToken?.(req, null);
           if (!sessionToken) {
             rejectWebSocketUpgrade(socket, 401, 'UI authentication required');
             return;

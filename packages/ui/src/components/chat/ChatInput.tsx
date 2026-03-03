@@ -4,10 +4,13 @@ import {
     RiAddCircleLine,
     RiAiAgentLine,
     RiAttachment2,
+    RiCloseLine,
     RiCommandLine,
+    RiExternalLinkLine,
     RiFileUploadLine,
     RiPauseLine,
     RiFullscreenLine,
+    RiGithubLine,
     RiSendPlane2Line,
 } from '@remixicon/react';
 import { BrowserVoiceButton } from '@/components/voice';
@@ -49,6 +52,7 @@ import {
     DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { useThemeSystem } from '@/contexts/useThemeSystem';
+import { GitHubIssuePickerDialog } from '@/components/session/GitHubIssuePickerDialog';
 
 const MAX_VISIBLE_TEXTAREA_LINES = 8;
 const EMPTY_QUEUE: QueuedMessage[] = [];
@@ -158,6 +162,16 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
     const [autocompleteOverlayPosition, setAutocompleteOverlayPosition] = React.useState<AutocompleteOverlayPosition | null>(null);
     const abortTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
     const prevWasAbortedRef = React.useRef(false);
+
+    // Issue linking state (for draft sessions)
+    const [issuePickerOpen, setIssuePickerOpen] = React.useState(false);
+    const [linkedIssue, setLinkedIssue] = React.useState<{ 
+        number: number; 
+        title: string; 
+        url: string; 
+        contextText: string;
+        author?: { login: string; avatarUrl?: string };
+    } | null>(null);
 
     // Message queue
     const queueModeEnabled = useMessageQueueStore((state) => state.queueModeEnabled);
@@ -595,6 +609,15 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             }
         }
 
+        // Add linked issue as synthetic part (only the parts with synthetic: true)
+        // The text part (synthetic: false) is completely dropped per requirements
+        if (linkedIssue && newSessionDraftOpen) {
+            additionalParts.push({
+                text: linkedIssue.contextText,
+                synthetic: true,
+            });
+        }
+
         if (!primaryText && additionalParts.length === 0) return;
 
         // Clear queue and input
@@ -666,7 +689,12 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             additionalParts.length > 0 ? additionalParts : undefined,
             currentVariant,
             inputMode
-        ).catch((error: unknown) => {
+        ).then(() => {
+            // Clear linked issue after successful message send in draft mode
+            if (linkedIssue && newSessionDraftOpen) {
+                setLinkedIssue(null);
+            }
+        }).catch((error: unknown) => {
             const rawMessage =
                 error instanceof Error
                     ? error.message
@@ -715,6 +743,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
         }
     };
 
+    // Update ref with latest handleSubmit on every render
     handleSubmitRef.current = handleSubmit;
 
     // Primary action for send button - respects queue mode setting
@@ -2207,6 +2236,70 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                         </div>
                     </div>
                 )}
+
+                {/* Linked Issue Button - only in draft mode */}
+                {newSessionDraftOpen && (
+                    <div className="pb-2 w-full px-1">
+                        {linkedIssue ? (
+                            <button
+                                type="button"
+                                onClick={() => setIssuePickerOpen(true)}
+                                className="flex w-full items-center gap-1.5 text-sm hover:opacity-80 transition-opacity text-left h-5 px-1"
+                            >
+                                {linkedIssue.author?.avatarUrl && (
+                                    <img 
+                                        src={linkedIssue.author.avatarUrl} 
+                                        alt={linkedIssue.author.login}
+                                        className="h-5 w-5 rounded-full flex-shrink-0"
+                                    />
+                                )}
+                                <span className="text-muted-foreground flex-shrink-0">
+                                    #{linkedIssue.number}
+                                    {linkedIssue.author && (
+                                        <span className="ml-1">by {linkedIssue.author.login}</span>
+                                    )}
+                                </span>
+                                <span className="text-foreground truncate">
+                                    {linkedIssue.title}
+                                </span>
+                                <span className="flex items-center gap-0.5 flex-shrink-0">
+                                    <a
+                                        href={linkedIssue.url}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        onClick={(e) => e.stopPropagation()}
+                                        className="flex items-center justify-center h-6 w-6 hover:bg-[var(--interactive-hover)] rounded-full transition-colors"
+                                        aria-label="Open issue in browser"
+                                    >
+                                        <RiExternalLinkLine className="h-4 w-4 text-muted-foreground" />
+                                    </a>
+                                    <span
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            setLinkedIssue(null);
+                                        }}
+                                        className="flex items-center justify-center h-6 w-6 hover:bg-[var(--interactive-hover)] rounded-full transition-colors cursor-pointer"
+                                        aria-label="Remove linked issue"
+                                    >
+                                        <RiCloseLine className="h-4 w-4 text-muted-foreground" />
+                                    </span>
+                                </span>
+                            </button>
+                        ) : (
+                            <button
+                                type="button"
+                                onClick={() => setIssuePickerOpen(true)}
+                                className="flex w-full items-center gap-1.5 text-sm hover:opacity-80 transition-opacity text-left h-5 px-1"
+                            >
+                                <RiGithubLine 
+                                    className="h-4 w-4 flex-shrink-0" 
+                                    style={{ color: currentTheme?.colors?.status?.success }} 
+                                />
+                                <span className="text-muted-foreground">Link GitHub Issue</span>
+                            </button>
+                        )}
+                    </div>
+                )}
                 <div
                     className={cn(
                         "flex flex-col relative overflow-visible",
@@ -2451,6 +2544,14 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                 </div>
             </div>
         </form>
+
+        {/* Issue Picker Dialog */}
+        <GitHubIssuePickerDialog
+            open={issuePickerOpen}
+            onOpenChange={setIssuePickerOpen}
+            mode="select"
+            onSelect={(issue) => setLinkedIssue(issue)}
+        />
         </>
     );
 };

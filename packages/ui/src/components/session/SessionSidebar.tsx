@@ -14,6 +14,7 @@ import {
   useDraggable,
   useDroppable,
   type DragEndEvent,
+  type Modifier,
 } from '@dnd-kit/core';
 import {
   SortableContext,
@@ -77,7 +78,6 @@ import {
   RiPencilAiLine,
   RiSearchLine,
   RiPushpinLine,
-  RiSearchLine,
   RiShare2Line,
   RiShieldLine,
   RiUnpinLine,
@@ -773,7 +773,29 @@ const SortableGroupItemBase: React.FC<{
 
 const SortableGroupItem = React.memo(SortableGroupItemBase);
 
+const centerDragOverlayUnderPointer: Modifier = ({ activatorEvent, draggingNodeRect, transform }) => {
+  if (!activatorEvent || !draggingNodeRect) {
+    return transform;
+  }
+  const event = activatorEvent as PointerEvent;
+  return {
+    ...transform,
+    x: transform.x + (event.clientX - draggingNodeRect.left - draggingNodeRect.width / 2),
+    y: transform.y + (event.clientY - draggingNodeRect.top - draggingNodeRect.height / 2),
+  };
+};
 
+const GroupDragOverlay: React.FC<{ label: string; showBranchIcon: boolean; width?: number }> = ({ label, showBranchIcon, width }) => (
+  <div
+    style={{ width: width ? `${width}px` : 'auto' }}
+    className="flex items-center rounded-lg border border-[var(--interactive-border)] bg-[var(--surface-elevated)] px-2.5 py-1 shadow-none pointer-events-none"
+  >
+    {showBranchIcon && <RiGitBranchLine className="h-4 w-4 text-muted-foreground mr-2 flex-shrink-0" />}
+    <div className="min-w-0 flex-1 truncate typography-ui-label font-normal text-foreground">
+      {label}
+    </div>
+  </div>
+);
 
 interface SessionSidebarProps {
   mobileVariant?: boolean;
@@ -832,6 +854,8 @@ export const SessionSidebar: React.FC<SessionSidebarProps> = ({
     subFolderCount: number;
     sessionCount: number;
   } | null>(null);
+  const [activeDraggedGroupId, setActiveDraggedGroupId] = React.useState<string | null>(null);
+  const [activeDraggedGroupWidth, setActiveDraggedGroupWidth] = React.useState<number | null>(null);
   const [pinnedSessionIds, setPinnedSessionIds] = React.useState<Set<string>>(() => {
     try {
       const raw = getSafeStorage().getItem(SESSION_PINNED_STORAGE_KEY);

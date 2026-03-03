@@ -5,7 +5,6 @@ import { useConfigStore } from '@/stores/useConfigStore';
 import { isDesktopShell, isVSCodeRuntime } from '@/lib/desktop';
 import { updateDesktopSettings } from '@/lib/persistence';
 import { useDeviceInfo } from '@/lib/device';
-import { updateDesktopSettings } from '@/lib/persistence';
 import { Checkbox } from '@/components/ui/checkbox';
 import { toast } from '@/components/ui';
 import { getRegisteredRuntimeAPIs } from '@/contexts/runtimeAPIRegistry';

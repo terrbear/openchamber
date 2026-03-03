@@ -64,6 +64,7 @@ import { useNotificationCenterStore, getUnreadCount } from '@/stores/useNotifica
 import { ProjectEditDialog } from '@/components/layout/ProjectEditDialog';
 import { GridLoader } from '@/components/ui/grid-loader';
 import { PROJECT_ICON_MAP, PROJECT_COLOR_MAP } from '@/lib/projectMeta';
+import { useDiffFileCount } from '@/components/views';
 
 
 const isSameContextUsage = (
@@ -1413,7 +1414,7 @@ export const Header: React.FC<HeaderProps> = ({
                 <button
                   type="button"
                   aria-label="Notifications"
-                  className={cn(headerIconButtonClass, 'relative')}
+                  className={cn(desktopHeaderIconButtonClass, 'relative')}
                 >
                   <RiNotification3Line className="h-5 w-5" />
                   {unreadNotificationCount > 0 && (
@@ -1927,9 +1928,9 @@ export const Header: React.FC<HeaderProps> = ({
               <TooltipTrigger asChild>
                 <button
                   type="button"
-                  onClick={handleOpenSettings}
+                  onClick={() => useUIStore.getState().setSettingsDialogOpen(true)}
                   aria-label="Open settings"
-                  className={cn(headerIconButtonClass, 'relative')}
+                  className={cn(mobileHeaderIconButtonClass, 'relative')}
                 >
                   <RiSettings3Line className="h-5 w-5" />
                 </button>

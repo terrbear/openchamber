@@ -64,8 +64,6 @@ const OPENCHAMBER_VERSION = (() => {
   return 'unknown';
 })();
 const fsPromises = fs.promises;
-const DEFAULT_FILE_SEARCH_LIMIT = 60;
-const MAX_FILE_SEARCH_LIMIT = 400;
 const FILE_SEARCH_MAX_CONCURRENCY = 5;
 const FILE_SEARCH_EXCLUDED_DIRS = new Set([
   'node_modules',
@@ -790,6 +788,36 @@ const resolveZenModel = async (override) => {
   return validatedZenFallback || ZEN_DEFAULT_MODEL;
 };
 
+const validateZenModelAtStartup = async () => {
+  try {
+    const freeModels = await fetchFreeZenModels();
+    const freeModelIds = freeModels.map((m) => m.id);
+
+    if (freeModelIds.length > 0) {
+      validatedZenFallback = freeModelIds[0];
+
+      const settings = await readSettingsFromDisk();
+      const storedModel = typeof settings?.zenModel === 'string' ? settings.zenModel.trim() : '';
+
+      if (!storedModel || !freeModelIds.includes(storedModel)) {
+        const fallback = freeModelIds[0];
+        console.log(
+          storedModel
+            ? `[zen] Stored model "${storedModel}" not found in free models, falling back to "${fallback}"`
+            : `[zen] No model configured, setting default to "${fallback}"`
+        );
+        await persistSettings({ zenModel: fallback });
+      } else {
+        console.log(`[zen] Stored model "${storedModel}" verified as available`);
+      }
+    } else {
+      console.warn('[zen] No free models returned from API, skipping validation');
+    }
+  } catch (error) {
+    console.warn('[zen] Startup model validation failed (non-blocking):', error?.message || error);
+  }
+};
+
 
 const summarizeText = async (text, targetLength, zenModel) => {
   if (!text || typeof text !== 'string' || text.trim().length === 0) return text;
@@ -1155,6 +1183,11 @@ const PROJECT_ICON_EXTENSION_TO_MIME = Object.fromEntries(
 );
 const PROJECT_ICON_SUPPORTED_MIMES = new Set(Object.keys(PROJECT_ICON_MIME_TO_EXTENSION));
 const PROJECT_ICON_MAX_BYTES = 5 * 1024 * 1024;
+const PROJECT_ICON_THEME_COLORS = {
+  light: '#111111',
+  dark: '#f5f5f5',
+};
+const PROJECT_ICON_HEX_COLOR_PATTERN = /^#(?:[\da-fA-F]{3}|[\da-fA-F]{4}|[\da-fA-F]{6}|[\da-fA-F]{8})$/;
 
 const normalizeProjectIconMime = (value) => {
   if (typeof value !== 'string') {
@@ -1235,6 +1268,54 @@ const parseProjectIconDataUrl = (value) => {
   } catch {
     return { ok: false, error: 'Failed to decode icon data' };
   }
+};
+
+const normalizeProjectIconThemeVariant = (value) => {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'light' || normalized === 'dark') {
+    return normalized;
+  }
+  return null;
+};
+
+const normalizeProjectIconColor = (value) => {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const normalized = value.trim();
+  if (!PROJECT_ICON_HEX_COLOR_PATTERN.test(normalized)) {
+    return null;
+  }
+  return normalized;
+};
+
+const applyProjectIconSvgTheme = (svgMarkup, themeVariant, iconColor) => {
+  if (typeof svgMarkup !== 'string') {
+    return svgMarkup;
+  }
+
+  const color = iconColor || PROJECT_ICON_THEME_COLORS[themeVariant];
+  if (!color) {
+    return svgMarkup;
+  }
+
+  const svgTagIndex = svgMarkup.search(/<svg\b/i);
+  if (svgTagIndex === -1) {
+    return svgMarkup;
+  }
+
+  const svgOpenTagEndIndex = svgMarkup.indexOf('>', svgTagIndex);
+  if (svgOpenTagEndIndex === -1) {
+    return svgMarkup;
+  }
+
+  const overrideStyle = `<style data-openchamber-theme-icon="1">:root{color:${color}!important;}</style>`;
+  return `${svgMarkup.slice(0, svgOpenTagEndIndex + 1)}${overrideStyle}${svgMarkup.slice(svgOpenTagEndIndex + 1)}`;
 };
 
 const findProjectById = (settings, projectId) => {
@@ -1823,6 +1904,20 @@ const sanitizeConnections = (input) => {
   return result;
 };
 
+const DEFAULT_PWA_APP_NAME = 'OpenChamber - AI Coding Assistant';
+const PWA_APP_NAME_MAX_LENGTH = 64;
+
+const normalizePwaAppName = (value, fallback = '') => {
+  if (typeof value !== 'string') {
+    return fallback;
+  }
+  const normalized = value.trim().replace(/\s+/g, ' ');
+  if (!normalized) {
+    return fallback;
+  }
+  return normalized.slice(0, PWA_APP_NAME_MAX_LENGTH);
+};
+
 const sanitizeSettingsUpdate = (payload) => {
   if (!payload || typeof payload !== 'object') {
     return {};
@@ -1845,6 +1940,18 @@ const sanitizeSettingsUpdate = (payload) => {
   }
   if (typeof candidate.darkThemeId === 'string' && candidate.darkThemeId.length > 0) {
     result.darkThemeId = candidate.darkThemeId;
+  }
+  if (typeof candidate.splashBgLight === 'string' && candidate.splashBgLight.trim().length > 0) {
+    result.splashBgLight = candidate.splashBgLight.trim();
+  }
+  if (typeof candidate.splashFgLight === 'string' && candidate.splashFgLight.trim().length > 0) {
+    result.splashFgLight = candidate.splashFgLight.trim();
+  }
+  if (typeof candidate.splashBgDark === 'string' && candidate.splashBgDark.trim().length > 0) {
+    result.splashBgDark = candidate.splashBgDark.trim();
+  }
+  if (typeof candidate.splashFgDark === 'string' && candidate.splashFgDark.trim().length > 0) {
+    result.splashFgDark = candidate.splashFgDark.trim();
   }
   if (typeof candidate.lastDirectory === 'string' && candidate.lastDirectory.length > 0) {
     result.lastDirectory = candidate.lastDirectory;
@@ -2068,11 +2175,17 @@ const sanitizeSettingsUpdate = (payload) => {
     const trimmed = candidate.gitModelId.trim();
     result.gitModelId = trimmed.length > 0 ? trimmed : undefined;
   }
+  if (typeof candidate.pwaAppName === 'string') {
+    result.pwaAppName = normalizePwaAppName(candidate.pwaAppName, undefined);
+  }
   if (typeof candidate.toolCallExpansion === 'string') {
     const mode = candidate.toolCallExpansion.trim();
-    if (mode === 'collapsed' || mode === 'activity' || mode === 'detailed') {
+    if (mode === 'collapsed' || mode === 'activity' || mode === 'detailed' || mode === 'changes') {
       result.toolCallExpansion = mode;
     }
+  }
+  if (typeof candidate.inputSpellcheckEnabled === 'boolean') {
+    result.inputSpellcheckEnabled = candidate.inputSpellcheckEnabled;
   }
   if (typeof candidate.userMessageRenderingMode === 'string') {
     const mode = candidate.userMessageRenderingMode.trim();
@@ -2358,10 +2471,12 @@ const formatSettingsResponse = (settings) => {
   const approved = normalizeStringArray(settings.approvedDirectories);
   const bookmarks = normalizeStringArray(settings.securityScopedBookmarks);
   const hasNamedTunnelToken = typeof settings?.namedTunnelToken === 'string' && settings.namedTunnelToken.trim().length > 0;
+  const pwaAppName = normalizePwaAppName(settings?.pwaAppName, '');
 
   return {
     ...sanitized,
     hasNamedTunnelToken,
+    ...(pwaAppName ? { pwaAppName } : {}),
     approvedDirectories: approved,
     securityScopedBookmarks: bookmarks,
     pinnedDirectories: normalizeStringArray(settings.pinnedDirectories),
@@ -6353,6 +6468,72 @@ async function refreshOpenCodeAfterConfigChange(reason, options = {}) {
   }
 }
 
+async function bootstrapOpenCodeAtStartup() {
+  try {
+    syncFromHmrState();
+    if (await isOpenCodeProcessHealthy()) {
+      console.log(`[HMR] Reusing existing OpenCode process on port ${openCodePort}`);
+    } else if (ENV_SKIP_OPENCODE_START && ENV_EFFECTIVE_PORT) {
+      const label = ENV_CONFIGURED_OPENCODE_HOST ? ENV_CONFIGURED_OPENCODE_HOST.origin : `http://localhost:${ENV_EFFECTIVE_PORT}`;
+      console.log(`Using external OpenCode server at ${label} (skip-start mode)`);
+      openCodeBaseUrl = ENV_CONFIGURED_OPENCODE_HOST?.origin ?? null;
+      setOpenCodePort(ENV_EFFECTIVE_PORT);
+      isOpenCodeReady = true;
+      isExternalOpenCode = true;
+      lastOpenCodeError = null;
+      openCodeNotReadySince = 0;
+      syncToHmrState();
+    } else if (ENV_EFFECTIVE_PORT && await probeExternalOpenCode(ENV_EFFECTIVE_PORT, ENV_CONFIGURED_OPENCODE_HOST?.origin)) {
+      const label = ENV_CONFIGURED_OPENCODE_HOST ? ENV_CONFIGURED_OPENCODE_HOST.origin : `http://localhost:${ENV_EFFECTIVE_PORT}`;
+      console.log(`Auto-detected existing OpenCode server at ${label}`);
+      openCodeBaseUrl = ENV_CONFIGURED_OPENCODE_HOST?.origin ?? null;
+      setOpenCodePort(ENV_EFFECTIVE_PORT);
+      isOpenCodeReady = true;
+      isExternalOpenCode = true;
+      lastOpenCodeError = null;
+      openCodeNotReadySince = 0;
+      syncToHmrState();
+    } else if (!ENV_EFFECTIVE_PORT && await probeExternalOpenCode(4096)) {
+      console.log('Auto-detected existing OpenCode server on default port 4096');
+      setOpenCodePort(4096);
+      isOpenCodeReady = true;
+      isExternalOpenCode = true;
+      lastOpenCodeError = null;
+      openCodeNotReadySince = 0;
+      syncToHmrState();
+    } else {
+      if (ENV_EFFECTIVE_PORT) {
+        console.log(`Using OpenCode port from environment: ${ENV_EFFECTIVE_PORT}`);
+        setOpenCodePort(ENV_EFFECTIVE_PORT);
+      } else {
+        openCodePort = null;
+        syncToHmrState();
+      }
+
+      lastOpenCodeError = null;
+      openCodeProcess = await startOpenCode();
+      syncToHmrState();
+    }
+    await waitForOpenCodePort();
+    try {
+      await waitForOpenCodeReady();
+    } catch (error) {
+      console.error(`OpenCode readiness check failed: ${error.message}`);
+      scheduleOpenCodeApiDetection();
+    }
+    scheduleOpenCodeApiDetection();
+    startHealthMonitoring();
+    void startGlobalEventWatcher().catch((error) => {
+      console.warn(`Global event watcher startup failed: ${error?.message || error}`);
+    });
+  } catch (error) {
+    console.error(`Failed to start OpenCode: ${error.message}`);
+    console.log('Continuing without OpenCode integration...');
+    lastOpenCodeError = error.message;
+    scheduleOpenCodeApiDetection();
+  }
+}
+
 function setupProxy(app) {
   if (app.get('opencodeProxyConfigured')) {
     return;
@@ -7367,35 +7548,8 @@ async function main(options = {}) {
     sayTTSCapability = { available: false, voices: [], reason: 'Not macOS' };
   }
 
-  // Validate stored zen model at startup – best-effort, never blocks startup
-  try {
-    const freeModels = await fetchFreeZenModels();
-    const freeModelIds = freeModels.map((m) => m.id);
-
-    if (freeModelIds.length > 0) {
-      // Set the validated fallback to the first available free model
-      validatedZenFallback = freeModelIds[0];
-
-      const settings = await readSettingsFromDisk();
-      const storedModel = typeof settings?.zenModel === 'string' ? settings.zenModel.trim() : '';
-
-      if (!storedModel || !freeModelIds.includes(storedModel)) {
-        const fallback = freeModelIds[0];
-        console.log(
-          storedModel
-            ? `[zen] Stored model "${storedModel}" not found in free models, falling back to "${fallback}"`
-            : `[zen] No model configured, setting default to "${fallback}"`
-        );
-        await persistSettings({ zenModel: fallback });
-      } else {
-        console.log(`[zen] Stored model "${storedModel}" verified as available`);
-      }
-    } else {
-      console.warn('[zen] No free models returned from API, skipping validation');
-    }
-  } catch (error) {
-    console.warn('[zen] Startup model validation failed (non-blocking):', error?.message || error);
-  }
+  // Startup model validation is best-effort and runs in background.
+  void validateZenModelAtStartup();
 
   const app = express();
   const serverStartedAt = new Date().toISOString();
@@ -9114,11 +9268,34 @@ async function main(options = {}) {
         ? [preferredPath, ...projectIconPathCandidates(projectId).filter((candidate) => candidate !== preferredPath)]
         : projectIconPathCandidates(projectId);
 
+      const themeQuery = Array.isArray(req.query?.theme) ? req.query.theme[0] : req.query?.theme;
+      const requestedThemeVariant = normalizeProjectIconThemeVariant(themeQuery);
+      const iconColorQuery = Array.isArray(req.query?.iconColor) ? req.query.iconColor[0] : req.query?.iconColor;
+      const requestedIconColor = normalizeProjectIconColor(iconColorQuery);
+
       for (const iconPath of candidates) {
         try {
           const data = await fsPromises.readFile(iconPath);
           const ext = path.extname(iconPath).slice(1).toLowerCase();
-          const contentType = metadataMime || PROJECT_ICON_EXTENSION_TO_MIME[ext] || 'application/octet-stream';
+          const resolvedMime = metadataMime || PROJECT_ICON_EXTENSION_TO_MIME[ext] || 'application/octet-stream';
+          const contentType = resolvedMime === 'image/svg+xml' ? 'image/svg+xml; charset=utf-8' : resolvedMime;
+
+          if (resolvedMime === 'image/svg+xml' && requestedThemeVariant) {
+            const svgMarkup = data.toString('utf8');
+            const themedSvgMarkup = applyProjectIconSvgTheme(svgMarkup, requestedThemeVariant, requestedIconColor);
+            res.setHeader('Content-Type', contentType);
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+            return res.send(themedSvgMarkup);
+          }
+
+          if (resolvedMime === 'image/svg+xml' && requestedIconColor) {
+            const svgMarkup = data.toString('utf8');
+            const themedSvgMarkup = applyProjectIconSvgTheme(svgMarkup, requestedThemeVariant, requestedIconColor);
+            res.setHeader('Content-Type', contentType);
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+            return res.send(themedSvgMarkup);
+          }
+
           res.setHeader('Content-Type', contentType);
           res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
           return res.send(data);
@@ -10672,36 +10849,40 @@ async function main(options = {}) {
         return res.json({ connected: true, repo: null, branch, pr: null, checks: null, canMerge: false });
       }
 
-       // Determine the head owner for PR search
-       // Priority: 1) tracking branch remote, 2) origin (if different from target), 3) target repo owner
-       let headOwnerForSearch = null;
-       
-       // First, check the branch's tracking info to see which remote it's on
+       let originRepo = null;
+       if (remote !== 'origin') {
+         const originResolved = await resolveGitHubRepoFromDirectory(directory, 'origin').catch(() => ({ repo: null }));
+         originRepo = originResolved?.repo || null;
+       }
+
+       const candidateHeadOwners = [];
+       const pushHeadOwner = (owner) => {
+         if (typeof owner !== 'string') return;
+         const normalized = owner.trim();
+         if (!normalized) return;
+         if (candidateHeadOwners.includes(normalized)) return;
+         candidateHeadOwners.push(normalized);
+       };
+
+       // First, use branch tracking remote owner (where branch is usually pushed).
        const { getStatus } = await import('./lib/git/index.js');
        const status = await getStatus(directory).catch(() => null);
        if (status?.tracking) {
          const trackingRemote = status.tracking.split('/')[0];
-         if (trackingRemote && trackingRemote !== remote) {
-           // Branch is tracked on a different remote - get that remote's owner
-           const { repo: trackingRepo } = await resolveGitHubRepoFromDirectory(directory, trackingRemote);
-           if (trackingRepo && trackingRepo.owner !== repo.owner) {
-             headOwnerForSearch = trackingRepo.owner;
-           }
-         }
-       }
-       
-       // Fallback: if targeting non-origin, check if origin has a different owner (fork scenario)
-       if (!headOwnerForSearch && remote !== 'origin') {
-         const { repo: originRepo } = await resolveGitHubRepoFromDirectory(directory, 'origin');
-         if (originRepo && originRepo.owner !== repo.owner) {
-           headOwnerForSearch = originRepo.owner;
+         if (trackingRemote) {
+           const trackingResolved = await resolveGitHubRepoFromDirectory(directory, trackingRemote).catch(() => ({ repo: null }));
+           pushHeadOwner(trackingResolved?.repo?.owner);
          }
        }
 
-       const listByHead = async (state, headOwner = repo.owner) => {
+       // Then same-repo and origin fallback owners.
+       pushHeadOwner(repo.owner);
+       pushHeadOwner(originRepo?.owner);
+
+       const listByHead = async (targetRepo, state, headOwner) => {
          const resp = await octokit.rest.pulls.list({
-           owner: repo.owner,
-           repo: repo.repo,
+           owner: targetRepo.owner,
+           repo: targetRepo.repo,
            state,
            head: `${headOwner}:${branch}`,
            per_page: 10,
@@ -10709,10 +10890,10 @@ async function main(options = {}) {
          return Array.isArray(resp?.data) ? resp.data[0] : null;
        };
 
-       const listByHeadRef = async (state) => {
+       const listByHeadRef = async (targetRepo, state) => {
          const resp = await octokit.rest.pulls.list({
-           owner: repo.owner,
-           repo: repo.repo,
+           owner: targetRepo.owner,
+           repo: targetRepo.repo,
            state,
            per_page: 100,
          });
@@ -10722,34 +10903,41 @@ async function main(options = {}) {
          return matches[0] ?? null;
        };
 
-       // PR status by branch:
-       // - Prefer open PRs.
-       // - If none, also surface closed/merged PRs.
-       // - For cross-repo PRs: first try with head owner, then fall back to target owner, then ref match.
-       let first = null;
-       
-       // For cross-repo workflows, try head owner first
-       if (headOwnerForSearch) {
-         first = await listByHead('open', headOwnerForSearch);
-         if (!first) first = await listByHead('closed', headOwnerForSearch);
+       const tryFindPr = async (targetRepo) => {
+         let found = null;
+         for (const owner of candidateHeadOwners) {
+           found = await listByHead(targetRepo, 'open', owner);
+           if (found) return found;
+           found = await listByHead(targetRepo, 'closed', owner);
+           if (found) return found;
+         }
+         found = await listByHeadRef(targetRepo, 'open');
+         if (found) return found;
+         return listByHeadRef(targetRepo, 'closed');
+       };
+
+       // Try requested remote target repo first, then origin target repo fallback for fork flows.
+       let searchRepo = repo;
+       let first = await tryFindPr(searchRepo);
+       if (!first && originRepo) {
+         const isDifferentRepo = originRepo.owner !== repo.owner || originRepo.repo !== repo.repo;
+         if (isDifferentRepo) {
+           const originMatch = await tryFindPr(originRepo);
+           if (originMatch) {
+             first = originMatch;
+             searchRepo = originRepo;
+           }
+         }
        }
-       
-       // Try with target repo owner (same-repo PRs)
-       if (!first) first = await listByHead('open');
-       if (!first) first = await listByHead('closed');
-       
-       // Fall back to matching head.ref directly (handles edge cases)
-       if (!first) first = await listByHeadRef('open');
-       if (!first) first = await listByHeadRef('closed');
       if (!first) {
-        return res.json({ connected: true, repo, branch, pr: null, checks: null, canMerge: false });
+        return res.json({ connected: true, repo: searchRepo, branch, pr: null, checks: null, canMerge: false });
       }
 
       // Enrich with mergeability fields
-      const prFull = await octokit.rest.pulls.get({ owner: repo.owner, repo: repo.repo, pull_number: first.number });
+      const prFull = await octokit.rest.pulls.get({ owner: searchRepo.owner, repo: searchRepo.repo, pull_number: first.number });
       const prData = prFull?.data;
       if (!prData) {
-        return res.json({ connected: true, repo, branch, pr: null, checks: null, canMerge: false });
+        return res.json({ connected: true, repo: searchRepo, branch, pr: null, checks: null, canMerge: false });
       }
 
       // Checks summary: prefer check-runs (Actions), fallback to classic statuses.
@@ -10758,8 +10946,8 @@ async function main(options = {}) {
       if (sha) {
         try {
           const runs = await octokit.rest.checks.listForRef({
-            owner: repo.owner,
-            repo: repo.repo,
+            owner: searchRepo.owner,
+            repo: searchRepo.repo,
             ref: sha,
             per_page: 100,
           });
@@ -10796,8 +10984,8 @@ async function main(options = {}) {
         if (!checks) {
           try {
             const combined = await octokit.rest.repos.getCombinedStatusForRef({
-              owner: repo.owner,
-              repo: repo.repo,
+              owner: searchRepo.owner,
+              repo: searchRepo.repo,
               ref: sha,
             });
             const statuses = Array.isArray(combined?.data?.statuses) ? combined.data.statuses : [];
@@ -10825,8 +11013,8 @@ async function main(options = {}) {
         const username = auth?.user?.login;
         if (username) {
           const perm = await octokit.rest.repos.getCollaboratorPermissionLevel({
-            owner: repo.owner,
-            repo: repo.repo,
+            owner: searchRepo.owner,
+            repo: searchRepo.repo,
             username,
           });
           const level = perm?.data?.permission;
@@ -10841,7 +11029,7 @@ async function main(options = {}) {
 
       return res.json({
         connected: true,
-        repo,
+        repo: searchRepo,
         branch,
         pr: {
           number: prData.number,
@@ -13386,53 +13574,6 @@ async function main(options = {}) {
     }
   });
 
-  app.get('/api/fs/search', async (req, res) => {
-    const rawRoot = typeof req.query.root === 'string' && req.query.root.trim().length > 0
-      ? req.query.root.trim()
-      : typeof req.query.directory === 'string' && req.query.directory.trim().length > 0
-        ? req.query.directory.trim()
-        : os.homedir();
-  const rawQuery = typeof req.query.q === 'string' ? req.query.q : '';
-  const includeHidden = req.query.includeHidden === 'true';
-  const respectGitignore = req.query.respectGitignore !== 'false';
-  const limitParam = typeof req.query.limit === 'string' ? Number.parseInt(req.query.limit, 10) : undefined;
-    const parsedLimit = Number.isFinite(limitParam) ? Number(limitParam) : DEFAULT_FILE_SEARCH_LIMIT;
-    const limit = Math.max(1, Math.min(parsedLimit, MAX_FILE_SEARCH_LIMIT));
-
-    try {
-      const resolvedRoot = path.resolve(normalizeDirectoryPath(rawRoot));
-      const stats = await fsPromises.stat(resolvedRoot);
-      if (!stats.isDirectory()) {
-        return res.status(400).json({ error: 'Specified root is not a directory' });
-      }
-
-      const files = await searchFilesystemFiles(resolvedRoot, {
-        limit,
-        query: rawQuery || '',
-        includeHidden,
-        respectGitignore,
-      });
-      res.json({
-        root: resolvedRoot,
-        count: files.length,
-        files
-      });
-    } catch (error) {
-      console.error('Failed to search filesystem:', error);
-      const err = error;
-      if (err && typeof err === 'object' && 'code' in err) {
-        const code = err.code;
-        if (code === 'ENOENT') {
-          return res.status(404).json({ error: 'Directory not found' });
-        }
-        if (code === 'EACCES') {
-          return res.status(403).json({ error: 'Access to directory denied' });
-        }
-      }
-      res.status(500).json({ error: (error && error.message) || 'Failed to search files' });
-    }
-  });
-
   let ptyProviderPromise = null;
   const getPtyProvider = async () => {
     if (ptyProviderPromise) {
@@ -14120,62 +14261,9 @@ async function main(options = {}) {
       setupProxy(app);
     }
   } else {
-    try {
-      syncFromHmrState();
-      if (await isOpenCodeProcessHealthy()) {
-        console.log(`[HMR] Reusing existing OpenCode process on port ${openCodePort}`);
-      } else if (ENV_SKIP_OPENCODE_START && ENV_EFFECTIVE_PORT) {
-        const label = ENV_CONFIGURED_OPENCODE_HOST ? ENV_CONFIGURED_OPENCODE_HOST.origin : `http://localhost:${ENV_EFFECTIVE_PORT}`;
-        console.log(`Using external OpenCode server at ${label} (skip-start mode)`);
-        openCodeBaseUrl = ENV_CONFIGURED_OPENCODE_HOST?.origin ?? null;
-        setOpenCodePort(ENV_EFFECTIVE_PORT);      isOpenCodeReady = true;
-      isExternalOpenCode = false;
-      lastOpenCodeError = null;
-      openCodeNotReadySince = 0;
-      syncToHmrState();
-    } else if (ENV_EFFECTIVE_PORT && await probeExternalOpenCode(ENV_EFFECTIVE_PORT, ENV_CONFIGURED_OPENCODE_HOST?.origin)) {
-      const label = ENV_CONFIGURED_OPENCODE_HOST ? ENV_CONFIGURED_OPENCODE_HOST.origin : `http://localhost:${ENV_EFFECTIVE_PORT}`;
-      console.log(`Auto-detected existing OpenCode server at ${label}`);
-      openCodeBaseUrl = ENV_CONFIGURED_OPENCODE_HOST?.origin ?? null;
-      setOpenCodePort(ENV_EFFECTIVE_PORT);
-      isOpenCodeReady = true;
-      isExternalOpenCode = true;
-      lastOpenCodeError = null;
-      openCodeNotReadySince = 0;
-      syncToHmrState();
-    } else if (!ENV_EFFECTIVE_PORT && await probeExternalOpenCode(4096)) {
-      console.log('Auto-detected existing OpenCode server on default port 4096');
-      setOpenCodePort(4096);
-      isOpenCodeReady = true;
-      isExternalOpenCode = true;
-      lastOpenCodeError = null;
-      openCodeNotReadySince = 0;
-      syncToHmrState();
-    } else {
-      if (ENV_EFFECTIVE_PORT) {
-        console.log(`Using OpenCode port from environment: ${ENV_EFFECTIVE_PORT}`);
-        setOpenCodePort(ENV_EFFECTIVE_PORT);
-      } else {
-        openCodePort = null;
-        syncToHmrState();
-      }
-
-      lastOpenCodeError = null;
-      openCodeProcess = await startOpenCode();
-      syncToHmrState();
-    }
-      await waitForOpenCodePort();
-      try {
-        await waitForOpenCodeReady();
-      } catch (error) {
-        console.error(`OpenCode readiness check failed: ${error.message}`);
-        scheduleOpenCodeApiDetection();
-      }
-      setupProxy(app);
-      scheduleOpenCodeApiDetection();
-      startHealthMonitoring();
-      void startGlobalEventWatcher();
-
+    setupProxy(app);
+    scheduleOpenCodeApiDetection();
+    void bootstrapOpenCodeAtStartup().then(async () => {
       // Start Claude Code adapter in hybrid mode if CLI was detected
       if (resolvedClaudeBinary) {
         try {
@@ -14193,13 +14281,7 @@ async function main(options = {}) {
           claudeCodeAdapterPort = null;
         }
       }
-    } catch (error) {
-      console.error(`Failed to start OpenCode: ${error.message}`);
-      console.log('Continuing without OpenCode integration...');
-      lastOpenCodeError = error.message;
-      setupProxy(app);
-      scheduleOpenCodeApiDetection();
-    }
+    });
   }
 
   const distPath = (() => {
@@ -14221,9 +14303,230 @@ async function main(options = {}) {
         },
       }));
 
-      // Alias for PWA manifest (.webmanifest redirect → /site.webmanifest)
-      app.get('/manifest.webmanifest', (req, res) => {
-        res.redirect(301, '/site.webmanifest');
+      const recentPwaSessionsCache = new Map();
+
+      const getRecentPwaSessionShortcuts = async (req) => {
+        const now = Date.now();
+
+        const resolvedDirectoryResult = await resolveProjectDirectory(req).catch(() => ({ directory: null }));
+        const preferredDirectory = typeof resolvedDirectoryResult?.directory === 'string'
+          ? resolvedDirectoryResult.directory
+          : null;
+
+        const cacheKey = preferredDirectory ? `dir:${preferredDirectory}` : 'global';
+        const cached = recentPwaSessionsCache.get(cacheKey);
+        if (cached && now - cached.at < 5000) {
+          return cached.data;
+        }
+
+        const normalizeShortcutTitle = (value, fallback) => {
+          const normalized = normalizePwaAppName(value, fallback);
+          return normalized.length > 48 ? normalized.slice(0, 48) : normalized;
+        };
+
+        const toFiniteNumber = (value) => {
+          if (typeof value === 'number' && Number.isFinite(value)) {
+            return value;
+          }
+          if (typeof value === 'string' && value.trim().length > 0) {
+            const parsed = Number(value);
+            if (Number.isFinite(parsed)) {
+              return parsed;
+            }
+          }
+          return null;
+        };
+
+        const normalizeDirectory = (value) => {
+          if (typeof value !== 'string') {
+            return '';
+          }
+          const trimmed = value.trim();
+          if (!trimmed) {
+            return '';
+          }
+          const normalized = trimmed.replace(/\\/g, '/');
+          if (normalized === '/') {
+            return '/';
+          }
+          return normalized.length > 1 ? normalized.replace(/\/+$/, '') : normalized;
+        };
+
+        const sessionUpdatedAt = (session) => {
+          const time = session && typeof session.time === 'object' ? session.time : null;
+          return toFiniteNumber(time?.updated) ?? toFiniteNumber(time?.created) ?? 0;
+        };
+
+        const filterSessionsByDirectory = (sessions, directory) => {
+          const normalizedDirectory = normalizeDirectory(directory);
+          if (!normalizedDirectory) {
+            return sessions;
+          }
+
+          const prefix = normalizedDirectory === '/' ? '/' : `${normalizedDirectory}/`;
+          return sessions.filter((session) => {
+            const sessionDirectory = normalizeDirectory(session?.directory);
+            if (!sessionDirectory) {
+              return false;
+            }
+            return sessionDirectory === normalizedDirectory || (prefix !== '/' && sessionDirectory.startsWith(prefix));
+          });
+        };
+
+        const listSessions = async (directory) => {
+          const query = (() => {
+            if (typeof directory !== 'string' || directory.length === 0) {
+              return '';
+            }
+            const preparedDirectory = process.platform === 'win32'
+              ? directory.replace(/\//g, '\\')
+              : directory;
+            return `?directory=${encodeURIComponent(preparedDirectory)}`;
+          })();
+
+          const response = await fetch(buildOpenCodeUrl(`/session${query}`, ''), {
+            method: 'GET',
+            headers: {
+              Accept: 'application/json',
+              ...getOpenCodeAuthHeaders(),
+            },
+            signal: AbortSignal.timeout(2500),
+          });
+
+          if (!response.ok) {
+            return [];
+          }
+
+          const payload = await response.json().catch(() => null);
+          return Array.isArray(payload) ? payload : [];
+        };
+
+        try {
+          let payload = [];
+
+          if (preferredDirectory) {
+            const scopedPayload = await listSessions(preferredDirectory);
+            const filteredScopedPayload = filterSessionsByDirectory(scopedPayload, preferredDirectory);
+
+            if (filteredScopedPayload.length > 0) {
+              payload = filteredScopedPayload;
+            } else {
+              const globalPayload = await listSessions(null);
+              const filteredGlobalPayload = filterSessionsByDirectory(globalPayload, preferredDirectory);
+              payload = filteredGlobalPayload.length > 0 ? filteredGlobalPayload : globalPayload;
+            }
+          } else {
+            payload = await listSessions(null);
+          }
+
+          const seen = new Set();
+          const rows = [];
+
+          for (const item of payload) {
+            if (!item || typeof item !== 'object') {
+              continue;
+            }
+
+            const id = typeof item.id === 'string' ? item.id.trim().slice(0, 160) : '';
+            if (!id || seen.has(id)) {
+              continue;
+            }
+
+            seen.add(id);
+            const title = normalizeShortcutTitle(item.title, `Session ${rows.length + 1}`);
+            const updatedAt = sessionUpdatedAt(item);
+
+            rows.push({ id, title, updatedAt });
+          }
+
+          rows.sort((a, b) => b.updatedAt - a.updatedAt);
+
+          const shortcuts = rows.slice(0, 3).map((session) => ({
+            name: session.title,
+            short_name: session.title.length > 32 ? session.title.slice(0, 32) : session.title,
+            description: 'Open recent session',
+            url: `/?session=${encodeURIComponent(session.id)}`,
+            icons: [{ src: '/pwa-192.png', sizes: '192x192', type: 'image/png' }],
+          }));
+
+          recentPwaSessionsCache.set(cacheKey, { at: now, data: shortcuts });
+          return shortcuts;
+        } catch {
+          recentPwaSessionsCache.set(cacheKey, { at: now, data: [] });
+          return [];
+        }
+      };
+
+      app.get('/manifest.webmanifest', async (req, res) => {
+        const hasQueryOverride =
+          typeof req.query?.pwa_name === 'string'
+          || typeof req.query?.app_name === 'string'
+          || typeof req.query?.appName === 'string';
+
+        let queryValueRaw = '';
+        if (typeof req.query?.pwa_name === 'string') {
+          queryValueRaw = req.query.pwa_name;
+        } else if (typeof req.query?.app_name === 'string') {
+          queryValueRaw = req.query.app_name;
+        } else if (typeof req.query?.appName === 'string') {
+          queryValueRaw = req.query.appName;
+        }
+
+        const queryOverrideName = normalizePwaAppName(queryValueRaw, '');
+
+        let storedName = '';
+        try {
+          const settings = await readSettingsFromDiskMigrated();
+          storedName = normalizePwaAppName(settings?.pwaAppName, '');
+        } catch {
+          storedName = '';
+        }
+
+        const appName = hasQueryOverride
+          ? (queryOverrideName || DEFAULT_PWA_APP_NAME)
+          : (storedName || DEFAULT_PWA_APP_NAME);
+
+        const shortName = appName.length > 30 ? appName.slice(0, 30) : appName;
+        const recentSessionShortcuts = await getRecentPwaSessionShortcuts(req);
+
+        const manifest = {
+          name: appName,
+          short_name: shortName,
+          description: 'Web interface companion for OpenCode AI coding agent',
+          id: '/',
+          start_url: '/',
+          scope: '/',
+          display: 'standalone',
+          background_color: '#151313',
+          theme_color: '#edb449',
+          orientation: 'any',
+          icons: [
+            { src: '/pwa-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+            { src: '/pwa-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+            { src: '/pwa-maskable-192.png', sizes: '192x192', type: 'image/png', purpose: 'any maskable' },
+            { src: '/pwa-maskable-512.png', sizes: '512x512', type: 'image/png', purpose: 'any maskable' },
+            { src: '/apple-touch-icon-180x180.png', sizes: '180x180', type: 'image/png', purpose: 'any' },
+            { src: '/apple-touch-icon-152x152.png', sizes: '152x152', type: 'image/png', purpose: 'any' },
+            { src: '/favicon-32.png', sizes: '32x32', type: 'image/png' },
+            { src: '/favicon-16.png', sizes: '16x16', type: 'image/png' },
+          ],
+          shortcuts: [
+            {
+              name: 'Appearance Settings',
+              short_name: 'Settings',
+              description: 'Open appearance settings',
+              url: '/?settings=appearance',
+              icons: [{ src: '/pwa-192.png', sizes: '192x192', type: 'image/png' }],
+            },
+            ...recentSessionShortcuts,
+          ],
+          categories: ['developer', 'tools', 'productivity'],
+          lang: 'en',
+        };
+
+        res.setHeader('Cache-Control', 'no-store, must-revalidate');
+        res.type('application/manifest+json');
+        res.send(JSON.stringify(manifest));
       });
 
     app.get(/^(?!\/api|.*\.(js|css|svg|png|jpg|jpeg|gif|ico|woff|woff2|ttf|eot|map)).*$/, (req, res) => {
@@ -14282,12 +14585,16 @@ async function main(options = {}) {
               const bootstrapTtlMs = settings?.tunnelBootstrapTtlMs === null
                 ? null
                 : normalizeTunnelBootstrapTtlMs(settings?.tunnelBootstrapTtlMs);
-              tunnelAuthController.issueBootstrapToken({ ttlMs: bootstrapTtlMs });
-            }
-            if (onTunnelReady) {
-              if (tunnelUrl) {
-                onTunnelReady(tunnelUrl);
+              const bootstrapToken = tunnelAuthController.issueBootstrapToken({ ttlMs: bootstrapTtlMs });
+              const connectUrl = `${tunnelUrl.replace(/\/$/, '')}/connect?t=${encodeURIComponent(bootstrapToken.token)}`;
+              if (onTunnelReady) {
+                onTunnelReady(tunnelUrl, connectUrl);
+              } else {
+                console.log(`\n🌐 Tunnel URL: ${connectUrl}`);
+                console.log('🔑 One-time connect link (expires after first use)\n');
               }
+            } else if (onTunnelReady) {
+              onTunnelReady(tunnelUrl, null);
             }
           } catch (error) {
             console.error(`Failed to start Cloudflare tunnel: ${error.message}`);

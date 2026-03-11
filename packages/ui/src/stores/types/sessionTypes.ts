@@ -147,6 +147,7 @@ export interface PausedSessionInfo {
 export interface SessionStore {
 
     sessions: Session[];
+    archivedSessions: Session[];
     sessionsByDirectory: Map<string, Session[]>;
     currentSessionId: string | null;
     lastLoadedDirectory: string | null;
@@ -233,6 +234,8 @@ export interface SessionStore {
 
     deleteSession: (id: string, options?: { archiveWorktree?: boolean; deleteRemoteBranch?: boolean; deleteLocalBranch?: boolean; remoteName?: string }) => Promise<boolean>;
     deleteSessions: (ids: string[], options?: { archiveWorktree?: boolean; deleteRemoteBranch?: boolean; deleteLocalBranch?: boolean; remoteName?: string; silent?: boolean }) => Promise<{ deletedIds: string[]; failedIds: string[] }>;
+    archiveSession: (id: string) => Promise<boolean>;
+    archiveSessions: (ids: string[], options?: { silent?: boolean }) => Promise<{ archivedIds: string[]; failedIds: string[] }>;
     updateSessionTitle: (id: string, title: string) => Promise<void>;
     shareSession: (id: string) => Promise<Session | null>;
     unshareSession: (id: string) => Promise<Session | null>;

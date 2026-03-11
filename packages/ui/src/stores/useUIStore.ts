@@ -476,6 +476,7 @@ interface UIStore {
   sidebarOpenBeforeFullscreenTab: boolean | null;
   pendingDiffFile: string | null;
   pendingFileNavigation: PendingFileNavigation | null;
+  pendingFileFocusPath: string | null;
   isMobile: boolean;
   isKeyboardOpen: boolean;
   isCommandPaletteOpen: boolean;
@@ -497,6 +498,7 @@ interface UIStore {
   eventStreamHint: string | null;
   showReasoningTraces: boolean;
   showTextJustificationActivity: boolean;
+  showActivityHeaderTimestamps: boolean;
   showDeletionDialog: boolean;
   autoDeleteEnabled: boolean;
   autoDeleteAfterDays: number;
@@ -504,7 +506,7 @@ interface UIStore {
   autoArchiveLastRunAt: number | null;
   messageLimit: number;
 
-  toolCallExpansion: 'collapsed' | 'activity' | 'detailed';
+  toolCallExpansion: 'collapsed' | 'activity' | 'detailed' | 'changes';
   fontSize: number;
   terminalFontSize: number;
   padding: number;
@@ -549,6 +551,7 @@ interface UIStore {
 
   showTerminalQuickKeysOnDesktop: boolean;
   persistChatDraft: boolean;
+  inputSpellcheckEnabled: boolean;
   mermaidRenderingMode: MermaidRenderingMode;
   userMessageRenderingMode: UserMessageRenderingMode;
   stickyUserHeader: boolean;
@@ -591,6 +594,7 @@ interface UIStore {
   setMainTabGuard: (guard: MainTabGuard | null) => void;
   setPendingDiffFile: (filePath: string | null) => void;
   setPendingFileNavigation: (navigation: PendingFileNavigation | null) => void;
+  setPendingFileFocusPath: (path: string | null) => void;
   navigateToDiff: (filePath: string) => void;
   navigateToFile: (filePath: string) => void;
   consumePendingDiffFile: () => string | null;
@@ -613,13 +617,14 @@ interface UIStore {
   setEventStreamStatus: (status: EventStreamStatus, hint?: string | null) => void;
   setShowReasoningTraces: (value: boolean) => void;
   setShowTextJustificationActivity: (value: boolean) => void;
+  setShowActivityHeaderTimestamps: (value: boolean) => void;
   setShowDeletionDialog: (value: boolean) => void;
   setAutoDeleteEnabled: (value: boolean) => void;
   setAutoDeleteAfterDays: (days: number) => void;
   setAutoDeleteLastRunAt: (timestamp: number | null) => void;
   setAutoArchiveLastRunAt: (timestamp: number | null) => void;
   setMessageLimit: (value: number) => void;
-  setToolCallExpansion: (value: 'collapsed' | 'activity' | 'detailed') => void;
+  setToolCallExpansion: (value: 'collapsed' | 'activity' | 'detailed' | 'changes') => void;
   setFontSize: (size: number) => void;
   setTerminalFontSize: (size: number) => void;
   setPadding: (size: number) => void;
@@ -659,6 +664,7 @@ interface UIStore {
   setSummaryLength: (value: number) => void;
   setMaxLastMessageLength: (value: number) => void;
   setPersistChatDraft: (value: boolean) => void;
+  setInputSpellcheckEnabled: (value: boolean) => void;
   setMermaidRenderingMode: (value: MermaidRenderingMode) => void;
   setUserMessageRenderingMode: (value: UserMessageRenderingMode) => void;
   setStickyUserHeader: (value: boolean) => void;
@@ -702,6 +708,7 @@ export const useUIStore = create<UIStore>()(
         sidebarOpenBeforeFullscreenTab: null,
         pendingDiffFile: null,
         pendingFileNavigation: null,
+        pendingFileFocusPath: null,
         isMobile: false,
         isKeyboardOpen: false,
         isCommandPaletteOpen: false,
@@ -721,6 +728,7 @@ export const useUIStore = create<UIStore>()(
         eventStreamHint: null,
         showReasoningTraces: true,
         showTextJustificationActivity: false,
+        showActivityHeaderTimestamps: false,
         showDeletionDialog: true,
         autoDeleteEnabled: false,
         autoDeleteAfterDays: 30,
@@ -768,6 +776,7 @@ export const useUIStore = create<UIStore>()(
 
         showTerminalQuickKeysOnDesktop: false,
         persistChatDraft: true,
+        inputSpellcheckEnabled: false,
         mermaidRenderingMode: 'svg',
         userMessageRenderingMode: 'markdown',
         stickyUserHeader: true,
@@ -900,12 +909,13 @@ export const useUIStore = create<UIStore>()(
 
         openContextFile: (directory, filePath) => {
           const normalizedDirectory = normalizeDirectoryPath((directory || '').trim());
-          const normalizedFilePath = (filePath || '').trim();
+          const normalizedFilePath = normalizeContextTargetPath(filePath);
           if (!normalizedDirectory || !normalizedFilePath) {
             return;
           }
 
           get().openContextPanelTab(normalizedDirectory, { mode: 'file', targetPath: normalizedFilePath });
+          get().setPendingFileFocusPath(normalizedFilePath);
           get().setPendingFileNavigation(null);
         },
 
@@ -919,6 +929,7 @@ export const useUIStore = create<UIStore>()(
           }
 
           get().openContextPanelTab(normalizedDirectory, { mode: 'file', targetPath: normalizedFilePath });
+          get().setPendingFileFocusPath(null);
           get().setPendingFileNavigation({
             path: normalizedFilePath,
             line: normalizedLine,
@@ -1189,6 +1200,10 @@ export const useUIStore = create<UIStore>()(
           set({ pendingFileNavigation: navigation });
         },
 
+        setPendingFileFocusPath: (path) => {
+          set({ pendingFileFocusPath: path });
+        },
+
         navigateToDiff: (filePath) => {
           const guard = get().mainTabGuard;
           if (guard && !guard('diff')) {
@@ -1308,6 +1323,10 @@ export const useUIStore = create<UIStore>()(
 
         setShowTextJustificationActivity: (value) => {
           set({ showTextJustificationActivity: value });
+        },
+
+        setShowActivityHeaderTimestamps: (value) => {
+          set({ showActivityHeaderTimestamps: value });
         },
 
         setShowDeletionDialog: (value) => {
@@ -1682,6 +1701,9 @@ export const useUIStore = create<UIStore>()(
         setPersistChatDraft: (value) => {
           set({ persistChatDraft: value });
         },
+        setInputSpellcheckEnabled: (value) => {
+          set({ inputSpellcheckEnabled: value });
+        },
         setMermaidRenderingMode: (value) => {
           set({ mermaidRenderingMode: value });
         },
@@ -1835,6 +1857,7 @@ export const useUIStore = create<UIStore>()(
           // Note: isSettingsDialogOpen intentionally NOT persisted
           showReasoningTraces: state.showReasoningTraces,
           showTextJustificationActivity: state.showTextJustificationActivity,
+          showActivityHeaderTimestamps: state.showActivityHeaderTimestamps,
           showDeletionDialog: state.showDeletionDialog,
           autoDeleteEnabled: state.autoDeleteEnabled,
           autoDeleteAfterDays: state.autoDeleteAfterDays,
@@ -1868,6 +1891,7 @@ export const useUIStore = create<UIStore>()(
           summaryLength: state.summaryLength,
           maxLastMessageLength: state.maxLastMessageLength,
           persistChatDraft: state.persistChatDraft,
+          inputSpellcheckEnabled: state.inputSpellcheckEnabled,
           mermaidRenderingMode: state.mermaidRenderingMode,
           userMessageRenderingMode: state.userMessageRenderingMode,
           stickyUserHeader: state.stickyUserHeader,

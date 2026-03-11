@@ -74,6 +74,14 @@ const persistToLocalStorage = (settings: DesktopSettings) => {
   if (typeof settings.openInAppId === 'string' && settings.openInAppId.length > 0) {
     localStorage.setItem('openInAppId', settings.openInAppId);
   }
+  if (typeof settings.pwaAppName === 'string') {
+    const normalized = settings.pwaAppName.trim().replace(/\s+/g, ' ').slice(0, 64);
+    if (normalized.length > 0) {
+      localStorage.setItem('openchamber.pwaName', normalized);
+    } else {
+      localStorage.removeItem('openchamber.pwaName');
+    }
+  }
 };
 
 type PersistApi = {
@@ -361,10 +369,16 @@ const applyDesktopUiPreferences = (settings: DesktopSettings) => {
     store.setMaxLastMessageLength(settings.maxLastMessageLength);
   }
   if (typeof settings.toolCallExpansion === 'string'
-    && (settings.toolCallExpansion === 'collapsed' || settings.toolCallExpansion === 'activity' || settings.toolCallExpansion === 'detailed')) {
+    && (settings.toolCallExpansion === 'collapsed'
+      || settings.toolCallExpansion === 'activity'
+      || settings.toolCallExpansion === 'detailed'
+      || settings.toolCallExpansion === 'changes')) {
     if (settings.toolCallExpansion !== store.toolCallExpansion) {
       store.setToolCallExpansion(settings.toolCallExpansion);
     }
+  }
+  if (typeof settings.inputSpellcheckEnabled === 'boolean' && settings.inputSpellcheckEnabled !== store.inputSpellcheckEnabled) {
+    store.setInputSpellcheckEnabled(settings.inputSpellcheckEnabled);
   }
   if (typeof settings.userMessageRenderingMode === 'string'
     && (settings.userMessageRenderingMode === 'markdown' || settings.userMessageRenderingMode === 'plain')) {
@@ -757,9 +771,13 @@ const sanitizeWebSettings = (payload: unknown): DesktopSettings | null => {
     typeof candidate.toolCallExpansion === 'string'
     && (candidate.toolCallExpansion === 'collapsed'
       || candidate.toolCallExpansion === 'activity'
-      || candidate.toolCallExpansion === 'detailed')
+      || candidate.toolCallExpansion === 'detailed'
+      || candidate.toolCallExpansion === 'changes')
   ) {
     result.toolCallExpansion = candidate.toolCallExpansion;
+  }
+  if (typeof candidate.inputSpellcheckEnabled === 'boolean') {
+    result.inputSpellcheckEnabled = candidate.inputSpellcheckEnabled;
   }
   if (typeof candidate.userMessageRenderingMode === 'string'
     && (candidate.userMessageRenderingMode === 'markdown' || candidate.userMessageRenderingMode === 'plain')) {
@@ -815,6 +833,10 @@ const sanitizeWebSettings = (payload: unknown): DesktopSettings | null => {
   }
   if (typeof candidate.openInAppId === 'string' && candidate.openInAppId.length > 0) {
     result.openInAppId = candidate.openInAppId;
+  }
+  if (typeof candidate.pwaAppName === 'string') {
+    const normalized = candidate.pwaAppName.trim().replace(/\s+/g, ' ').slice(0, 64);
+    result.pwaAppName = normalized.length > 0 ? normalized : '';
   }
 
   if (typeof candidate.messageLimit === 'number' && Number.isFinite(candidate.messageLimit)) {

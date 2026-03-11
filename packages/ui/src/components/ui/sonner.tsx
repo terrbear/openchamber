@@ -11,7 +11,18 @@ const Toaster = ({ ...props }: ToasterProps) => {
     <Sonner
       theme={theme as ToasterProps["theme"]}
       className="toaster group"
-      closeButton
+      closeButton={false}
+      toastOptions={{
+        style: {
+          borderRadius: "var(--radius-md)",
+        },
+        classNames: {
+          toast: "rounded-[var(--radius-md)]",
+          actionButton: "rounded-[var(--radius-sm)]",
+          cancelButton: "rounded-[var(--radius-sm)]",
+          closeButton: "rounded-[var(--radius-sm)]",
+        },
+      }}
       style={
         {
           "--normal-bg": "var(--popover)",

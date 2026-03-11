@@ -48,6 +48,7 @@ import { isDesktopLocalOriginActive, isDesktopShell, isTauriShell, requestDirect
 import { useLongPress } from '@/hooks/useLongPress';
 import { formatShortcutForDisplay, getEffectiveShortcutCombo } from '@/lib/shortcuts';
 import { sessionEvents } from '@/lib/sessionEvents';
+import { useThemeSystem } from '@/contexts/useThemeSystem';
 import type { ProjectEntry } from '@/lib/api/types';
 
 const normalize = (value: string): string => {
@@ -257,10 +258,16 @@ const ProjectTile: React.FC<{
   onEdit: () => void;
   onClose: () => void;
 }> = ({ project, isActive, hasStreaming, hasUnread, label, expanded, projectTextVisible, onClick, onEdit, onClose }) => {
+  const { currentTheme } = useThemeSystem();
   const [menuOpen, setMenuOpen] = React.useState(false);
   const [iconImageFailed, setIconImageFailed] = React.useState(false);
   const ProjectIcon = project.icon ? PROJECT_ICON_MAP[project.icon] : null;
-  const projectIconImageUrl = !iconImageFailed ? getProjectIconImageUrl(project) : null;
+  const projectIconImageUrl = !iconImageFailed
+    ? getProjectIconImageUrl(project, {
+      themeVariant: currentTheme.metadata.variant,
+      iconColor: currentTheme.colors.surface.foreground,
+    })
+    : null;
   const projectColorVar = project.color ? (PROJECT_COLOR_MAP[project.color] ?? null) : null;
   const showStreamingDots = hasStreaming;
   const showAttentionDots = !hasStreaming && hasUnread;
@@ -319,7 +326,7 @@ const ProjectTile: React.FC<{
       type="button"
       {...longPressHandlers}
       className={cn(
-        'group relative flex items-center rounded-lg overflow-hidden cursor-default',
+        'group relative flex cursor-pointer items-center rounded-lg overflow-hidden',
         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--interactive-focus-ring)]',
         expanded ? 'h-9 w-full gap-2.5 pr-1.5 pl-[7px]' : 'h-9 w-9 justify-center',
         !expanded && (
@@ -719,7 +726,7 @@ export const NavRail: React.FC<NavRailProps> = ({ className, mobile }) => {
   );
 
   const navRailActionButtonClass = cn(
-    'group relative flex h-8 items-center rounded-lg',
+    'group relative flex h-8 cursor-pointer items-center rounded-lg disabled:cursor-not-allowed',
     showExpandedContent ? 'w-full justify-start gap-2.5 pr-2 pl-2' : 'w-8 justify-center',
     showExpandedContent
       ? 'text-[var(--surface-mutedForeground)] hover:text-[var(--surface-foreground)]'

@@ -3,7 +3,7 @@ import { toast } from '@/components/ui';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { useUIStore } from '@/stores/useUIStore';
 import { useProjectsStore } from '@/stores/useProjectsStore';
-import { useConnectionsStore } from '@/stores/useConnectionsStore';
+import { useUpdateStore } from '@/stores/useUpdateStore';
 import { useThemeSystem } from '@/contexts/useThemeSystem';
 import { sessionEvents } from '@/lib/sessionEvents';
 import { isTauriShell } from '@/lib/desktop';
@@ -59,17 +59,37 @@ export const useMenuActions = (
     setAboutDialogOpen,
   } = useUIStore();
   const { addProject } = useProjectsStore();
-  const { activeConnectionId } = useConnectionsStore();
+  const checkForUpdates = useUpdateStore((state) => state.checkForUpdates);
   const { requestAccess, startAccessing } = useFileSystemAccess();
   const { setThemeMode } = useThemeSystem();
+  const checkUpdatesInFlightRef = React.useRef(false);
 
-  const handleChangeWorkspace = React.useCallback(() => {
-    // When remote connection is active, use the remote filesystem browser
-    if (activeConnectionId !== 'local') {
-      sessionEvents.requestDirectoryDialog();
+  const handleCheckForUpdates = React.useCallback(() => {
+    if (checkUpdatesInFlightRef.current) {
       return;
     }
+    checkUpdatesInFlightRef.current = true;
 
+    void checkForUpdates()
+      .then(() => {
+        const { available, error } = useUpdateStore.getState();
+        if (error) {
+          toast.error('Failed to check for updates', {
+            description: error,
+          });
+          return;
+        }
+
+        if (!available) {
+          toast.success('You are on the latest version');
+        }
+      })
+      .finally(() => {
+        checkUpdatesInFlightRef.current = false;
+      });
+  }, [checkForUpdates]);
+
+  const handleChangeWorkspace = React.useCallback(() => {
     if (isTauriShell()) {
       requestAccess('')
         .then(async (result) => {
@@ -90,7 +110,7 @@ export const useMenuActions = (
             return;
           }
 
-          const added = addProject(result.path, { id: result.projectId, connectionId: activeConnectionId });
+          const added = addProject(result.path, { id: result.projectId });
           if (!added) {
             toast.error('Failed to add project', {
               description: 'Please select a valid directory path.',
@@ -101,11 +121,10 @@ export const useMenuActions = (
           console.error('Desktop: Error selecting directory:', error);
           toast.error('Failed to select directory');
         });
-      return;
     }
 
     sessionEvents.requestDirectoryDialog();
-  }, [activeConnectionId, addProject, requestAccess, startAccessing]);
+  }, [addProject, requestAccess, startAccessing]);
 
   const handleAction = React.useCallback(
     (action: MenuAction) => {
@@ -225,9 +244,17 @@ export const useMenuActions = (
       handleAction(action);
     };
 
+    const handleCheckForUpdatesEvent = () => {
+      handleCheckForUpdates();
+    };
+
     window.addEventListener(MENU_ACTION_EVENT, handleMenuAction);
-    return () => window.removeEventListener(MENU_ACTION_EVENT, handleMenuAction);
-  }, [handleAction]);
+    window.addEventListener(CHECK_FOR_UPDATES_EVENT, handleCheckForUpdatesEvent);
+    return () => {
+      window.removeEventListener(MENU_ACTION_EVENT, handleMenuAction);
+      window.removeEventListener(CHECK_FOR_UPDATES_EVENT, handleCheckForUpdatesEvent);
+    };
+  }, [handleAction, handleCheckForUpdates]);
 
   React.useEffect(() => {
     if (typeof window === 'undefined') return;

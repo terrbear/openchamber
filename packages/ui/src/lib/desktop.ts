@@ -42,6 +42,10 @@ export type DesktopSettings = {
   themeVariant?: 'light' | 'dark';
   lightThemeId?: string;
   darkThemeId?: string;
+  splashBgLight?: string;
+  splashFgLight?: string;
+  splashBgDark?: string;
+  splashFgDark?: string;
   lastDirectory?: string;
   homeDirectory?: string;
   // Optional absolute path to `opencode` binary.
@@ -113,7 +117,9 @@ export type DesktopSettings = {
   zenModel?: string;
   gitProviderId?: string;
   gitModelId?: string;
-  toolCallExpansion?: 'collapsed' | 'activity' | 'detailed';
+  pwaAppName?: string;
+  toolCallExpansion?: 'collapsed' | 'activity' | 'detailed' | 'changes';
+  inputSpellcheckEnabled?: boolean;
   userMessageRenderingMode?: 'markdown' | 'plain';
   stickyUserHeader?: boolean;
   fontSize?: number;

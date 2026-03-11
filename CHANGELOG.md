@@ -4,6 +4,41 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.8.5] - 2026-03-04
+
+- Desktop: startup now opens the app shell much earlier while background services continue loading, so the app feels ready faster after launch.
+- Desktop/macOS: fixed early title updates that could shift traffic-light window controls on startup, keeping native controls stable in their expected position.
+- VSCode: edit-style tool results now open directly in a focused diff view, so you can review generated changes at the first modified line with less manual navigation.
+- VSCode: cleaned up extension settings by removing duplicate display controls and hiding sections that do not apply in the editor environment.
+- Chat: fixed focus-mode composer layout so the footer action row stays pinned and accessible while writing longer prompts.
+- UI/Theming: unified loading logos and startup screens across runtimes, with visuals that better match your active theme.
+- Projects/UI: project icons now follow active theme foreground colors more consistently, improving readability and visual consistency in project lists.
+- Reliability: improved early startup recovery so models and agents are less likely to appear missing right after launch.
+- Tunnel/CLI: fixed one-time Cloudflare tunnel connect links in CLI output for `--try-cf-tunnel`, so remote collaborators can use the printed URL/QR flow successfully (thanks to @plfavreau).
+- Mobile/PWA: respected OS rotation lock by removing forced orientation behavior in the web app shell (thanks to @theluckystrike).
+
+
+## [1.8.4] - 2026-03-04
+
+- Chat: added clickable file-path links in assistant messages (including line targeting), so you can jump from answer text straight to the exact file location (thanks to @yulia-ivashko).
+- Chat: added a new `Changes` tool-output mode that expands edits/patches by default while keeping activity readable, making long runs easier to review (thanks to @iamhenry).
+- Chat: in-progress tools now appear immediately and stay live in collapsed activity view, so active work is visible earlier with stable durations (thanks to @nelsonPires5).
+- Chat: improved long user-message behavior in sticky mode with bounded height, internal scrolling, and cleaner action hit targets for better readability and control.
+- Chat/Files: improved `@` file discovery and mention behavior with project-scoped search and more consistent matching, reducing wrong-project results.
+- Chat/GitHub: added Attach menu actions to link GitHub issues and PRs directly in any session, making it faster to pull ticket/PR context into a prompt.
+- Chat/Files: restored user image previews/fullscreen navigation and improved text-selection action placement on narrow layouts.
+- Shortcuts/Models: added favorite-model cycling shortcuts, so you can switch between starred models without leaving the keyboard (thanks to @iamhenry).
+- Sessions: added active-project session search in the sidebar, with clearer match behavior and easier clearing during filtering (thanks to @KJdotIO).
+- Worktrees/GitHub: streamlined worktree creation with a unified flow for branches, issues, and PR-linked sessions, including cleaner validation and faster branch loading.
+- Worktrees/Git: fixed branch/PR source resolution (including slash-named branches and fork PR heads), so linked worktrees track and push to the correct upstream branch.
+- Git: fixed a PR panel refresh loop that could trigger repeated updates and unstable behavior in the PR section (thanks to @yulia-ivashko).
+- Files/Desktop: improved `Open In` actions from file views/editors, including app selection behavior and tighter integration for opening focused files (thanks to @yulia-ivashko).
+- Mobile/Projects: added long-press project editing with a bottom-sheet panel and drag-to-reorder support for faster project management on mobile (thanks to @Jovines).
+- Web/PWA/Android: added improved install UX with pre-install naming and manifest shortcut updates, so installed web apps feel more customized and project-aware (thanks to @shekohex).
+- UI: interactive controls now consistently show pointer cursors, improving click affordance and reducing ambiguous hover states (thanks to @KJdotIO).
+- Security/Reliability: hardened terminal auth, tightened skill-file path protections, and reduced sensitive request logging exposure for safer day-to-day usage (thanks to @yulia-ivashko).
+
+
 ## [1.8.3] - 2026-03-02
 
 - Chat: added user-message display controls for plain-text rendering and sticky headers, so you can tune readability to match your preferences.

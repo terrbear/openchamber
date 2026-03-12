@@ -16,7 +16,7 @@ let _port = null;
 let sessions = {};
 let _claudeBinary = 'claude';
 let _cwd = process.cwd();
-let _permissionMode = 'acceptEdits';
+let _permissionMode = 'bypassPermissions';
 
 // Pending permission questions keyed by requestId: { resolve, question }
 const pendingQuestions = {};
@@ -34,6 +34,7 @@ const globalSseClients = new Set();
 
 function broadcastGlobalEvent(obj) {
   const data = `data: ${JSON.stringify(obj)}\n\n`;
+  console.log(`[claudecode-adapter] broadcast event: ${obj.type} (clients=${globalSseClients.size})`);
   for (const client of globalSseClients) {
     try {
       const ok = client.write(data);
@@ -250,12 +251,15 @@ function createApp(cwd) {
 
     // Extract text from parts array (OpenCode API format)
     const body = req.body || {};
+    console.log(`[claudecode-adapter] prompt_async received for session=${id}, body keys=${Object.keys(body).join(',')}`);
     const parts = Array.isArray(body.parts) ? body.parts : [];
     const textPart = parts.find(p => p && p.type === 'text');
     const content = (typeof textPart?.text === 'string') ? textPart.text.trim() : '';
     if (!content) {
+      console.log(`[claudecode-adapter] prompt_async rejected: no text part found. parts=${JSON.stringify(parts).slice(0, 200)}`);
       return res.status(400).json({ error: 'Message must contain a text part' });
     }
+    console.log(`[claudecode-adapter] prompt_async content="${content.slice(0, 80)}..."`);
 
     // Generate stable IDs for this exchange
     const userMessageId = crypto.randomUUID();
@@ -316,18 +320,25 @@ function createApp(cwd) {
           ];
           // Strip Claude Code's own env vars so nested sessions aren't blocked
           const { CLAUDECODE: _cc, CLAUDE_CODE_ENTRYPOINT: _cce, ...spawnEnv } = process.env;
+          console.log(`[claudecode-adapter] spawning: ${_claudeBinary} ${args.join(' ')}`);
+          console.log(`[claudecode-adapter] spawn cwd=${sessionCwd}, permissionMode=${_permissionMode}`);
           const claudeProc = spawn(_claudeBinary, args, {
             cwd: sessionCwd,
             env: spawnEnv,
             stdio: ['pipe', 'pipe', 'pipe'],
           });
 
+          console.log(`[claudecode-adapter] spawn pid=${claudeProc.pid}`);
+
           // Track this process so concurrent prompts can kill it
           runningProcesses.set(id, claudeProc);
 
           // Write the user prompt as a stream-json message and keep stdin open.
-          claudeProc.stdin.on('error', () => {});
+          claudeProc.stdin.on('error', (err) => {
+            console.error(`[claudecode-adapter] stdin error: ${err.message}`);
+          });
           const userMsg = JSON.stringify({ type: 'user', message: { role: 'user', content } }) + '\n';
+          console.log(`[claudecode-adapter] writing to stdin: ${userMsg.slice(0, 120)}...`);
           claudeProc.stdin.write(userMsg, 'utf8');
 
           let stdoutBuf = '';
@@ -344,7 +355,12 @@ function createApp(cwd) {
           const processLine = (line) => {
             if (!line.trim()) return;
             let parsed;
-            try { parsed = JSON.parse(line); } catch { return; }
+            try { parsed = JSON.parse(line); } catch {
+              console.log(`[claudecode-adapter] non-JSON stdout: ${line.slice(0, 200)}`);
+              return;
+            }
+
+            console.log(`[claudecode-adapter] stdout event: type=${parsed.type}${parsed.type === 'control_request' ? ` tool=${parsed.request?.tool_name}` : ''}`);
 
             if (parsed.type === 'result') {
               // Claude has finished — close stdin so the process can exit cleanly.
@@ -464,7 +480,9 @@ function createApp(cwd) {
           });
 
           claudeProc.stderr.on('data', (chunk) => {
-            if (stderrBuf.length < STDERR_MAX) stderrBuf += chunk.toString('utf8');
+            const text = chunk.toString('utf8');
+            console.log(`[claudecode-adapter] stderr: ${text.slice(0, 300)}`);
+            if (stderrBuf.length < STDERR_MAX) stderrBuf += text;
           });
 
           claudeProc.on('error', (err) => {
@@ -477,6 +495,7 @@ function createApp(cwd) {
           });
 
           claudeProc.on('close', (code) => {
+            console.log(`[claudecode-adapter] process closed with code=${code}, assistantText.length=${assistantText.length}`);
             clearTimeout(timeoutHandle);
             // Remove from running processes tracking
             if (runningProcesses.get(id) === claudeProc) {
@@ -495,7 +514,10 @@ function createApp(cwd) {
       }
 
       // Run claude, retrying without --resume if resume fails
+      console.log(`[claudecode-adapter] running claude (useResume=true) for session=${id}`);
       let result = await runClaude({ useResume: true });
+
+      console.log(`[claudecode-adapter] runClaude result: code=${result.code}, assistantText.length=${result.assistantText.length}, usedResume=${result.usedResume}, stderr=${result.stderr?.slice(0, 200)}`);
 
       if (result.code !== 0 && !result.assistantText && result.usedResume) {
         // --resume failed — clear stale session ID and retry with a fresh conversation
@@ -583,9 +605,11 @@ function createApp(cwd) {
     res.write('data: {"type":"connected"}\n\n');
 
     globalSseClients.add(res);
+    console.log(`[claudecode-adapter] SSE client connected (total=${globalSseClients.size})`);
 
     req.on('close', () => {
       globalSseClients.delete(res);
+      console.log(`[claudecode-adapter] SSE client disconnected (total=${globalSseClients.size})`);
     });
   });
 
@@ -642,11 +666,13 @@ function createApp(cwd) {
   });
   app.post('/question/reply', (req, res) => {
     const { requestID, answers } = req.body || {};
+    console.log(`[claudecode-adapter] question/reply: requestID=${requestID}, pending=${Object.keys(pendingQuestions).join(',')}`);
     if (!requestID || !Object.hasOwn(pendingQuestions, requestID)) {
       return res.status(404).json({ error: 'Question not found' });
     }
     const entry = pendingQuestions[requestID];
     delete pendingQuestions[requestID];
+    console.log(`[claudecode-adapter] resolving question ${requestID} with allow=true`);
     entry.resolve({ allow: true, answers });
     const { sessionID } = entry.question;
     broadcastGlobalEvent({ type: 'question.replied', properties: { sessionID, requestID } });
@@ -654,11 +680,13 @@ function createApp(cwd) {
   });
   app.post('/question/reject', (req, res) => {
     const { requestID } = req.body || {};
+    console.log(`[claudecode-adapter] question/reject: requestID=${requestID}, pending=${Object.keys(pendingQuestions).join(',')}`);
     if (!requestID || !Object.hasOwn(pendingQuestions, requestID)) {
       return res.status(404).json({ error: 'Question not found' });
     }
     const entry = pendingQuestions[requestID];
     delete pendingQuestions[requestID];
+    console.log(`[claudecode-adapter] resolving question ${requestID} with allow=false`);
     entry.resolve({ allow: false });
     const { sessionID } = entry.question;
     broadcastGlobalEvent({ type: 'question.rejected', properties: { sessionID, requestID } });
@@ -686,13 +714,14 @@ function createApp(cwd) {
 }
 
 export async function startClaudeCodeAdapter({ port = 0, claudeBinary, cwd, permissionMode } = {}) {
+  console.log(`[claudecode-adapter] starting: binary=${claudeBinary}, cwd=${cwd}, permissionMode=${permissionMode}`);
   if (claudeBinary) {
     _claudeBinary = claudeBinary;
   }
   if (cwd) {
     _cwd = cwd;
   }
-  _permissionMode = permissionMode || 'acceptEdits';
+  _permissionMode = permissionMode || 'bypassPermissions';
 
   await ensureDataDir();
 

@@ -4,6 +4,7 @@ import path from 'path';
 import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import http from 'http';
+import https from 'https';
 import net from 'net';
 import { WebSocketServer } from 'ws';
 import { fileURLToPath } from 'url';
@@ -3674,7 +3675,7 @@ const ENV_SKIP_OPENCODE_START = process.env.OPENCODE_SKIP_START === 'true' ||
 const ENV_DESKTOP_NOTIFY = process.env.OPENCHAMBER_DESKTOP_NOTIFY === 'true';
 const ENV_BACKEND = process.env.OPENCHAMBER_BACKEND || 'opencode';
 const ENV_CLAUDECODE_BINARY = (process.env.CLAUDECODE_BINARY || '').trim() || 'claude';
-const ENV_CLAUDECODE_PERMISSION_MODE = (process.env.CLAUDECODE_PERMISSION_MODE || '').trim() || 'acceptEdits';
+const ENV_CLAUDECODE_PERMISSION_MODE = (process.env.CLAUDECODE_PERMISSION_MODE || '').trim() || 'bypassPermissions';
 const ENV_CONFIGURED_OPENCODE_WSL_DISTRO =
   typeof process.env.OPENCODE_WSL_DISTRO === 'string' && process.env.OPENCODE_WSL_DISTRO.trim().length > 0
     ? process.env.OPENCODE_WSL_DISTRO.trim()
@@ -7026,6 +7027,15 @@ function setupProxy(app) {
       return next();
     }
 
+    // Let dedicated route handlers below decide whether to forward to the
+    // Claude Code adapter or OpenCode.
+    if (req.method === 'POST' && /^\/session\/[^/]+\/prompt_async$/.test(req.path)) {
+      return next();
+    }
+    if (req.method === 'GET' && /^\/session\/[^/]+\/message$/.test(req.path)) {
+      return next();
+    }
+
     // Windows: Merge sessions from all project directories on bare GET /session
     if (process.platform === 'win32' && req.method === 'GET' && req.path === '/session') {
       const rawUrl = req.originalUrl || req.url || '';
@@ -7177,6 +7187,55 @@ function setupProxy(app) {
         });
       }
     }
+  });
+
+  // GET /api/session/:id/message — check both OpenCode and Claude Code adapter,
+  // preferring whichever has messages (the adapter stores messages for Claude Code sessions).
+  app.get('/api/session/:id/message', async (req, res) => {
+    const sessionId = req.params.id;
+    const queryString = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
+
+    // Fetch from OpenCode
+    let openCodeMessages = [];
+    try {
+      const upstreamPath = `/session/${encodeURIComponent(sessionId)}/message${queryString}`;
+      const targetUrl = buildOpenCodeUrl(upstreamPath, '');
+      const authHeaders = getOpenCodeAuthHeaders();
+      const ocResponse = await fetch(targetUrl, {
+        method: 'GET',
+        headers: { accept: 'application/json', ...authHeaders },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (ocResponse.ok) {
+        const data = await ocResponse.json();
+        openCodeMessages = Array.isArray(data) ? data : [];
+      }
+    } catch {
+      // OpenCode may be unreachable — continue to adapter fallback
+    }
+
+    // If OpenCode returned messages, use those
+    if (openCodeMessages.length > 0 || claudeCodeAdapterPort == null) {
+      return res.json(openCodeMessages);
+    }
+
+    // Try Claude Code adapter
+    try {
+      const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/session/${encodeURIComponent(sessionId)}/message`;
+      const adapterResponse = await fetch(adapterUrl, {
+        method: 'GET',
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (adapterResponse.ok) {
+        const data = await adapterResponse.json();
+        return res.json(Array.isArray(data) ? data : []);
+      }
+    } catch {
+      // adapter unreachable
+    }
+
+    res.json(openCodeMessages);
   });
 
   // Merge GET /api/question from both OpenCode and Claude Code adapter
@@ -7555,7 +7614,24 @@ async function main(options = {}) {
   const serverStartedAt = new Date().toISOString();
   app.set('trust proxy', true);
   expressApp = app;
-  server = http.createServer(app);
+  // Use HTTPS when TLS certificates are available (e.g. from mkcert).
+  // Looks in ~/.config/openchamber/certs/ or OPENCHAMBER_TLS_CERT / OPENCHAMBER_TLS_KEY env vars.
+  const tlsCertPath = process.env.OPENCHAMBER_TLS_CERT || path.join(os.homedir(), '.config', 'openchamber', 'certs', 'cert.pem');
+  const tlsKeyPath = process.env.OPENCHAMBER_TLS_KEY || path.join(os.homedir(), '.config', 'openchamber', 'certs', 'key.pem');
+  let useTls = false;
+  try {
+    if (fs.existsSync(tlsCertPath) && fs.existsSync(tlsKeyPath)) {
+      const tlsOpts = { cert: fs.readFileSync(tlsCertPath), key: fs.readFileSync(tlsKeyPath) };
+      server = https.createServer(tlsOpts, app);
+      useTls = true;
+      console.log(`TLS enabled (cert: ${tlsCertPath})`);
+    }
+  } catch (err) {
+    console.warn(`TLS certificate found but failed to load: ${err.message}`);
+  }
+  if (!useTls) {
+    server = http.createServer(app);
+  }
 
   app.get('/health', (req, res) => {
     res.json({
@@ -14562,9 +14638,10 @@ async function main(options = {}) {
         // ignore
       }
 
-      console.log(`OpenChamber server running on port ${activePort}`);
-      console.log(`Health check: http://localhost:${activePort}/health`);
-      console.log(`Web interface: http://localhost:${activePort}`);
+      const proto = useTls ? 'https' : 'http';
+      console.log(`OpenChamber server running on port ${activePort}${useTls ? ' (TLS)' : ''}`);
+      console.log(`Health check: ${proto}://localhost:${activePort}/health`);
+      console.log(`Web interface: ${proto}://localhost:${activePort}`);
 
       if (tryCfTunnel) {
         console.log('\nInitializing Cloudflare Quick Tunnel...');

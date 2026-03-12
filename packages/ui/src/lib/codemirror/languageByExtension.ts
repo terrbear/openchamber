@@ -25,15 +25,16 @@ import { ruby } from '@codemirror/legacy-modes/mode/ruby';
 import { properties } from '@codemirror/legacy-modes/mode/properties';
 import { erlang } from '@codemirror/legacy-modes/mode/erlang';
 
-const shellLanguage = StreamLanguage.define(shell);
-const tomlLanguage = StreamLanguage.define(toml);
-const diffLanguage = StreamLanguage.define(diff);
-const dockerfileLanguage = StreamLanguage.define(dockerFile);
-const rubyLanguage = StreamLanguage.define(ruby);
-const propertiesLanguage = StreamLanguage.define(properties);
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- legacy-modes may resolve to a different @codemirror/language version
+const shellLanguage = StreamLanguage.define(shell as any);
+const tomlLanguage = StreamLanguage.define(toml as any);
+const diffLanguage = StreamLanguage.define(diff as any);
+const dockerfileLanguage = StreamLanguage.define(dockerFile as any);
+const rubyLanguage = StreamLanguage.define(ruby as any);
+const propertiesLanguage = StreamLanguage.define(properties as any);
 const elixirSupport = elixir();
 const elixirLanguage = elixirSupport.language;
-const erlangLanguage = StreamLanguage.define(erlang);
+const erlangLanguage = StreamLanguage.define(erlang as any);
 
 function codeBlockLanguageResolver(info: string): Language | LanguageDescription | null {
   const normalized = info.trim().toLowerCase();
@@ -103,7 +104,7 @@ function codeBlockLanguageResolver(info: string): Language | LanguageDescription
     case 'leex':
       return html().language;
     default:
-      return LanguageDescription.matchLanguageName(languages, normalized, true);
+      return LanguageDescription.matchLanguageName(languages as any, normalized, true);
   }
 }
 
@@ -114,7 +115,7 @@ const matchLanguageDescriptionForFile = (filePath: string): LanguageDescription 
   if (!filename) {
     return null;
   }
-  return LanguageDescription.matchFilename(languages, filename);
+  return LanguageDescription.matchFilename(languages as any, filename);
 };
 
 const markdownHighlight = () => syntaxHighlighting(HighlightStyle.define([
@@ -182,7 +183,7 @@ export function languageByExtension(filePath: string): Extension | null {
     case 'mkd':
       return [
         markdown({
-          codeLanguages: codeBlockLanguageResolver,
+          codeLanguages: codeBlockLanguageResolver as any,
         }),
         markdownHighlight(),
       ];

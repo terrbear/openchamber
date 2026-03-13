@@ -529,7 +529,6 @@ export interface SettingsPayload {
   securityScopedBookmarks?: string[];
   pinnedDirectories?: string[];
   showReasoningTraces?: boolean;
-  showTextJustificationActivity?: boolean;
   showDeletionDialog?: boolean;
   nativeNotificationsEnabled?: boolean;
   notificationMode?: 'always' | 'hidden-only';
@@ -537,8 +536,13 @@ export interface SettingsPayload {
   autoDeleteAfterDays?: number;
   queueModeEnabled?: boolean;
   gitmojiEnabled?: boolean;
-  toolCallExpansion?: 'collapsed' | 'activity' | 'detailed' | 'changes';
   inputSpellcheckEnabled?: boolean;
+  showToolFileIcons?: boolean;
+  showExpandedBashTools?: boolean;
+  showExpandedEditTools?: boolean;
+  chatRenderMode?: 'sorted' | 'live';
+  activityRenderMode?: 'collapsed' | 'summary';
+  mermaidRenderingMode?: 'svg' | 'ascii';
   fontSize?: number;
   terminalFontSize?: number;
   padding?: number;
@@ -787,6 +791,8 @@ export type GitHubPullRequestStatus = {
   pr?: GitHubPullRequest | null;
   checks?: GitHubChecksSummary | null;
   canMerge?: boolean;
+  defaultBranch?: string | null;
+  resolvedRemoteName?: string | null;
 };
 
 export type GitHubPullRequestCreateInput = {

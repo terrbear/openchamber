@@ -16,7 +16,7 @@ let _port = null;
 let sessions = {};
 let _claudeBinary = 'claude';
 let _cwd = process.cwd();
-let _permissionMode = 'bypassPermissions';
+let _permissionMode = 'default';
 
 // Pending permission questions keyed by requestId: { resolve, question }
 const pendingQuestions = {};
@@ -131,6 +131,10 @@ function toSdkSession(session) {
 // Convert stored message to the { info, parts } shape the client expects.
 function toSdkMessage(msg, sessionId) {
   const createdMs = msg.createdAt ? new Date(msg.createdAt).getTime() : Date.now();
+  const savedParts = Array.isArray(msg.parts) ? msg.parts : [];
+  const textPart = msg.content
+    ? [{ id: `${msg.id}-p0`, type: 'text', text: msg.content, messageID: msg.id, sessionID: sessionId }]
+    : [];
   return {
     info: {
       id: msg.id,
@@ -140,9 +144,7 @@ function toSdkMessage(msg, sessionId) {
       status: 'completed',
       ...(msg.role === 'assistant' ? { finish: 'stop' } : {}),
     },
-    parts: msg.content
-      ? [{ id: `${msg.id}-p0`, type: 'text', text: msg.content, messageID: msg.id, sessionID: sessionId }]
-      : [],
+    parts: [...savedParts, ...textPart],
   };
 }
 
@@ -160,14 +162,17 @@ function createApp(cwd) {
     const id = crypto.randomUUID();
     const now = new Date().toISOString();
     const title = (req.body && req.body.title) || 'New Session';
+    const directory = (req.body && req.body.directory) || req.query.directory || req.get('x-opencode-directory') || cwd;
+    console.log(`[claudecode-adapter] POST /session: directory=${directory} (body=${req.body?.directory}, query=${req.query.directory}, header=${req.get('x-opencode-directory')}, fallback=${cwd})`);
     const session = {
       id,
       title,
-      directory: cwd,
+      directory,
       createdAt: now,
       updatedAt: now,
       messageCount: 0,
       claudeSessionId: null, // set after first successful claude run
+      agent: null,
     };
     sessions[id] = session;
     try {
@@ -237,20 +242,27 @@ function createApp(cwd) {
     // unknown session ID (e.g. routed from an OpenCode-managed session).
     if (!Object.hasOwn(sessions, id)) {
       const now = new Date().toISOString();
+      const directory = req.query.directory || req.get('x-opencode-directory') || cwd;
       sessions[id] = {
         id,
         title: 'New Session',
-        directory: cwd,
+        directory,
         createdAt: now,
         updatedAt: now,
         messageCount: 0,
         claudeSessionId: null,
+        agent: null,
       };
       saveSessions().catch(() => {});
     }
 
     // Extract text from parts array (OpenCode API format)
     const body = req.body || {};
+
+    // Capture agent from the request body (sent by the UI)
+    if (body.agent && typeof body.agent === 'string') {
+      sessions[id].agent = body.agent;
+    }
     console.log(`[claudecode-adapter] prompt_async received for session=${id}, body keys=${Object.keys(body).join(',')}`);
     const parts = Array.isArray(body.parts) ? body.parts : [];
     const textPart = parts.find(p => p && p.type === 'text');
@@ -310,12 +322,17 @@ function createApp(cwd) {
             existing.kill('SIGTERM');
           }
 
-          const sessionCwd = (Object.hasOwn(sessions, id) && sessions[id].directory) || _cwd;
-          const claudeSessionId = useResume && Object.hasOwn(sessions, id) ? sessions[id].claudeSessionId : null;
+          const sessionData = Object.hasOwn(sessions, id) ? sessions[id] : null;
+          const sessionCwd = (sessionData && sessionData.directory) || _cwd;
+          const claudeSessionId = useResume && sessionData ? sessionData.claudeSessionId : null;
+          const sessionAgent = sessionData ? sessionData.agent : null;
           const args = [
             '--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
             '--permission-mode', _permissionMode,
             '--permission-prompt-tool', 'stdio',
+            // Auto-allow read operations so Claude can explore without prompting
+            '--allowed-tools', 'Read', 'Glob', 'Grep',
+            ...(sessionAgent ? ['--agent', sessionAgent] : []),
             ...(claudeSessionId ? ['--resume', claudeSessionId] : []),
           ];
           // Strip Claude Code's own env vars so nested sessions aren't blocked
@@ -344,6 +361,9 @@ function createApp(cwd) {
           let stdoutBuf = '';
           let stderrBuf = '';
           let assistantText = '';
+          const allParts = [];       // track all emitted parts for the final message.updated
+          let blockIndex = 0;        // monotonic counter for stable part IDs
+          const seenToolIds = new Map(); // claude tool_use block.id → our part ID
 
           const timeoutHandle = setTimeout(() => {
             if (!claudeProc.killed) {
@@ -454,18 +474,83 @@ function createApp(cwd) {
               for (const block of parsed.message.content) {
                 if (block.type === 'text' && typeof block.text === 'string') {
                   assistantText += block.text;
+                } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
+                  const partId = `${assistantMessageId}-r${blockIndex++}`;
+                  const reasoningPart = {
+                    id: partId,
+                    type: 'reasoning',
+                    text: block.thinking,
+                    messageID: assistantMessageId,
+                    sessionID: id,
+                    time: { start: Date.now() },
+                  };
+                  allParts.push(reasoningPart);
+                  broadcastGlobalEvent({
+                    type: 'message.part.updated',
+                    properties: {
+                      part: reasoningPart,
+                      info: { id: assistantMessageId, sessionID: id, role: 'assistant' }
+                    }
+                  });
+                } else if (block.type === 'tool_use') {
+                  const partId = `${assistantMessageId}-t${blockIndex++}`;
+                  if (block.id) seenToolIds.set(block.id, partId);
+                  const toolPart = {
+                    id: partId,
+                    type: 'tool',
+                    tool: block.name || 'unknown',
+                    state: {
+                      status: 'running',
+                      input: block.input || {},
+                      time: { start: Date.now() },
+                    },
+                    messageID: assistantMessageId,
+                    sessionID: id,
+                  };
+                  allParts.push(toolPart);
+                  broadcastGlobalEvent({
+                    type: 'message.part.updated',
+                    properties: {
+                      part: toolPart,
+                      info: { id: assistantMessageId, sessionID: id, role: 'assistant' }
+                    }
+                  });
+                } else if (block.type === 'tool_result' && block.tool_use_id) {
+                  // Update the matching tool part with results
+                  const toolPartId = seenToolIds.get(block.tool_use_id);
+                  if (toolPartId) {
+                    const existing = allParts.find(p => p.id === toolPartId);
+                    if (existing && existing.state) {
+                      const output = Array.isArray(block.content)
+                        ? block.content.map(c => c.text || '').join('\n')
+                        : (typeof block.content === 'string' ? block.content : '');
+                      existing.state.status = block.is_error ? 'error' : 'completed';
+                      existing.state.output = output;
+                      existing.state.time.end = Date.now();
+                      broadcastGlobalEvent({
+                        type: 'message.part.updated',
+                        properties: {
+                          part: existing,
+                          info: { id: assistantMessageId, sessionID: id, role: 'assistant' }
+                        }
+                      });
+                    }
+                  }
                 }
               }
+
+              // Always broadcast text part (even if empty, to keep the stall detector happy)
+              const textPart = {
+                id: assistantPartId,
+                type: 'text',
+                text: assistantText,
+                messageID: assistantMessageId,
+                sessionID: id,
+              };
               broadcastGlobalEvent({
                 type: 'message.part.updated',
                 properties: {
-                  part: {
-                    id: assistantPartId,
-                    type: 'text',
-                    text: assistantText,
-                    messageID: assistantMessageId,
-                    sessionID: id,
-                  },
+                  part: textPart,
                   info: { id: assistantMessageId, sessionID: id, role: 'assistant' }
                 }
               });
@@ -491,7 +576,7 @@ function createApp(cwd) {
               runningProcesses.delete(id);
             }
             console.error('[claudecode-adapter] Claude process error:', err.message);
-            resolveRun({ code: 1, assistantText: '', usedResume: !!claudeSessionId, stderr: err.message });
+            resolveRun({ code: 1, assistantText: '', allParts: [], usedResume: !!claudeSessionId, stderr: err.message });
           });
 
           claudeProc.on('close', (code) => {
@@ -508,7 +593,7 @@ function createApp(cwd) {
                 delete pendingQuestions[reqId];
               }
             }
-            resolveRun({ code, assistantText, usedResume: !!claudeSessionId, stderr: stderrBuf });
+            resolveRun({ code, assistantText, allParts, usedResume: !!claudeSessionId, stderr: stderrBuf });
           });
         });
       }
@@ -559,7 +644,7 @@ function createApp(cwd) {
 
       // Persist complete assistant message
       try {
-        const msgs = await chainedAppendMessage(id, { id: assistantMessageId, role: 'assistant', content: result.assistantText, createdAt: new Date().toISOString() });
+        const msgs = await chainedAppendMessage(id, { id: assistantMessageId, role: 'assistant', content: result.assistantText, parts: result.allParts || [], createdAt: new Date().toISOString() });
         if (msgs && Object.hasOwn(sessions, id)) {
           sessions[id].updatedAt = new Date().toISOString();
           sessions[id].messageCount = msgs.length;
@@ -569,8 +654,12 @@ function createApp(cwd) {
         console.error('[claudecode-adapter] Failed to persist assistant message:', err.message);
       }
 
-      // Emit final message.updated with complete content
+      // Emit final message.updated with all parts (reasoning, tools, text)
       const assistantCompletedAt = Date.now();
+      const finalParts = [
+        ...(result.allParts || []),
+        { id: assistantPartId, type: 'text', text: result.assistantText, messageID: assistantMessageId, sessionID: id },
+      ];
       broadcastGlobalEvent({
         type: 'message.updated',
         properties: {
@@ -581,7 +670,7 @@ function createApp(cwd) {
             status: 'completed',
             finish: 'stop',
             time: { created: assistantCompletedAt, updated: assistantCompletedAt, completed: assistantCompletedAt },
-            parts: [{ id: assistantPartId, type: 'text', text: result.assistantText, messageID: assistantMessageId, sessionID: id }],
+            parts: finalParts,
           }
         }
       });
@@ -721,7 +810,7 @@ export async function startClaudeCodeAdapter({ port = 0, claudeBinary, cwd, perm
   if (cwd) {
     _cwd = cwd;
   }
-  _permissionMode = permissionMode || 'bypassPermissions';
+  _permissionMode = permissionMode || 'default';
 
   await ensureDataDir();
 

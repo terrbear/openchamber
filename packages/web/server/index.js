@@ -3675,7 +3675,7 @@ const ENV_SKIP_OPENCODE_START = process.env.OPENCODE_SKIP_START === 'true' ||
 const ENV_DESKTOP_NOTIFY = process.env.OPENCHAMBER_DESKTOP_NOTIFY === 'true';
 const ENV_BACKEND = process.env.OPENCHAMBER_BACKEND || 'opencode';
 const ENV_CLAUDECODE_BINARY = (process.env.CLAUDECODE_BINARY || '').trim() || 'claude';
-const ENV_CLAUDECODE_PERMISSION_MODE = (process.env.CLAUDECODE_PERMISSION_MODE || '').trim() || 'bypassPermissions';
+const ENV_CLAUDECODE_PERMISSION_MODE = (process.env.CLAUDECODE_PERMISSION_MODE || '').trim() || 'default';
 const ENV_CONFIGURED_OPENCODE_WSL_DISTRO =
   typeof process.env.OPENCODE_WSL_DISTRO === 'string' && process.env.OPENCODE_WSL_DISTRO.trim().length > 0
     ? process.env.OPENCODE_WSL_DISTRO.trim()
@@ -5829,6 +5829,12 @@ function connectAdapterSse(res, abortSignal) {
               try {
                 res.write(`${block}\n\n`);
               } catch { /* client gone */ }
+              // Run the notification pipeline on adapter events too
+              const adapterPayload = parseSseDataPayload(block);
+              if (adapterPayload) {
+                maybeCacheSessionInfoFromEvent(adapterPayload);
+                void maybeSendPushForTrigger(adapterPayload);
+              }
             }
           }
         }
@@ -6648,7 +6654,11 @@ function setupProxy(app) {
     let endedBy = 'upstream-end';
     let stopAdapterSse = null;
 
+    // Register this SSE client for UI notification broadcasts
+    uiNotificationClients.add(res);
+
     const cleanup = () => {
+      uiNotificationClients.delete(res);
       if (connectTimer) {
         clearTimeout(connectTimer);
         connectTimer = null;
@@ -7163,14 +7173,19 @@ function setupProxy(app) {
       return;
     }
 
-    // Forward to Claude Code adapter
-    const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/session/${encodeURIComponent(sessionId)}/prompt_async`;
-    console.log(`[ClaudeCode] Forwarding prompt_async for session ${sessionId} to adapter at port ${claudeCodeAdapterPort}`);
+    // Forward to Claude Code adapter, preserving query params (e.g. ?directory=...)
+    const adapterBase = `http://127.0.0.1:${claudeCodeAdapterPort}/session/${encodeURIComponent(sessionId)}/prompt_async`;
+    const origQuery = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
+    const adapterUrl = adapterBase + origQuery;
+    console.log(`[ClaudeCode] Forwarding prompt_async for session ${sessionId} to adapter at port ${claudeCodeAdapterPort}, url=${adapterUrl}`);
 
     try {
+      const adapterHeaders = { 'content-type': 'application/json' };
+      const dirHeader = req.headers['x-opencode-directory'];
+      if (dirHeader) adapterHeaders['x-opencode-directory'] = dirHeader;
       const upstreamResponse = await fetch(adapterUrl, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: adapterHeaders,
         body: rawBuffer,
         signal: AbortSignal.timeout(LONG_REQUEST_TIMEOUT_MS),
       });

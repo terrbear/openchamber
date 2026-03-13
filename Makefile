@@ -1,6 +1,8 @@
 .PHONY: package certs
 
 CERT_DIR := $(HOME)/.config/openchamber/certs
+LOG_DIR := $(HOME)/.local/share/openchamber
+LOG_FILE := $(LOG_DIR)/server.log
 
 certs:
 	@command -v mkcert >/dev/null 2>&1 || { echo "mkcert not found. Install: https://github.com/FiloSottile/mkcert"; exit 1; }
@@ -17,6 +19,19 @@ run:
 run-cc:
 	(kill $(shell (lsof -ti:6969)) && sleep 3) || true
 	OPENCHAMBER_BACKEND=claudecode bun run dev
+
+run-log:
+	(kill $(shell (lsof -ti:6969)) && sleep 3) || true
+	@mkdir -p $(LOG_DIR)
+	OPENCHAMBER_BACKEND=opencode bun run dev 2>&1 | tee $(LOG_FILE)
+
+run-cc-log:
+	(kill $(shell (lsof -ti:6969)) && sleep 3) || true
+	@mkdir -p $(LOG_DIR)
+	OPENCHAMBER_BACKEND=claudecode bun run dev 2>&1 | tee $(LOG_FILE)
+
+tail-log:
+	tail -f $(LOG_FILE)
 
 # Detect platform and set appropriate bundle types
 UNAME_S := $(shell uname -s)

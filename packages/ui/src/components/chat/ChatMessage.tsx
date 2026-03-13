@@ -425,8 +425,11 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
             return visibleParts;
         }
 
-        return isMessageCompleted ? visibleParts : [];
-    }, [isUser, isMessageCompleted, visibleParts]);
+        // Show parts while streaming so thinking/tools are visible during execution
+        return (isMessageCompleted || isStreamingMessage || visibleParts.length > 0)
+            ? visibleParts
+            : [];
+    }, [isUser, isMessageCompleted, isStreamingMessage, visibleParts]);
 
 
     const assistantTextParts = React.useMemo(() => {

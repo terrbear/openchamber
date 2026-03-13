@@ -1477,6 +1477,41 @@ class OpencodeService {
     }
   }
 
+  private parseSseBlock(block: string): { data: unknown; id?: string } | null {
+    if (!block) return null;
+
+    const lines = block.split('\n');
+    const dataLines: string[] = [];
+    let eventId: string | undefined;
+
+    for (const line of lines) {
+      if (line.startsWith('data:')) {
+        dataLines.push(line.slice(5).replace(/^\s/, ''));
+      } else if (line.startsWith('id:')) {
+        const candidate = line.slice(3).trim();
+        if (candidate) {
+          eventId = candidate;
+        }
+      }
+    }
+
+    if (dataLines.length === 0) {
+      return null;
+    }
+
+    const payloadText = dataLines.join('\n').trim();
+    if (!payloadText) {
+      return null;
+    }
+
+    try {
+      const data = JSON.parse(payloadText) as unknown;
+      return { data, id: eventId };
+    } catch {
+      return null;
+    }
+  }
+
   private normalizeRoutedSsePayload(raw: unknown): RoutedOpencodeEvent | null {
     if (!raw || typeof raw !== 'object') {
       return null;

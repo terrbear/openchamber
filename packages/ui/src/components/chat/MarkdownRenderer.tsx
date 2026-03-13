@@ -1526,7 +1526,7 @@ export const SimpleMarkdownRenderer: React.FC<{
         plugins={streamdownPlugins}
         components={streamdownComponents}
         // @ts-expect-error Streamdown type missing linkSafety in older minor
-        linkSafety={disableLinkSafety ? { enabled: false } : undefined}
+        linkSafety={{ enabled: false }}
       >
         {renderedContent}
       </Streamdown>

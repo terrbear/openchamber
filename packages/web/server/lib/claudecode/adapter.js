@@ -9,7 +9,7 @@ import { spawn } from 'child_process';
 const DATA_DIR = path.join(os.homedir(), '.local', 'share', 'openchamber');
 const SESSIONS_FILE = path.join(DATA_DIR, 'claudecode-sessions.json');
 
-const TIMEOUT_MS = 5 * 60 * 1000;
+const TIMEOUT_MS = 10 * 60 * 1000;
 const STDERR_MAX = 64 * 1024; // 64KB
 
 let _port = null;
@@ -17,6 +17,133 @@ let sessions = {};
 let _claudeBinary = 'claude';
 let _cwd = process.cwd();
 let _permissionMode = 'default';
+
+// ---------------------------------------------------------------------------
+// Permission rule matching against ~/.claude/settings.json
+// ---------------------------------------------------------------------------
+
+// Parse a rule like "Bash(*)" or "Edit(/home/user/**)" or "WebFetch(domain:github.com)"
+// Returns { tool, filter } where filter is the string inside parens.
+function parseRule(rule) {
+  const m = rule.match(/^([^(]+)\((.+)\)$/);
+  if (!m) return { tool: rule, filter: '*' };
+  return { tool: m[1], filter: m[2] };
+}
+
+// Simple glob match supporting * and **
+function globMatch(pattern, value) {
+  if (pattern === '*') return true;
+  // Convert glob to regex: ** matches anything, * matches non-/ chars
+  const re = pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')  // escape regex specials except * and ?
+    .replace(/\*\*/g, '\0')                  // placeholder for **
+    .replace(/\*/g, '[^/]*')                 // * matches within a path segment
+    .replace(/\0/g, '.*');                   // ** matches across segments
+  return new RegExp(`^${re}$`).test(value);
+}
+
+// Extract the primary value to match against from a tool's input.
+function extractToolValue(toolName, input) {
+  switch (toolName) {
+    case 'Bash':
+      return input.command || '';
+    case 'Read':
+    case 'Edit':
+    case 'Write':
+    case 'Glob':
+    case 'Grep':
+    case 'NotebookEdit':
+      return input.file_path || input.path || input.pattern || '';
+    case 'WebFetch':
+    case 'WebSearch':
+      return input.url || input.domain || '';
+    case 'Agent':
+      return input.prompt || '';
+    default:
+      return '';
+  }
+}
+
+// Check if a single rule matches a tool invocation.
+function ruleMatches(rule, toolName, input) {
+  const { tool, filter } = parseRule(rule);
+
+  // Tool name matching — support wildcards (e.g. "mcp__*__*")
+  if (!globMatch(tool, toolName)) return false;
+
+  if (filter === '*') return true;
+
+  // "domain:example.com" filter for WebFetch
+  if (filter.startsWith('domain:')) {
+    const domain = filter.slice(7);
+    const url = input.url || input.domain || '';
+    try {
+      const host = url.startsWith('http') ? new URL(url).hostname : url;
+      return host === domain || host.endsWith('.' + domain);
+    } catch {
+      return url.includes(domain);
+    }
+  }
+
+  // "sudo:*" filter for Bash deny rules
+  if (filter.startsWith('sudo:')) {
+    const cmd = input.command || '';
+    return /(?:^|\s|&&|\|\||;)sudo(?:\s|$)/.test(cmd);
+  }
+
+  // Path glob filter — match against the primary value
+  const value = extractToolValue(toolName, input);
+  if (value) return globMatch(filter, value);
+
+  return false;
+}
+
+// Load permission rules from ~/.claude/settings.json (and optionally project settings).
+function loadPermissionRules(projectDir) {
+  const rules = { allow: [], deny: [] };
+
+  // Global settings
+  const globalPath = path.join(os.homedir(), '.claude', 'settings.json');
+  try {
+    const raw = fs.readFileSync(globalPath, 'utf8');
+    const settings = JSON.parse(raw);
+    if (settings.permissions) {
+      if (Array.isArray(settings.permissions.allow)) rules.allow.push(...settings.permissions.allow);
+      if (Array.isArray(settings.permissions.deny)) rules.deny.push(...settings.permissions.deny);
+    }
+  } catch { /* missing or invalid — no rules */ }
+
+  // Project-level settings (.claude/settings.json in the project dir)
+  if (projectDir) {
+    for (const name of ['settings.json', 'settings.local.json']) {
+      const projPath = path.join(projectDir, '.claude', name);
+      try {
+        const raw = fs.readFileSync(projPath, 'utf8');
+        const settings = JSON.parse(raw);
+        if (settings.permissions) {
+          if (Array.isArray(settings.permissions.allow)) rules.allow.push(...settings.permissions.allow);
+          if (Array.isArray(settings.permissions.deny)) rules.deny.push(...settings.permissions.deny);
+        }
+      } catch { /* missing or invalid */ }
+    }
+  }
+
+  return rules;
+}
+
+// Evaluate whether a tool invocation should be allowed, denied, or needs user input.
+// Returns 'allow', 'deny', or 'ask'.
+function evaluatePermission(toolName, input, rules) {
+  // Deny rules take priority
+  for (const rule of rules.deny) {
+    if (ruleMatches(rule, toolName, input)) return 'deny';
+  }
+  // Check allow rules
+  for (const rule of rules.allow) {
+    if (ruleMatches(rule, toolName, input)) return 'allow';
+  }
+  return 'ask';
+}
 
 // Pending permission questions keyed by requestId: { resolve, question }
 const pendingQuestions = {};
@@ -330,8 +457,6 @@ function createApp(cwd) {
             '--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
             '--permission-mode', _permissionMode,
             '--permission-prompt-tool', 'stdio',
-            // Auto-allow read operations so Claude can explore without prompting
-            '--allowed-tools', 'Read', 'Glob', 'Grep',
             ...(sessionAgent ? ['--agent', sessionAgent] : []),
             ...(claudeSessionId ? ['--resume', claudeSessionId] : []),
           ];
@@ -365,12 +490,34 @@ function createApp(cwd) {
           let blockIndex = 0;        // monotonic counter for stable part IDs
           const seenToolIds = new Map(); // claude tool_use block.id → our part ID
 
-          const timeoutHandle = setTimeout(() => {
-            if (!claudeProc.killed) {
-              try { claudeProc.stdin.end(); } catch { /* already closed */ }
-              claudeProc.kill('SIGTERM');
-            }
-          }, TIMEOUT_MS);
+          let timeoutHandle = null;
+          let timeoutPaused = false;
+
+          function startTimeout() {
+            clearTimeout(timeoutHandle);
+            if (timeoutPaused) return;
+            timeoutHandle = setTimeout(() => {
+              if (!claudeProc.killed) {
+                console.log(`[claudecode-adapter] session ${id} timed out after ${TIMEOUT_MS / 1000}s of inactivity`);
+                try { claudeProc.stdin.end(); } catch { /* already closed */ }
+                claudeProc.kill('SIGTERM');
+              }
+            }, TIMEOUT_MS);
+          }
+
+          // Reset the inactivity timeout on activity (stdout data, permission response).
+          function resetTimeout() {
+            timeoutPaused = false;
+            startTimeout();
+          }
+
+          // Pause the timeout while waiting for user input (permission prompts).
+          function pauseTimeout() {
+            timeoutPaused = true;
+            clearTimeout(timeoutHandle);
+          }
+
+          startTimeout();
 
           const processLine = (line) => {
             if (!line.trim()) return;
@@ -412,6 +559,7 @@ function createApp(cwd) {
                 pendingQuestions[requestId] = {
                   question,
                   resolve: ({ answers }) => {
+                    resetTimeout();
                     const response = JSON.stringify({
                       type: 'control_response',
                       response: {
@@ -427,11 +575,44 @@ function createApp(cwd) {
                   },
                 };
 
+                pauseTimeout();
                 broadcastGlobalEvent({ type: 'question.asked', properties: question });
                 return;
               }
 
-              // Other tool permissions (Bash, Edit, etc.): show Yes/No
+              // Check permission rules from ~/.claude/settings.json before prompting.
+              const permRules = loadPermissionRules(sessionCwd);
+              const decision = evaluatePermission(toolName, toolInput, permRules);
+
+              if (decision === 'allow') {
+                console.log(`[claudecode-adapter] auto-allow ${toolName} (matched settings.json rule)`);
+                const autoResponse = JSON.stringify({
+                  type: 'control_response',
+                  response: {
+                    request_id: requestId,
+                    subtype: 'success',
+                    response: { behavior: 'allow', updatedInput: toolInput },
+                  },
+                }) + '\n';
+                claudeProc.stdin.write(autoResponse, 'utf8');
+                return;
+              }
+
+              if (decision === 'deny') {
+                console.log(`[claudecode-adapter] auto-deny ${toolName} (matched settings.json deny rule)`);
+                const denyResponse = JSON.stringify({
+                  type: 'control_response',
+                  response: {
+                    request_id: requestId,
+                    subtype: 'success',
+                    response: { behavior: 'deny', message: 'Denied by settings.json rule' },
+                  },
+                }) + '\n';
+                claudeProc.stdin.write(denyResponse, 'utf8');
+                return;
+              }
+
+              // No rule matched — prompt the user
               const inputSummary = typeof toolInput === 'object'
                 ? (toolInput.command || toolInput.path || JSON.stringify(toolInput).slice(0, 80))
                 : String(toolInput).slice(0, 80);
@@ -452,6 +633,7 @@ function createApp(cwd) {
               pendingQuestions[requestId] = {
                 question,
                 resolve: ({ allow }) => {
+                  resetTimeout();
                   const response = JSON.stringify({
                     type: 'control_response',
                     response: {
@@ -466,6 +648,7 @@ function createApp(cwd) {
                 },
               };
 
+              pauseTimeout();
               broadcastGlobalEvent({ type: 'question.asked', properties: question });
               return;
             }
@@ -558,6 +741,7 @@ function createApp(cwd) {
           };
 
           claudeProc.stdout.on('data', (chunk) => {
+            resetTimeout();
             stdoutBuf += chunk.toString('utf8');
             const lines = stdoutBuf.split('\n');
             stdoutBuf = lines.pop() ?? '';

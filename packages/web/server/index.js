@@ -7045,6 +7045,15 @@ function setupProxy(app) {
     if (req.method === 'GET' && /^\/session\/[^/]+\/message$/.test(req.path)) {
       return next();
     }
+    // Question reply/reject routes have dedicated handlers that try the Claude Code
+    // adapter first before falling through to OpenCode.
+    if (req.method === 'POST' && /^\/question\/[^/]+\/(reply|reject)$/.test(req.path)) {
+      return next();
+    }
+    // Question list and permission list merge from both backends.
+    if (req.method === 'GET' && (req.path === '/question' || req.path === '/permission')) {
+      return next();
+    }
 
     // Windows: Merge sessions from all project directories on bare GET /session
     if (process.platform === 'win32' && req.method === 'GET' && req.path === '/session') {

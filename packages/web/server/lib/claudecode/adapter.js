@@ -151,6 +151,11 @@ const pendingQuestions = {};
 // Track running claude processes per session to prevent concurrent prompts
 const runningProcesses = new Map();
 
+// Track in-progress assistant message state so GET endpoints can serve it
+// while Claude is still running. Keyed by session ID.
+// Value: { messageId, partId, allParts, assistantText }
+const inProgressMessages = new Map();
+
 // Per-session promise chains for serializing message file writes.
 // Same pattern as `saveChain` for sessions, but keyed per session so
 // different sessions can write in parallel while writes to the same
@@ -358,7 +363,29 @@ function createApp(cwd) {
       return res.status(404).json({ error: 'Session not found' });
     }
     const messages = await loadMessages(id);
-    res.json(messages.map(msg => toSdkMessage(msg, id)));
+    const result = messages.map(msg => toSdkMessage(msg, id));
+
+    // If there's an in-progress assistant message, include it so the UI
+    // can show tool calls and reasoning while Claude is still working.
+    const ip = inProgressMessages.get(id);
+    if (ip && (ip.allParts.length > 0 || ip.assistantText)) {
+      const now = Date.now();
+      const textPart = ip.assistantText
+        ? [{ id: `${ip.partId}`, type: 'text', text: ip.assistantText, messageID: ip.messageId, sessionID: id }]
+        : [];
+      result.push({
+        info: {
+          id: ip.messageId,
+          sessionID: id,
+          role: 'assistant',
+          status: 'running',
+          time: { created: now, updated: now },
+        },
+        parts: [...ip.allParts, ...textPart],
+      });
+    }
+
+    res.json(result);
   });
 
   // POST /session/:id/prompt_async — fire-and-forget; events delivered via SSE
@@ -487,6 +514,10 @@ function createApp(cwd) {
           let stderrBuf = '';
           let assistantText = '';
           const allParts = [];       // track all emitted parts for the final message.updated
+
+          // Expose in-progress state so GET endpoints can serve partial results
+          const inProgress = { messageId: assistantMessageId, partId: assistantPartId, allParts, assistantText };
+          inProgressMessages.set(id, inProgress);
           let blockIndex = 0;        // monotonic counter for stable part IDs
           const seenToolIds = new Map(); // claude tool_use block.id → our part ID
 
@@ -657,6 +688,7 @@ function createApp(cwd) {
               for (const block of parsed.message.content) {
                 if (block.type === 'text' && typeof block.text === 'string') {
                   assistantText += block.text;
+                  inProgress.assistantText = assistantText;
                 } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
                   const partId = `${assistantMessageId}-r${blockIndex++}`;
                   const reasoningPart = {
@@ -759,6 +791,7 @@ function createApp(cwd) {
             if (runningProcesses.get(id) === claudeProc) {
               runningProcesses.delete(id);
             }
+            inProgressMessages.delete(id);
             console.error('[claudecode-adapter] Claude process error:', err.message);
             resolveRun({ code: 1, assistantText: '', allParts: [], usedResume: !!claudeSessionId, stderr: err.message });
           });
@@ -770,6 +803,7 @@ function createApp(cwd) {
             if (runningProcesses.get(id) === claudeProc) {
               runningProcesses.delete(id);
             }
+            inProgressMessages.delete(id);
             if (stdoutBuf.trim()) processLine(stdoutBuf.trim());
             // Clean up any pending questions for this session
             for (const [reqId, entry] of Object.entries(pendingQuestions)) {
@@ -925,9 +959,13 @@ function createApp(cwd) {
     res.json({ ok: true });
   });
 
-  // Stubs for UI polling endpoints
+  // Session status endpoint — reports busy for sessions with running Claude processes
   app.get('/session/status', (_req, res) => {
-    res.json({ sessions: {} });
+    const statuses = {};
+    for (const [sessionId] of runningProcesses) {
+      statuses[sessionId] = { type: 'busy' };
+    }
+    res.json(statuses);
   });
   app.get('/session/:id/todo', (_req, res) => {
     res.json([]);

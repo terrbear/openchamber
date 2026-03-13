@@ -1450,6 +1450,8 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
          controls={streamdownControls}
          plugins={streamdownPlugins}
          components={streamdownComponents}
+         // @ts-expect-error Streamdown type missing linkSafety in older minor
+         linkSafety={{ enabled: false }}
         >
         {content}
       </Streamdown>

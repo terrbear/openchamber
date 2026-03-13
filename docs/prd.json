@@ -1,0 +1,176 @@
+{
+  "project": "OpenChamber",
+  "branchName": "feature/claude-code-backend",
+  "description": "Claude Code as Selectable Provider - Make Claude Code available as a selectable provider in the model dropdown alongside existing providers, enabling dynamic switching without restarting OpenChamber.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Detect claude CLI availability on server startup",
+      "description": "As a developer, I need the server to detect whether the claude CLI binary is available at startup so the system knows whether to offer Claude Code as a provider.",
+      "acceptanceCriteria": [
+        "On server startup in packages/web/server/index.js, attempt to locate the claude binary by checking CLAUDECODE_BINARY env var first, then searching PATH for 'claude' (reuse or extract the detection logic from checkClaudeCodeCLI in packages/web/bin/cli.js)",
+        "Detection runs asynchronously and does not block server startup or delay OpenCode initialization",
+        "If claude is found, store the resolved binary path in a module-level variable (e.g., resolvedClaudeBinary) and log: [openchamber] Claude Code CLI detected: <path>",
+        "If claude is not found, log a debug message: [openchamber] Claude Code CLI not found, Claude Code provider will not be available",
+        "The CLAUDECODE_BINARY environment variable overrides auto-detection",
+        "Detection result is accessible to other middleware in the same module (for provider injection and adapter startup)",
+        "Typecheck passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-002",
+      "title": "Start Claude Code adapter alongside OpenCode in hybrid mode",
+      "description": "As a developer, I need the Claude Code adapter to run simultaneously with OpenCode so messages can be routed to either backend based on the selected provider.",
+      "acceptanceCriteria": [
+        "When ENV_BACKEND is 'opencode' (the default) AND resolvedClaudeBinary is set (from US-001), start the Claude Code adapter on a separate port using the existing startClaudeCodeAdapter() from packages/web/server/lib/claudecode/adapter.js",
+        "The adapter is started after OpenCode is ready (after setupProxy is called), using startClaudeCodeAdapter({ port: 0, claudeBinary: resolvedClaudeBinary, cwd: process.cwd(), permissionMode: ENV_CLAUDECODE_PERMISSION_MODE })",
+        "Store the adapter port in a new module-level variable claudeCodeAdapterPort (separate from openCodePort)",
+        "Store the adapter instance in the existing claudeCodeAdapterInstance variable for shutdown",
+        "When ENV_BACKEND is 'claudecode' (legacy mode), behavior is unchanged from current implementation",
+        "If the adapter fails to start, log a warning and set claudeCodeAdapterPort to null (do not crash the server)",
+        "The adapter is stopped during gracefulShutdown() alongside existing OpenCode cleanup",
+        "The /health endpoint response includes claudeCodeAvailable: true/false and claudeCodeAdapterPort fields",
+        "Typecheck passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-003",
+      "title": "Inject Claude Code provider into /config/providers response",
+      "description": "As the server, I need to augment the OpenCode provider list with a Claude Code provider entry so the frontend can display it in the model dropdown.",
+      "acceptanceCriteria": [
+        "In packages/web/server/index.js, add a route handler for GET /api/config/providers that intercepts BEFORE the proxy middleware, fetches the response from OpenCode internally, and augments it",
+        "If claudeCodeAdapterPort is set (adapter is running), append a claudecode provider to the providers array: { id: 'claudecode', name: 'Claude Code', models: { default: { id: 'default', name: 'Default (Claude Code manages model selection)' } } }",
+        "If claudeCodeAdapterPort is null (adapter not running), pass the OpenCode response through unmodified",
+        "The injected provider appears at the end of the providers list after all OpenCode providers",
+        "The response shape matches the Provider type from @opencode-ai/sdk/v2 that loadProviders() in useConfigStore.ts expects",
+        "Existing OpenCode providers are not modified or removed",
+        "Typecheck passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-004",
+      "title": "Route prompt_async requests to Claude Code adapter based on provider selection",
+      "description": "As the server, I need to route prompt_async requests to either OpenCode or the Claude Code adapter based on the selected providerID.",
+      "acceptanceCriteria": [
+        "In packages/web/server/index.js, add middleware before the existing proxy that handles POST /api/session/:id/prompt_async requests",
+        "The middleware parses the JSON request body and inspects model.providerID",
+        "When providerID is 'claudecode' and claudeCodeAdapterPort is set, proxy the request to http://127.0.0.1:<claudeCodeAdapterPort>/session/:id/prompt_async",
+        "When providerID is any other value (or claudeCodeAdapterPort is null), call next() to let the existing proxy handle it as usual",
+        "The proxied request to the Claude Code adapter includes the full original request body",
+        "Error responses from the Claude Code adapter are forwarded to the client with the original HTTP status codes",
+        "The middleware must buffer/re-attach the request body since express.json() may have already consumed it",
+        "Typecheck passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-005",
+      "title": "Merge Claude Code SSE events into the client event stream",
+      "description": "As a developer, I need SSE events from Claude Code sessions to reach the client through the existing event stream so the UI updates in real time.",
+      "acceptanceCriteria": [
+        "In packages/web/server/index.js, when claudeCodeAdapterPort is set, connect to the Claude Code adapter's /event SSE endpoint as an upstream source",
+        "Events received from the Claude Code adapter SSE stream are forwarded to the client's /api/event and /api/global/event SSE connections",
+        "The existing forwardSseRequest function in setupProxy() handles OpenCode events; add a parallel connection to the adapter's event stream that merges events into the same client response",
+        "Events include the correct sessionID so the frontend associates them with the right session",
+        "If the adapter SSE connection drops, attempt to reconnect after a brief delay",
+        "When claudeCodeAdapterPort is null, no adapter SSE connection is made (existing behavior)",
+        "Typecheck passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-006",
+      "title": "Forward Claude Code question and permission requests to client",
+      "description": "As a developer, I need permission prompts and question requests from Claude Code to reach the client through the existing question/permission endpoints.",
+      "acceptanceCriteria": [
+        "In packages/web/server/index.js, add middleware for GET /api/question that also fetches pending questions from the Claude Code adapter (GET http://127.0.0.1:<claudeCodeAdapterPort>/question) and merges them into the response",
+        "POST /api/question/reply and POST /api/question/reject are proxied to the Claude Code adapter when the requestID matches a Claude Code question (adapter tracks its own pending questions)",
+        "GET /api/permission returns merged results from both OpenCode and the Claude Code adapter",
+        "When claudeCodeAdapterPort is null, these endpoints pass through to OpenCode only (existing behavior)",
+        "Typecheck passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-007",
+      "title": "Handle Claude Code session state mapping for --resume continuity",
+      "description": "As a developer, I need Claude Code's --resume session continuity to work correctly when Claude Code is used as a provider within an OpenCode-managed session.",
+      "acceptanceCriteria": [
+        "The Claude Code adapter maintains a mapping from OpenCode session IDs to Claude Code session IDs (the claudeSessionId field already exists in the adapter's session objects)",
+        "When the adapter receives a prompt_async for a session ID it has not seen before, it creates a new entry in its sessions map for that ID and starts a fresh claude conversation",
+        "The adapter captures session_id from the claude result event and stores it as claudeSessionId",
+        "Subsequent prompt_async calls for the same session use --resume <claudeSessionId> to continue the conversation",
+        "If --resume fails (claude exits with non-zero and no output), the adapter retries without --resume (fresh conversation) and updates claudeSessionId",
+        "The session mapping persists across server restarts via ~/.local/share/openchamber/claudecode-sessions.json",
+        "Typecheck passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-008",
+      "title": "Add Claude Code provider logo",
+      "description": "As a user, I want to see a recognizable logo for the Claude Code provider in the model dropdown so I can identify it visually.",
+      "acceptanceCriteria": [
+        "Add a claudecode.svg logo file to packages/ui/src/assets/provider-logos/ (a simple terminal/CLI-themed icon that is visually distinct from the Anthropic logo)",
+        "The useProviderLogo.ts hook resolves providerId 'claudecode' to the new local SVG without needing any alias changes (the existing normalizeProviderId and buildLogoCandidates logic handles it automatically since the file name matches the provider ID)",
+        "The logo renders correctly at h-3.5 w-3.5 and h-4 w-4 sizes used in the model dropdown",
+        "Typecheck passes",
+        "Verify in browser using dev-browser skill"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-009",
+      "title": "Show Claude Code status in provider settings page",
+      "description": "As a user, I want to see Claude Code in the providers settings page with its availability status.",
+      "acceptanceCriteria": [
+        "The Claude Code provider appears in ProvidersPage (packages/ui/src/components/sections/providers/ProvidersPage.tsx) alongside other providers when it is in the providers list",
+        "The provider entry shows 'Available' status when Claude Code is in the provider list (no API key needed)",
+        "The provider entry does NOT show API key configuration fields (Claude Code uses its own authentication)",
+        "If Claude Code is not in the provider list (claude CLI not detected), it does not appear in the settings page",
+        "Typecheck passes",
+        "Verify in browser using dev-browser skill"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-010",
+      "title": "Add Claude Code permission mode configuration",
+      "description": "As a user, I want to configure the Claude Code permission mode so I can control how much autonomy Claude Code has when executing tools.",
+      "acceptanceCriteria": [
+        "Add a permissionMode setting for Claude Code, stored in OpenChamber's settings file (~/.config/openchamber/settings.json or equivalent)",
+        "Supported values: 'default', 'acceptEdits', 'bypassPermissions' (matching Claude Code CLI --permission-mode options)",
+        "Default value is 'acceptEdits' (matching current behavior)",
+        "The server reads this setting on startup and passes it to startClaudeCodeAdapter() as the permissionMode parameter",
+        "Add a UI control in the provider settings page (ProvidersPage.tsx) for the Claude Code provider entry: a dropdown to select the permission mode",
+        "Changing the permission mode persists to disk and takes effect for new claude subprocess spawns (existing running subprocesses are not affected)",
+        "Typecheck passes",
+        "Verify in browser using dev-browser skill"
+      ],
+      "priority": 10,
+      "passes": true,
+      "notes": ""
+    }
+  ]
+}

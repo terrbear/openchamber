@@ -1,17 +1,24 @@
 import express from 'express';
-import { createProxyMiddleware } from 'http-proxy-middleware';
+
 import path from 'path';
 import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import http from 'http';
+import https from 'https';
 import net from 'net';
 import { WebSocketServer } from 'ws';
 import { fileURLToPath } from 'url';
 import os from 'os';
 import crypto from 'crypto';
 import { createUiAuth } from './lib/opencode/ui-auth.js';
-import { startCloudflareTunnel, printTunnelWarning, checkCloudflaredAvailable } from './lib/cloudflare-tunnel.js';
-import { prepareNotificationLastMessage } from './lib/notification-message.js';
+import { createTunnelAuth } from './lib/opencode/tunnel-auth.js';
+import {
+  startCloudflareQuickTunnel,
+  startCloudflareNamedTunnel,
+  printTunnelWarning,
+  checkCloudflaredAvailable,
+} from './lib/cloudflare-tunnel.js';
+import { prepareNotificationLastMessage } from './lib/notifications/index.js';
 import {
   TERMINAL_INPUT_WS_MAX_PAYLOAD_BYTES,
   TERMINAL_INPUT_WS_PATH,
@@ -21,7 +28,7 @@ import {
   parseRequestPathname,
   pruneRebindTimestamps,
   readTerminalInputWsControlFrame,
-} from './lib/terminal-input-ws-protocol.js';
+} from './lib/terminal/index.js';
 import webPush from 'web-push';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -37,9 +44,27 @@ const MODELS_METADATA_CACHE_TTL = 5 * 60 * 1000;
 const CLIENT_RELOAD_DELAY_MS = 800;
 const OPEN_CODE_READY_GRACE_MS = 12000;
 const LONG_REQUEST_TIMEOUT_MS = 4 * 60 * 1000;
+const TUNNEL_BOOTSTRAP_TTL_DEFAULT_MS = 30 * 60 * 1000;
+const TUNNEL_BOOTSTRAP_TTL_MIN_MS = 60 * 1000;
+const TUNNEL_BOOTSTRAP_TTL_MAX_MS = 24 * 60 * 60 * 1000;
+const TUNNEL_SESSION_TTL_DEFAULT_MS = 8 * 60 * 60 * 1000;
+const TUNNEL_SESSION_TTL_MIN_MS = 5 * 60 * 1000;
+const TUNNEL_SESSION_TTL_MAX_MS = 24 * 60 * 60 * 1000;
+const TUNNEL_MODE_QUICK = 'quick';
+const TUNNEL_MODE_NAMED = 'named';
+const OPENCHAMBER_VERSION = (() => {
+  try {
+    const packagePath = path.resolve(__dirname, '..', 'package.json');
+    const raw = fs.readFileSync(packagePath, 'utf8');
+    const pkg = JSON.parse(raw);
+    if (pkg && typeof pkg.version === 'string' && pkg.version.trim().length > 0) {
+      return pkg.version.trim();
+    }
+  } catch {
+  }
+  return 'unknown';
+})();
 const fsPromises = fs.promises;
-const DEFAULT_FILE_SEARCH_LIMIT = 60;
-const MAX_FILE_SEARCH_LIMIT = 400;
 const FILE_SEARCH_MAX_CONCURRENCY = 5;
 const FILE_SEARCH_EXCLUDED_DIRS = new Set([
   'node_modules',
@@ -87,6 +112,106 @@ const OPENCHAMBER_USER_THEMES_DIR = path.join(OPENCHAMBER_USER_CONFIG_ROOT, 'the
 const MAX_THEME_JSON_BYTES = 512 * 1024;
 
 const isNonEmptyString = (value) => typeof value === 'string' && value.trim().length > 0;
+
+const clampNumber = (value, min, max) => Math.max(min, Math.min(max, value));
+
+const normalizeTunnelBootstrapTtlMs = (value) => {
+  if (value === null) {
+    return null;
+  }
+  if (!Number.isFinite(value)) {
+    return TUNNEL_BOOTSTRAP_TTL_DEFAULT_MS;
+  }
+  return clampNumber(Math.round(value), TUNNEL_BOOTSTRAP_TTL_MIN_MS, TUNNEL_BOOTSTRAP_TTL_MAX_MS);
+};
+
+const normalizeTunnelSessionTtlMs = (value) => {
+  if (!Number.isFinite(value)) {
+    return TUNNEL_SESSION_TTL_DEFAULT_MS;
+  }
+  return clampNumber(Math.round(value), TUNNEL_SESSION_TTL_MIN_MS, TUNNEL_SESSION_TTL_MAX_MS);
+};
+
+const normalizeTunnelMode = (value) => {
+  if (typeof value !== 'string') {
+    return TUNNEL_MODE_QUICK;
+  }
+  const mode = value.trim().toLowerCase();
+  if (mode === TUNNEL_MODE_NAMED) {
+    return TUNNEL_MODE_NAMED;
+  }
+  return TUNNEL_MODE_QUICK;
+};
+
+const normalizeNamedTunnelHostname = (value) => {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  const parsed = (() => {
+    try {
+      if (trimmed.includes('://')) {
+        return new URL(trimmed);
+      }
+      return new URL(`https://${trimmed}`);
+    } catch {
+      return null;
+    }
+  })();
+
+  const hostname = parsed?.hostname?.trim().toLowerCase() || '';
+  if (!hostname) {
+    return undefined;
+  }
+  return hostname;
+};
+
+const normalizeNamedTunnelPresets = (value) => {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const result = [];
+  const seenIds = new Set();
+  const seenHostnames = new Set();
+
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') continue;
+    const candidate = entry;
+    const id = typeof candidate.id === 'string' ? candidate.id.trim() : '';
+    const name = typeof candidate.name === 'string' ? candidate.name.trim() : '';
+    const hostname = normalizeNamedTunnelHostname(candidate.hostname);
+    if (!id || !name || !hostname) continue;
+    if (seenIds.has(id) || seenHostnames.has(hostname)) continue;
+    seenIds.add(id);
+    seenHostnames.add(hostname);
+    result.push({ id, name, hostname });
+  }
+
+  return result;
+};
+
+const normalizeNamedTunnelPresetTokens = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const result = {};
+  for (const [rawId, rawToken] of Object.entries(value)) {
+    const id = typeof rawId === 'string' ? rawId.trim() : '';
+    const token = typeof rawToken === 'string' ? rawToken.trim() : '';
+    if (!id || !token) {
+      continue;
+    }
+    result[id] = token;
+  }
+
+  return Object.keys(result).length > 0 ? result : undefined;
+};
 
 const isValidThemeColor = (value) => isNonEmptyString(value);
 
@@ -664,6 +789,37 @@ const resolveZenModel = async (override) => {
   return validatedZenFallback || ZEN_DEFAULT_MODEL;
 };
 
+const validateZenModelAtStartup = async () => {
+  try {
+    const freeModels = await fetchFreeZenModels();
+    const freeModelIds = freeModels.map((m) => m.id);
+
+    if (freeModelIds.length > 0) {
+      validatedZenFallback = freeModelIds[0];
+
+      const settings = await readSettingsFromDisk();
+      const storedModel = typeof settings?.zenModel === 'string' ? settings.zenModel.trim() : '';
+
+      if (!storedModel || !freeModelIds.includes(storedModel)) {
+        const fallback = freeModelIds[0];
+        console.log(
+          storedModel
+            ? `[zen] Stored model "${storedModel}" not found in free models, falling back to "${fallback}"`
+            : `[zen] No model configured, setting default to "${fallback}"`
+        );
+        await persistSettings({ zenModel: fallback });
+      } else {
+        console.log(`[zen] Stored model "${storedModel}" verified as available`);
+      }
+    } else {
+      console.warn('[zen] No free models returned from API, skipping validation');
+    }
+  } catch (error) {
+    console.warn('[zen] Startup model validation failed (non-blocking):', error?.message || error);
+  }
+};
+
+
 const summarizeText = async (text, targetLength, zenModel) => {
   if (!text || typeof text !== 'string' || text.trim().length === 0) return text;
 
@@ -838,6 +994,11 @@ const maybeCacheSessionInfoFromEvent = (payload) => {
   const sessionId = info.id;
   const title = info.title;
   cacheSessionTitle(sessionId, title);
+  // Also cache parentID from session events to ensure subtask detection works correctly
+  const parentID = info.parentID;
+  if (sessionId && parentID !== undefined) {
+    setCachedSessionParentId(sessionId, parentID);
+  }
 };
 
 /**
@@ -1002,59 +1163,170 @@ const buildTemplateVariables = async (payload, sessionId) => {
   };
 };
 
-const stripJsonMarkdownWrapper = (value) => {
-  if (typeof value !== 'string') {
-    return '';
-  }
-  let trimmed = value.trim();
-  if (!trimmed) {
-    return '';
-  }
-  if (trimmed.startsWith('```')) {
-    trimmed = trimmed.replace(/^```(?:json)?\s*/i, '');
-    const closingFenceIndex = trimmed.lastIndexOf('```');
-    if (closingFenceIndex !== -1) {
-      trimmed = trimmed.slice(0, closingFenceIndex);
-    }
-    trimmed = trimmed.trim();
-  }
-  if (trimmed.endsWith('```')) {
-    trimmed = trimmed.slice(0, -3).trim();
-  }
-  return trimmed;
-};
-
-const extractJsonObject = (value) => {
-  if (typeof value !== 'string') {
-    return null;
-  }
-  const source = value.trim();
-  if (!source) {
-    return null;
-  }
-  let start = source.indexOf('{');
-  while (start !== -1) {
-    let end = source.indexOf('}', start + 1);
-    while (end !== -1) {
-      const candidate = source.slice(start, end + 1);
-      try {
-        JSON.parse(candidate);
-        return candidate;
-      } catch {
-        end = source.indexOf('}', end + 1);
-      }
-    }
-    start = source.indexOf('{', start + 1);
-  }
-  return null;
-};
-
 const OPENCHAMBER_DATA_DIR = process.env.OPENCHAMBER_DATA_DIR
   ? path.resolve(process.env.OPENCHAMBER_DATA_DIR)
   : path.join(os.homedir(), '.config', 'openchamber');
 const SETTINGS_FILE_PATH = path.join(OPENCHAMBER_DATA_DIR, 'settings.json');
 const PUSH_SUBSCRIPTIONS_FILE_PATH = path.join(OPENCHAMBER_DATA_DIR, 'push-subscriptions.json');
 const TRANSCRIPTS_DIR = path.join(OPENCHAMBER_DATA_DIR, 'transcripts');
+const CLOUDFLARE_NAMED_TUNNELS_FILE_PATH = path.join(OPENCHAMBER_DATA_DIR, 'cloudflare-named-tunnels.json');
+const CLOUDFLARE_NAMED_TUNNELS_VERSION = 1;
+const PROJECT_ICONS_DIR_PATH = path.join(OPENCHAMBER_DATA_DIR, 'project-icons');
+const PROJECT_ICON_MIME_TO_EXTENSION = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/svg+xml': 'svg',
+  'image/webp': 'webp',
+  'image/x-icon': 'ico',
+};
+const PROJECT_ICON_EXTENSION_TO_MIME = Object.fromEntries(
+  Object.entries(PROJECT_ICON_MIME_TO_EXTENSION).map(([mime, ext]) => [ext, mime])
+);
+const PROJECT_ICON_SUPPORTED_MIMES = new Set(Object.keys(PROJECT_ICON_MIME_TO_EXTENSION));
+const PROJECT_ICON_MAX_BYTES = 5 * 1024 * 1024;
+const PROJECT_ICON_THEME_COLORS = {
+  light: '#111111',
+  dark: '#f5f5f5',
+};
+const PROJECT_ICON_HEX_COLOR_PATTERN = /^#(?:[\da-fA-F]{3}|[\da-fA-F]{4}|[\da-fA-F]{6}|[\da-fA-F]{8})$/;
+
+const normalizeProjectIconMime = (value) => {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'image/jpg') {
+    return 'image/jpeg';
+  }
+  if (PROJECT_ICON_SUPPORTED_MIMES.has(normalized)) {
+    return normalized;
+  }
+  return null;
+};
+
+const projectIconBaseName = (projectId) => {
+  const hash = crypto.createHash('sha1').update(projectId).digest('hex');
+  return `project-${hash}`;
+};
+
+const projectIconPathForMime = (projectId, mime) => {
+  const normalizedMime = normalizeProjectIconMime(mime);
+  if (!normalizedMime) {
+    return null;
+  }
+  const ext = PROJECT_ICON_MIME_TO_EXTENSION[normalizedMime];
+  return path.join(PROJECT_ICONS_DIR_PATH, `${projectIconBaseName(projectId)}.${ext}`);
+};
+
+const projectIconPathCandidates = (projectId) => {
+  const base = projectIconBaseName(projectId);
+  return Object.values(PROJECT_ICON_MIME_TO_EXTENSION).map((ext) => path.join(PROJECT_ICONS_DIR_PATH, `${base}.${ext}`));
+};
+
+const removeProjectIconFiles = async (projectId, keepPath) => {
+  const candidates = projectIconPathCandidates(projectId);
+  await Promise.all(candidates.map(async (candidatePath) => {
+    if (keepPath && candidatePath === keepPath) {
+      return;
+    }
+    try {
+      await fsPromises.unlink(candidatePath);
+    } catch (error) {
+      if (!error || typeof error !== 'object' || error.code !== 'ENOENT') {
+        throw error;
+      }
+    }
+  }));
+};
+
+const parseProjectIconDataUrl = (value) => {
+  if (typeof value !== 'string') {
+    return { ok: false, error: 'dataUrl is required' };
+  }
+
+  const trimmed = value.trim();
+  const match = trimmed.match(/^data:([^;,]+);base64,([A-Za-z0-9+/=\s]+)$/i);
+  if (!match) {
+    return { ok: false, error: 'Invalid dataUrl format' };
+  }
+
+  const mime = normalizeProjectIconMime(match[1]);
+  if (!mime || !['image/png', 'image/jpeg', 'image/svg+xml'].includes(mime)) {
+    return { ok: false, error: 'Icon must be PNG, JPEG, or SVG' };
+  }
+
+  try {
+    const base64 = match[2].replace(/\s+/g, '');
+    const bytes = Buffer.from(base64, 'base64');
+    if (bytes.length === 0) {
+      return { ok: false, error: 'Icon content is empty' };
+    }
+    if (bytes.length > PROJECT_ICON_MAX_BYTES) {
+      return { ok: false, error: 'Icon exceeds size limit (5 MB)' };
+    }
+    return { ok: true, mime, bytes };
+  } catch {
+    return { ok: false, error: 'Failed to decode icon data' };
+  }
+};
+
+const normalizeProjectIconThemeVariant = (value) => {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'light' || normalized === 'dark') {
+    return normalized;
+  }
+  return null;
+};
+
+const normalizeProjectIconColor = (value) => {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const normalized = value.trim();
+  if (!PROJECT_ICON_HEX_COLOR_PATTERN.test(normalized)) {
+    return null;
+  }
+  return normalized;
+};
+
+const applyProjectIconSvgTheme = (svgMarkup, themeVariant, iconColor) => {
+  if (typeof svgMarkup !== 'string') {
+    return svgMarkup;
+  }
+
+  const color = iconColor || PROJECT_ICON_THEME_COLORS[themeVariant];
+  if (!color) {
+    return svgMarkup;
+  }
+
+  const svgTagIndex = svgMarkup.search(/<svg\b/i);
+  if (svgTagIndex === -1) {
+    return svgMarkup;
+  }
+
+  const svgOpenTagEndIndex = svgMarkup.indexOf('>', svgTagIndex);
+  if (svgOpenTagEndIndex === -1) {
+    return svgMarkup;
+  }
+
+  const overrideStyle = `<style data-openchamber-theme-icon="1">:root{color:${color}!important;}</style>`;
+  return `${svgMarkup.slice(0, svgOpenTagEndIndex + 1)}${overrideStyle}${svgMarkup.slice(svgOpenTagEndIndex + 1)}`;
+};
+
+const findProjectById = (settings, projectId) => {
+  const projects = sanitizeProjects(settings?.projects) || [];
+  const index = projects.findIndex((project) => project.id === projectId);
+  if (index === -1) {
+    return { projects, index: -1, project: null };
+  }
+  return { projects, index, project: projects[index] };
+};
 
 const readSettingsFromDisk = async () => {
   try {
@@ -1085,6 +1357,7 @@ const writeSettingsToDisk = async (settings) => {
 
 const PUSH_SUBSCRIPTIONS_VERSION = 1;
 let persistPushSubscriptionsLock = Promise.resolve();
+let persistNamedTunnelConfigLock = Promise.resolve();
 
 const readPushSubscriptionsFromDisk = async () => {
   try {
@@ -1130,6 +1403,167 @@ const persistPushSubscriptionUpdate = async (mutate) => {
   });
 
   return persistPushSubscriptionsLock;
+};
+
+const sanitizeNamedTunnelConfigEntries = (value) => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const result = [];
+  const seenIds = new Set();
+  const seenHostnames = new Set();
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+
+    const id = typeof entry.id === 'string' ? entry.id.trim() : '';
+    const name = typeof entry.name === 'string' ? entry.name.trim() : '';
+    const hostname = normalizeNamedTunnelHostname(entry.hostname);
+    const token = typeof entry.token === 'string' ? entry.token.trim() : '';
+    const updatedAt = Number.isFinite(entry.updatedAt) ? entry.updatedAt : Date.now();
+
+    if (!id || !name || !hostname || !token) {
+      continue;
+    }
+    if (seenIds.has(id) || seenHostnames.has(hostname)) {
+      continue;
+    }
+
+    seenIds.add(id);
+    seenHostnames.add(hostname);
+    result.push({ id, name, hostname, token, updatedAt });
+  }
+
+  return result;
+};
+
+const readNamedTunnelConfigFromDisk = async () => {
+  try {
+    const raw = await fsPromises.readFile(CLOUDFLARE_NAMED_TUNNELS_FILE_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') {
+      return { version: CLOUDFLARE_NAMED_TUNNELS_VERSION, tunnels: [] };
+    }
+
+    const version = parsed.version === CLOUDFLARE_NAMED_TUNNELS_VERSION
+      ? CLOUDFLARE_NAMED_TUNNELS_VERSION
+      : CLOUDFLARE_NAMED_TUNNELS_VERSION;
+
+    return {
+      version,
+      tunnels: sanitizeNamedTunnelConfigEntries(parsed.tunnels),
+    };
+  } catch (error) {
+    if (error && typeof error === 'object' && error.code === 'ENOENT') {
+      return { version: CLOUDFLARE_NAMED_TUNNELS_VERSION, tunnels: [] };
+    }
+    console.warn('Failed to read named tunnel config file:', error);
+    return { version: CLOUDFLARE_NAMED_TUNNELS_VERSION, tunnels: [] };
+  }
+};
+
+const writeNamedTunnelConfigToDisk = async (data) => {
+  await fsPromises.mkdir(path.dirname(CLOUDFLARE_NAMED_TUNNELS_FILE_PATH), { recursive: true });
+  await fsPromises.writeFile(CLOUDFLARE_NAMED_TUNNELS_FILE_PATH, JSON.stringify(data, null, 2), 'utf8');
+};
+
+const updateNamedTunnelConfig = async (mutate) => {
+  persistNamedTunnelConfigLock = persistNamedTunnelConfigLock.then(async () => {
+    const current = await readNamedTunnelConfigFromDisk();
+    const next = mutate({
+      version: CLOUDFLARE_NAMED_TUNNELS_VERSION,
+      tunnels: sanitizeNamedTunnelConfigEntries(current.tunnels),
+    });
+
+    await writeNamedTunnelConfigToDisk({
+      version: CLOUDFLARE_NAMED_TUNNELS_VERSION,
+      tunnels: sanitizeNamedTunnelConfigEntries(next?.tunnels),
+    });
+  });
+
+  return persistNamedTunnelConfigLock;
+};
+
+const syncNamedTunnelConfigWithPresets = async (presets) => {
+  const sanitizedPresets = normalizeNamedTunnelPresets(presets) || [];
+
+  await updateNamedTunnelConfig((current) => {
+    const byId = new Map(current.tunnels.map((entry) => [entry.id, entry]));
+    const byHostname = new Map(current.tunnels.map((entry) => [entry.hostname, entry]));
+
+    const nextTunnels = [];
+    for (const preset of sanitizedPresets) {
+      const existing = byId.get(preset.id) || byHostname.get(preset.hostname) || null;
+      if (!existing) {
+        continue;
+      }
+
+      nextTunnels.push({
+        ...existing,
+        id: preset.id,
+        name: preset.name,
+        hostname: preset.hostname,
+      });
+    }
+
+    return {
+      version: CLOUDFLARE_NAMED_TUNNELS_VERSION,
+      tunnels: nextTunnels,
+    };
+  });
+};
+
+const upsertNamedTunnelToken = async ({ id, name, hostname, token }) => {
+  if (typeof id !== 'string' || typeof name !== 'string' || typeof hostname !== 'string' || typeof token !== 'string') {
+    return;
+  }
+  const normalizedId = id.trim();
+  const normalizedName = name.trim();
+  const normalizedHostname = normalizeNamedTunnelHostname(hostname);
+  const normalizedToken = token.trim();
+  if (!normalizedId || !normalizedName || !normalizedHostname || !normalizedToken) {
+    return;
+  }
+
+  await updateNamedTunnelConfig((current) => {
+    const withoutConflicts = current.tunnels.filter((entry) => entry.id !== normalizedId && entry.hostname !== normalizedHostname);
+    withoutConflicts.push({
+      id: normalizedId,
+      name: normalizedName,
+      hostname: normalizedHostname,
+      token: normalizedToken,
+      updatedAt: Date.now(),
+    });
+
+    return {
+      version: CLOUDFLARE_NAMED_TUNNELS_VERSION,
+      tunnels: withoutConflicts,
+    };
+  });
+};
+
+const resolveNamedTunnelToken = async ({ presetId, hostname }) => {
+  const normalizedPresetId = typeof presetId === 'string' ? presetId.trim() : '';
+  const normalizedHostname = normalizeNamedTunnelHostname(hostname);
+  const config = await readNamedTunnelConfigFromDisk();
+
+  if (normalizedPresetId) {
+    const byId = config.tunnels.find((entry) => entry.id === normalizedPresetId);
+    if (byId?.token) {
+      return byId.token;
+    }
+  }
+
+  if (normalizedHostname) {
+    const byHostname = config.tunnels.find((entry) => entry.hostname === normalizedHostname);
+    if (byHostname?.token) {
+      return byHostname.token;
+    }
+  }
+
+  return '';
 };
 
 const resolveDirectoryCandidate = (value) => {
@@ -1200,6 +1634,19 @@ const resolveProjectDirectory = async (req) => {
   }
 
   return { directory: validated.directory, error: null };
+};
+
+const isUnsafeSkillRelativePath = (value) => {
+  if (typeof value !== 'string' || value.length === 0) {
+    return true;
+  }
+
+  const normalized = value.replace(/\\/g, '/');
+  if (path.posix.isAbsolute(normalized)) {
+    return true;
+  }
+
+  return normalized.split('/').some((segment) => segment === '..');
 };
 
 const resolveOptionalProjectDirectory = async (req) => {
@@ -1318,6 +1765,18 @@ const sanitizeProjects = (input) => {
     return undefined;
   }
 
+  const hexColorPattern = /^#(?:[\da-fA-F]{3}|[\da-fA-F]{6})$/;
+  const normalizeIconBackground = (value) => {
+    if (typeof value !== 'string') {
+      return null;
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+    return hexColorPattern.test(trimmed) ? trimmed.toLowerCase() : null;
+  };
+
   const result = [];
   const seenIds = new Set();
   const seenPaths = new Set();
@@ -1331,6 +1790,10 @@ const sanitizeProjects = (input) => {
     const normalizedPath = rawPath ? path.resolve(normalizeDirectoryPath(rawPath)) : '';
     const label = typeof candidate.label === 'string' ? candidate.label.trim() : '';
     const icon = typeof candidate.icon === 'string' ? candidate.icon.trim() : '';
+    const iconImage = candidate.iconImage && typeof candidate.iconImage === 'object'
+      ? candidate.iconImage
+      : null;
+    const iconBackground = normalizeIconBackground(candidate.iconBackground);
     const color = typeof candidate.color === 'string' ? candidate.color.trim() : '';
     const addedAt = Number.isFinite(candidate.addedAt) ? Number(candidate.addedAt) : null;
     const lastOpenedAt = Number.isFinite(candidate.lastOpenedAt)
@@ -1349,10 +1812,30 @@ const sanitizeProjects = (input) => {
       path: normalizedPath,
       ...(label ? { label } : {}),
       ...(icon ? { icon } : {}),
+      ...(iconBackground ? { iconBackground } : {}),
       ...(color ? { color } : {}),
       ...(Number.isFinite(addedAt) && addedAt >= 0 ? { addedAt } : {}),
       ...(Number.isFinite(lastOpenedAt) && lastOpenedAt >= 0 ? { lastOpenedAt } : {}),
     };
+
+    if (candidate.iconImage === null) {
+      project.iconImage = null;
+    } else if (iconImage) {
+      const mime = typeof iconImage.mime === 'string' ? iconImage.mime.trim() : '';
+      const updatedAt = typeof iconImage.updatedAt === 'number' && Number.isFinite(iconImage.updatedAt)
+        ? Math.max(0, Math.round(iconImage.updatedAt))
+        : 0;
+      const source = iconImage.source === 'custom' || iconImage.source === 'auto'
+        ? iconImage.source
+        : null;
+      if (mime && updatedAt > 0 && source) {
+        project.iconImage = { mime, updatedAt, source };
+      }
+    }
+
+    if (candidate.iconBackground === null) {
+      project.iconBackground = null;
+    }
 
     if (typeof candidate.sidebarCollapsed === 'boolean') {
       project.sidebarCollapsed = candidate.sidebarCollapsed;
@@ -1422,6 +1905,20 @@ const sanitizeConnections = (input) => {
   return result;
 };
 
+const DEFAULT_PWA_APP_NAME = 'OpenChamber - AI Coding Assistant';
+const PWA_APP_NAME_MAX_LENGTH = 64;
+
+const normalizePwaAppName = (value, fallback = '') => {
+  if (typeof value !== 'string') {
+    return fallback;
+  }
+  const normalized = value.trim().replace(/\s+/g, ' ');
+  if (!normalized) {
+    return fallback;
+  }
+  return normalized.slice(0, PWA_APP_NAME_MAX_LENGTH);
+};
+
 const sanitizeSettingsUpdate = (payload) => {
   if (!payload || typeof payload !== 'object') {
     return {};
@@ -1444,6 +1941,18 @@ const sanitizeSettingsUpdate = (payload) => {
   }
   if (typeof candidate.darkThemeId === 'string' && candidate.darkThemeId.length > 0) {
     result.darkThemeId = candidate.darkThemeId;
+  }
+  if (typeof candidate.splashBgLight === 'string' && candidate.splashBgLight.trim().length > 0) {
+    result.splashBgLight = candidate.splashBgLight.trim();
+  }
+  if (typeof candidate.splashFgLight === 'string' && candidate.splashFgLight.trim().length > 0) {
+    result.splashFgLight = candidate.splashFgLight.trim();
+  }
+  if (typeof candidate.splashBgDark === 'string' && candidate.splashBgDark.trim().length > 0) {
+    result.splashBgDark = candidate.splashBgDark.trim();
+  }
+  if (typeof candidate.splashFgDark === 'string' && candidate.splashFgDark.trim().length > 0) {
+    result.splashFgDark = candidate.splashFgDark.trim();
   }
   if (typeof candidate.lastDirectory === 'string' && candidate.lastDirectory.length > 0) {
     result.lastDirectory = candidate.lastDirectory;
@@ -1528,6 +2037,9 @@ const sanitizeSettingsUpdate = (payload) => {
   if (typeof candidate.showTextJustificationActivity === 'boolean') {
     result.showTextJustificationActivity = candidate.showTextJustificationActivity;
   }
+  if (typeof candidate.showDeletionDialog === 'boolean') {
+    result.showDeletionDialog = candidate.showDeletionDialog;
+  }
   if (typeof candidate.nativeNotificationsEnabled === 'boolean') {
     result.nativeNotificationsEnabled = candidate.nativeNotificationsEnabled;
   }
@@ -1570,6 +2082,9 @@ const sanitizeSettingsUpdate = (payload) => {
   if (typeof candidate.usageRefreshIntervalMs === 'number' && Number.isFinite(candidate.usageRefreshIntervalMs)) {
     result.usageRefreshIntervalMs = Math.max(30000, Math.min(300000, Math.round(candidate.usageRefreshIntervalMs)));
   }
+  if (candidate.usageDisplayMode === 'usage' || candidate.usageDisplayMode === 'remaining') {
+    result.usageDisplayMode = candidate.usageDisplayMode;
+  }
   if (Array.isArray(candidate.usageDropdownProviders)) {
     result.usageDropdownProviders = normalizeStringArray(candidate.usageDropdownProviders);
   }
@@ -1579,6 +2094,38 @@ const sanitizeSettingsUpdate = (payload) => {
   if (typeof candidate.autoDeleteAfterDays === 'number' && Number.isFinite(candidate.autoDeleteAfterDays)) {
     const normalizedDays = Math.max(1, Math.min(365, Math.round(candidate.autoDeleteAfterDays)));
     result.autoDeleteAfterDays = normalizedDays;
+  }
+  if (candidate.tunnelBootstrapTtlMs === null) {
+    result.tunnelBootstrapTtlMs = null;
+  } else if (typeof candidate.tunnelBootstrapTtlMs === 'number' && Number.isFinite(candidate.tunnelBootstrapTtlMs)) {
+    result.tunnelBootstrapTtlMs = normalizeTunnelBootstrapTtlMs(candidate.tunnelBootstrapTtlMs);
+  }
+  if (typeof candidate.tunnelSessionTtlMs === 'number' && Number.isFinite(candidate.tunnelSessionTtlMs)) {
+    result.tunnelSessionTtlMs = normalizeTunnelSessionTtlMs(candidate.tunnelSessionTtlMs);
+  }
+  if (typeof candidate.tunnelMode === 'string') {
+    result.tunnelMode = normalizeTunnelMode(candidate.tunnelMode);
+  }
+  if (typeof candidate.namedTunnelHostname === 'string') {
+    const hostname = normalizeNamedTunnelHostname(candidate.namedTunnelHostname);
+    result.namedTunnelHostname = hostname;
+  }
+  if (candidate.namedTunnelToken === null) {
+    result.namedTunnelToken = null;
+  } else if (typeof candidate.namedTunnelToken === 'string') {
+    result.namedTunnelToken = candidate.namedTunnelToken.trim();
+  }
+  const namedTunnelPresets = normalizeNamedTunnelPresets(candidate.namedTunnelPresets);
+  if (namedTunnelPresets) {
+    result.namedTunnelPresets = namedTunnelPresets;
+  }
+  const namedTunnelPresetTokens = normalizeNamedTunnelPresetTokens(candidate.namedTunnelPresetTokens);
+  if (namedTunnelPresetTokens) {
+    result.namedTunnelPresetTokens = namedTunnelPresetTokens;
+  }
+  if (typeof candidate.namedTunnelSelectedPresetId === 'string') {
+    const id = candidate.namedTunnelSelectedPresetId.trim();
+    result.namedTunnelSelectedPresetId = id || undefined;
   }
 
   const typography = sanitizeTypographySizesPartial(candidate.typographySizes);
@@ -1615,11 +2162,40 @@ const sanitizeSettingsUpdate = (payload) => {
     const trimmed = candidate.zenModel.trim();
     result.zenModel = trimmed.length > 0 ? trimmed : undefined;
   }
+  if (typeof candidate.claudeCodePermissionMode === 'string') {
+    const mode = candidate.claudeCodePermissionMode.trim();
+    if (mode === 'default' || mode === 'acceptEdits' || mode === 'bypassPermissions') {
+      result.claudeCodePermissionMode = mode;
+    }
+  }
+  if (typeof candidate.gitProviderId === 'string') {
+    const trimmed = candidate.gitProviderId.trim();
+    result.gitProviderId = trimmed.length > 0 ? trimmed : undefined;
+  }
+  if (typeof candidate.gitModelId === 'string') {
+    const trimmed = candidate.gitModelId.trim();
+    result.gitModelId = trimmed.length > 0 ? trimmed : undefined;
+  }
+  if (typeof candidate.pwaAppName === 'string') {
+    result.pwaAppName = normalizePwaAppName(candidate.pwaAppName, undefined);
+  }
   if (typeof candidate.toolCallExpansion === 'string') {
     const mode = candidate.toolCallExpansion.trim();
-    if (mode === 'collapsed' || mode === 'activity' || mode === 'detailed') {
+    if (mode === 'collapsed' || mode === 'activity' || mode === 'detailed' || mode === 'changes') {
       result.toolCallExpansion = mode;
     }
+  }
+  if (typeof candidate.inputSpellcheckEnabled === 'boolean') {
+    result.inputSpellcheckEnabled = candidate.inputSpellcheckEnabled;
+  }
+  if (typeof candidate.userMessageRenderingMode === 'string') {
+    const mode = candidate.userMessageRenderingMode.trim();
+    if (mode === 'markdown' || mode === 'plain') {
+      result.userMessageRenderingMode = mode;
+    }
+  }
+  if (typeof candidate.stickyUserHeader === 'boolean') {
+    result.stickyUserHeader = candidate.stickyUserHeader;
   }
   if (typeof candidate.fontSize === 'number' && Number.isFinite(candidate.fontSize)) {
     result.fontSize = Math.max(50, Math.min(200, Math.round(candidate.fontSize)));
@@ -1892,11 +2468,16 @@ const mergePersistedSettings = (current, changes) => {
 
 const formatSettingsResponse = (settings) => {
   const sanitized = sanitizeSettingsUpdate(settings);
+  delete sanitized.namedTunnelToken;
   const approved = normalizeStringArray(settings.approvedDirectories);
   const bookmarks = normalizeStringArray(settings.securityScopedBookmarks);
+  const hasNamedTunnelToken = typeof settings?.namedTunnelToken === 'string' && settings.namedTunnelToken.trim().length > 0;
+  const pwaAppName = normalizePwaAppName(settings?.pwaAppName, '');
 
   return {
     ...sanitized,
+    hasNamedTunnelToken,
+    ...(pwaAppName ? { pwaAppName } : {}),
     approvedDirectories: approved,
     securityScopedBookmarks: bookmarks,
     pinnedDirectories: normalizeStringArray(settings.pinnedDirectories),
@@ -2848,6 +3429,32 @@ const persistSettings = async (changes) => {
       next = { ...next, activeProjectId: undefined };
     }
 
+    if (Object.prototype.hasOwnProperty.call(sanitized, 'namedTunnelPresets')) {
+      await syncNamedTunnelConfigWithPresets(next.namedTunnelPresets);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(sanitized, 'namedTunnelPresetTokens') && sanitized.namedTunnelPresetTokens) {
+      const presetsById = new Map((next.namedTunnelPresets || []).map((entry) => [entry.id, entry]));
+      const updates = Object.entries(sanitized.namedTunnelPresetTokens)
+        .map(([presetId, token]) => {
+          const preset = presetsById.get(presetId);
+          if (!preset || typeof token !== 'string' || token.trim().length === 0) {
+            return null;
+          }
+          return {
+            id: preset.id,
+            name: preset.name,
+            hostname: preset.hostname,
+            token: token.trim(),
+          };
+        })
+        .filter(Boolean);
+
+      for (const update of updates) {
+        await upsertNamedTunnelToken(update);
+      }
+    }
+
     await writeSettingsToDisk(next);
     console.log(`[persistSettings] Successfully saved ${next.projects?.length || 0} projects to disk`);
     return formatSettingsResponse(next);
@@ -2906,7 +3513,12 @@ let isExternalOpenCode = false;
 let exitOnShutdown = true;
 let uiAuthController = null;
 let cloudflareTunnelController = null;
+const tunnelAuthController = createTunnelAuth();
+let runtimeNamedTunnelToken = '';
+let runtimeNamedTunnelHostname = '';
 let terminalInputWsServer = null;
+let claudeCodeAdapterInstance = null;
+let claudeCodeAdapterPort = null;
 const userProvidedOpenCodePassword =
   typeof hmrState.userProvidedOpenCodePassword === 'string' && hmrState.userProvidedOpenCodePassword.length > 0
     ? hmrState.userProvidedOpenCodePassword
@@ -2924,6 +3536,7 @@ let openCodeAuthSource =
 const syncToHmrState = () => {
   hmrState.openCodeProcess = openCodeProcess;
   hmrState.openCodePort = openCodePort;
+  hmrState.openCodeBaseUrl = openCodeBaseUrl;
   hmrState.isShuttingDown = isShuttingDown;
   hmrState.signalsAttached = signalsAttached;
   hmrState.openCodeWorkingDirectory = openCodeWorkingDirectory;
@@ -2935,6 +3548,7 @@ const syncToHmrState = () => {
 const syncFromHmrState = () => {
   openCodeProcess = hmrState.openCodeProcess;
   openCodePort = hmrState.openCodePort;
+  openCodeBaseUrl = hmrState.openCodeBaseUrl ?? null;
   isShuttingDown = hmrState.isShuttingDown;
   signalsAttached = hmrState.signalsAttached;
   openCodeWorkingDirectory = hmrState.openCodeWorkingDirectory;
@@ -2952,6 +3566,7 @@ const syncFromHmrState = () => {
 // These are synced to/from hmrState to survive HMR reloads
 let openCodeProcess = hmrState.openCodeProcess;
 let openCodePort = hmrState.openCodePort;
+let openCodeBaseUrl = hmrState.openCodeBaseUrl ?? null;
 let isShuttingDown = hmrState.isShuttingDown;
 let signalsAttached = hmrState.signalsAttached;
 let openCodeWorkingDirectory = hmrState.openCodeWorkingDirectory;
@@ -2983,7 +3598,7 @@ async function isOpenCodeProcessHealthy() {
  * Unlike isOpenCodeProcessHealthy(), this doesn't require openCodeProcess to be set.
  * Used to auto-detect and connect to an existing OpenCode instance on startup.
  */
-async function probeExternalOpenCode(port) {
+async function probeExternalOpenCode(port, origin) {
   if (!port || port <= 0) {
     return false;
   }
@@ -2991,7 +3606,8 @@ async function probeExternalOpenCode(port) {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 3000);
-    const response = await fetch(`http://127.0.0.1:${port}/global/health`, {
+    const base = origin ?? `http://127.0.0.1:${port}`;
+    const response = await fetch(`${base}/global/health`, {
       method: 'GET',
       headers: {
         Accept: 'application/json',
@@ -3020,9 +3636,55 @@ const ENV_CONFIGURED_OPENCODE_PORT = (() => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 })();
 
+const ENV_CONFIGURED_OPENCODE_HOST = (() => {
+  const raw = process.env.OPENCODE_HOST?.trim();
+  if (!raw) return null;
+
+  const warnInvalidHost = (reason) => {
+    console.warn(`[config] Ignoring OPENCODE_HOST=${JSON.stringify(raw)}: ${reason}`);
+  };
+
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    warnInvalidHost('not a valid URL');
+    return null;
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    warnInvalidHost(`must use http or https scheme (got ${JSON.stringify(url.protocol)})`);
+    return null;
+  }
+  const port = parseInt(url.port, 10);
+  if (!Number.isFinite(port) || port <= 0) {
+    warnInvalidHost('must include an explicit port (example: http://hostname:4096)');
+    return null;
+  }
+  if (url.pathname !== '/' || url.search || url.hash) {
+    warnInvalidHost('must not include path, query, or hash');
+    return null;
+  }
+  return { origin: url.origin, port };
+})();
+
+// OPENCODE_HOST takes precedence over OPENCODE_PORT when both are set
+const ENV_EFFECTIVE_PORT = ENV_CONFIGURED_OPENCODE_HOST?.port ?? ENV_CONFIGURED_OPENCODE_PORT;
+
 const ENV_SKIP_OPENCODE_START = process.env.OPENCODE_SKIP_START === 'true' ||
                                     process.env.OPENCHAMBER_SKIP_OPENCODE_START === 'true';
 const ENV_DESKTOP_NOTIFY = process.env.OPENCHAMBER_DESKTOP_NOTIFY === 'true';
+const ENV_BACKEND = process.env.OPENCHAMBER_BACKEND || 'opencode';
+const ENV_CLAUDECODE_BINARY = (process.env.CLAUDECODE_BINARY || '').trim() || 'claude';
+const ENV_CLAUDECODE_PERMISSION_MODE = (process.env.CLAUDECODE_PERMISSION_MODE || '').trim() || 'default';
+const ENV_CONFIGURED_OPENCODE_WSL_DISTRO =
+  typeof process.env.OPENCODE_WSL_DISTRO === 'string' && process.env.OPENCODE_WSL_DISTRO.trim().length > 0
+    ? process.env.OPENCODE_WSL_DISTRO.trim()
+    : (
+      typeof process.env.OPENCHAMBER_OPENCODE_WSL_DISTRO === 'string' &&
+      process.env.OPENCHAMBER_OPENCODE_WSL_DISTRO.trim().length > 0
+        ? process.env.OPENCHAMBER_OPENCODE_WSL_DISTRO.trim()
+        : null
+    );
 
 // OpenCode server authentication (Basic Auth with username "opencode")
 
@@ -3269,6 +3931,11 @@ let resolvedOpencodeBinary = null;
 let resolvedOpencodeBinarySource = null;
 let resolvedNodeBinary = null;
 let resolvedBunBinary = null;
+let resolvedClaudeBinary = null;
+let useWslForOpencode = false;
+let resolvedWslBinary = null;
+let resolvedWslOpencodePath = null;
+let resolvedWslDistro = null;
 
 function isExecutable(filePath) {
   try {
@@ -3307,6 +3974,182 @@ function searchPathFor(binaryName) {
   return null;
 }
 
+/**
+ * Resolve the Claude Code CLI binary path.
+ * Checks CLAUDECODE_BINARY env var first, then searches PATH for 'claude'.
+ * Returns the resolved path or null if not found.
+ */
+function resolveClaudeCodeCliPath() {
+  const envBinary = (process.env.CLAUDECODE_BINARY || '').trim();
+  if (envBinary) {
+    if (path.isAbsolute(envBinary) || envBinary.includes(path.sep)) {
+      const resolved = path.isAbsolute(envBinary) ? envBinary : path.resolve(envBinary);
+      if (isExecutable(resolved)) {
+        return resolved;
+      }
+      console.warn(`[openchamber] CLAUDECODE_BINARY="${envBinary}" is not executable, falling back to PATH lookup`);
+    } else {
+      // Bare name like "claude" — search PATH for it
+      const found = searchPathFor(envBinary);
+      if (found) {
+        return found;
+      }
+      console.warn(`[openchamber] CLAUDECODE_BINARY="${envBinary}" not found on PATH, falling back to default lookup`);
+    }
+  }
+
+  return searchPathFor('claude');
+}
+
+/**
+ * Detect the Claude Code CLI binary synchronously.
+ * Stores the result in resolvedClaudeBinary for use by the adapter and middleware.
+ */
+function detectClaudeCodeCli() {
+  try {
+    const resolved = resolveClaudeCodeCliPath();
+    if (resolved) {
+      resolvedClaudeBinary = resolved;
+      console.log(`[openchamber] Claude Code CLI detected: ${resolved}`);
+    } else {
+      console.debug('[openchamber] Claude Code CLI not found, Claude Code provider will not be available');
+    }
+  } catch (error) {
+    console.debug(`[openchamber] Claude Code CLI detection failed: ${error.message}`);
+  }
+}
+
+
+function isWslExecutableValue(value) {
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  return /(^|[\\/])wsl(\.exe)?$/i.test(trimmed);
+}
+
+function clearWslOpencodeResolution() {
+  useWslForOpencode = false;
+  resolvedWslBinary = null;
+  resolvedWslOpencodePath = null;
+  resolvedWslDistro = null;
+}
+
+function resolveWslExecutablePath() {
+  if (process.platform !== 'win32') {
+    return null;
+  }
+
+  const explicit = [process.env.WSL_BINARY, process.env.OPENCHAMBER_WSL_BINARY]
+    .map((v) => (typeof v === 'string' ? v.trim() : ''))
+    .filter(Boolean);
+
+  for (const candidate of explicit) {
+    if (isExecutable(candidate)) {
+      return candidate;
+    }
+  }
+
+  try {
+    const result = spawnSync('where', ['wsl'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (result.status === 0) {
+      const lines = (result.stdout || '')
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+      const found = lines.find((line) => isExecutable(line));
+      if (found) {
+        return found;
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  const systemRoot = process.env.SystemRoot || 'C:\\Windows';
+  const fallback = path.join(systemRoot, 'System32', 'wsl.exe');
+  if (isExecutable(fallback)) {
+    return fallback;
+  }
+
+  return null;
+}
+
+function buildWslExecArgs(execArgs, distroOverride = null) {
+  const distro = typeof distroOverride === 'string' && distroOverride.trim().length > 0
+    ? distroOverride.trim()
+    : ENV_CONFIGURED_OPENCODE_WSL_DISTRO;
+
+  const prefix = distro ? ['-d', distro] : [];
+  return [...prefix, '--exec', ...execArgs];
+}
+
+function probeWslForOpencode() {
+  if (process.platform !== 'win32') {
+    return null;
+  }
+
+  const wslBinary = resolveWslExecutablePath();
+  if (!wslBinary) {
+    return null;
+  }
+
+  try {
+    const result = spawnSync(
+      wslBinary,
+      buildWslExecArgs(['sh', '-lc', 'command -v opencode']),
+      {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 6000,
+      },
+    );
+
+    if (result.status !== 0) {
+      return null;
+    }
+
+    const lines = (result.stdout || '')
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const found = lines[0] || '';
+    if (!found) {
+      return null;
+    }
+
+    return {
+      wslBinary,
+      opencodePath: found,
+      distro: ENV_CONFIGURED_OPENCODE_WSL_DISTRO,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function applyWslOpencodeResolution({ wslBinary, opencodePath, source = 'wsl', distro = null } = {}) {
+  const resolvedWsl = wslBinary || resolveWslExecutablePath();
+  if (!resolvedWsl) {
+    return null;
+  }
+
+  useWslForOpencode = true;
+  resolvedWslBinary = resolvedWsl;
+  resolvedWslOpencodePath = typeof opencodePath === 'string' && opencodePath.trim().length > 0
+    ? opencodePath.trim()
+    : 'opencode';
+  resolvedWslDistro = typeof distro === 'string' && distro.trim().length > 0 ? distro.trim() : ENV_CONFIGURED_OPENCODE_WSL_DISTRO;
+  resolvedOpencodeBinary = `wsl:${resolvedWslOpencodePath}`;
+  resolvedOpencodeBinarySource = source;
+
+  // Keep OPENCODE_BINARY empty in WSL mode to avoid native spawn attempts.
+  delete process.env.OPENCODE_BINARY;
+  return resolvedOpencodeBinary;
+}
+
 function resolveOpencodeCliPath() {
   const explicit = [
     process.env.OPENCODE_BINARY,
@@ -3319,6 +4162,7 @@ function resolveOpencodeCliPath() {
 
   for (const candidate of explicit) {
     if (isExecutable(candidate)) {
+      clearWslOpencodeResolution();
       resolvedOpencodeBinarySource = 'env';
       return candidate;
     }
@@ -3326,6 +4170,7 @@ function resolveOpencodeCliPath() {
 
   const resolvedFromPath = searchPathFor('opencode');
   if (resolvedFromPath) {
+    clearWslOpencodeResolution();
     resolvedOpencodeBinarySource = 'path';
     return resolvedFromPath;
   }
@@ -3364,6 +4209,7 @@ function resolveOpencodeCliPath() {
   const fallbacks = process.platform === 'win32' ? winFallbacks : unixFallbacks;
   for (const candidate of fallbacks) {
     if (isExecutable(candidate)) {
+      clearWslOpencodeResolution();
       resolvedOpencodeBinarySource = 'fallback';
       return candidate;
     }
@@ -3382,12 +4228,22 @@ function resolveOpencodeCliPath() {
           .filter(Boolean);
         const found = lines.find((line) => isExecutable(line));
         if (found) {
+          clearWslOpencodeResolution();
           resolvedOpencodeBinarySource = 'where';
           return found;
         }
       }
     } catch {
       // ignore
+    }
+    const wsl = probeWslForOpencode();
+    if (wsl) {
+      return applyWslOpencodeResolution({
+        wslBinary: wsl.wslBinary,
+        opencodePath: wsl.opencodePath,
+        source: 'wsl',
+        distro: wsl.distro,
+      });
     }
     return null;
   }
@@ -3403,6 +4259,7 @@ function resolveOpencodeCliPath() {
       if (result.status === 0) {
         const found = (result.stdout || '').trim().split(/\s+/).pop() || '';
         if (found && isExecutable(found)) {
+          clearWslOpencodeResolution();
           resolvedOpencodeBinarySource = 'shell';
           return found;
         }
@@ -3684,10 +4541,44 @@ async function applyOpencodeBinaryFromSettings() {
       delete process.env.OPENCODE_BINARY;
       resolvedOpencodeBinary = null;
       resolvedOpencodeBinarySource = null;
+      clearWslOpencodeResolution();
       return null;
     }
 
+    const raw = typeof settings.opencodeBinary === 'string' ? settings.opencodeBinary.trim() : '';
+
+    const explicitWslPath = process.platform === 'win32' && typeof raw === 'string'
+      ? raw.match(/^wsl:\s*(.+)$/i)
+      : null;
+
+    if (explicitWslPath && explicitWslPath[1] && explicitWslPath[1].trim().length > 0) {
+      const probe = probeWslForOpencode();
+      const applied = applyWslOpencodeResolution({
+        wslBinary: probe?.wslBinary || resolveWslExecutablePath(),
+        opencodePath: explicitWslPath[1].trim(),
+        source: 'settings-wsl-path',
+        distro: probe?.distro || ENV_CONFIGURED_OPENCODE_WSL_DISTRO,
+      });
+      if (applied) {
+        return applied;
+      }
+    }
+
+    if (process.platform === 'win32' && (isWslExecutableValue(raw) || isWslExecutableValue(normalized || ''))) {
+      const probe = probeWslForOpencode();
+      const applied = applyWslOpencodeResolution({
+        wslBinary: probe?.wslBinary || normalized || raw || null,
+        opencodePath: probe?.opencodePath || 'opencode',
+        source: 'settings-wsl',
+        distro: probe?.distro || ENV_CONFIGURED_OPENCODE_WSL_DISTRO,
+      });
+      if (applied) {
+        return applied;
+      }
+    }
+
     if (normalized && isExecutable(normalized)) {
+      clearWslOpencodeResolution();
       process.env.OPENCODE_BINARY = normalized;
       prependToPath(path.dirname(normalized));
       resolvedOpencodeBinary = normalized;
@@ -3696,7 +4587,6 @@ async function applyOpencodeBinaryFromSettings() {
       return normalized;
     }
 
-    const raw = typeof settings.opencodeBinary === 'string' ? settings.opencodeBinary.trim() : '';
     if (raw) {
       console.warn(`Configured settings.opencodeBinary is not executable: ${raw}`);
     }
@@ -3709,12 +4599,16 @@ async function applyOpencodeBinaryFromSettings() {
 
 function ensureOpencodeCliEnv() {
   if (resolvedOpencodeBinary) {
+    if (useWslForOpencode) {
+      return resolvedOpencodeBinary;
+    }
     ensureOpencodeShimRuntime(resolvedOpencodeBinary);
     return resolvedOpencodeBinary;
   }
 
   const existing = typeof process.env.OPENCODE_BINARY === 'string' ? process.env.OPENCODE_BINARY.trim() : '';
   if (existing && isExecutable(existing)) {
+    clearWslOpencodeResolution();
     resolvedOpencodeBinary = existing;
     resolvedOpencodeBinarySource = resolvedOpencodeBinarySource || 'env';
     prependToPath(path.dirname(existing));
@@ -3724,6 +4618,13 @@ function ensureOpencodeCliEnv() {
 
   const resolved = resolveOpencodeCliPath();
   if (resolved) {
+    if (useWslForOpencode) {
+      resolvedOpencodeBinary = resolved;
+      resolvedOpencodeBinarySource = resolvedOpencodeBinarySource || 'wsl';
+      console.log(`Resolved opencode CLI via WSL: ${resolvedWslOpencodePath || 'opencode'}`);
+      return resolved;
+    }
+
     process.env.OPENCODE_BINARY = resolved;
     prependToPath(path.dirname(resolved));
     ensureOpencodeShimRuntime(resolved);
@@ -3733,6 +4634,7 @@ function ensureOpencodeCliEnv() {
     return resolved;
   }
 
+  clearWslOpencodeResolution();
   return null;
 }
 
@@ -3992,7 +4894,8 @@ function buildOpenCodeUrl(path, prefixOverride) {
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;
   const prefix = normalizeApiPrefix(prefixOverride !== undefined ? prefixOverride : '');
   const fullPath = `${prefix}${normalizedPath}`;
-  return `http://localhost:${openCodePort}${fullPath}`;
+  const base = openCodeBaseUrl ?? `http://localhost:${openCodePort}`;
+  return `${base}${fullPath}`;
 }
 
 function parseSseDataPayload(block) {
@@ -4422,7 +5325,7 @@ const fetchSessionParentId = async (sessionId) => {
     }
 
     const match = data.find((s) => s && typeof s === 'object' && s.id === sessionId);
-    const parentID = match && typeof match.parentID === 'string' && match.parentID.length > 0 ? match.parentID : null;
+    const parentID = match?.parentID ? match.parentID : null;
     setCachedSessionParentId(sessionId, parentID);
     return parentID;
   } catch {
@@ -4858,6 +5761,104 @@ function writeSseEvent(res, payload) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
+/**
+ * Connect to the Claude Code adapter's /event SSE endpoint and forward events
+ * to the client response. Reconnects on drop with exponential backoff.
+ * Returns a cleanup function that stops the connection loop.
+ */
+function connectAdapterSse(res, abortSignal) {
+  // In legacy claudecode mode, openCodePort === claudeCodeAdapterPort and the
+  // upstream OpenCode connection already carries all adapter events — skip.
+  // NOTE: Do NOT bail when claudeCodeAdapterPort is null — the adapter may start
+  // after the SSE connection is established (hybrid mode startup order). The run()
+  // loop below handles null port with a wait-and-retry.
+  if (claudeCodeAdapterPort && claudeCodeAdapterPort === openCodePort) return () => {};
+
+  let stopped = false;
+  let currentReader = null;
+
+  const stop = () => {
+    stopped = true;
+    if (currentReader) {
+      try { currentReader.cancel(); } catch { /* ignore */ }
+    }
+  };
+
+  // Stop when the parent signal aborts (client disconnect)
+  const onAbort = () => stop();
+  abortSignal.addEventListener('abort', onAbort, { once: true });
+
+  const run = async () => {
+    let attempt = 0;
+    while (!stopped && !abortSignal.aborted) {
+      const port = claudeCodeAdapterPort;
+      if (!port) {
+        // Adapter went away, wait and retry
+        await new Promise((r) => setTimeout(r, 5000));
+        continue;
+      }
+      attempt += 1;
+      try {
+        const adapterUrl = `http://127.0.0.1:${port}/event`;
+        const adapterResponse = await fetch(adapterUrl, {
+          headers: { Accept: 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' },
+          signal: abortSignal,
+        });
+        if (!adapterResponse.ok || !adapterResponse.body) {
+          throw new Error(`adapter SSE bad status ${adapterResponse.status}`);
+        }
+        console.log('[AdapterSSE] connected to Claude Code adapter event stream');
+        attempt = 0; // reset backoff on successful connect
+
+        const decoder = new TextDecoder();
+        const reader = adapterResponse.body.getReader();
+        currentReader = reader;
+        let buffer = '';
+
+        while (!stopped && !abortSignal.aborted) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+
+          let separatorIndex = buffer.indexOf('\n\n');
+          while (separatorIndex !== -1) {
+            const block = buffer.slice(0, separatorIndex);
+            buffer = buffer.slice(separatorIndex + 2);
+            separatorIndex = buffer.indexOf('\n\n');
+            if (block && !res.writableEnded) {
+              try {
+                res.write(`${block}\n\n`);
+              } catch { /* client gone */ }
+              // Run the notification pipeline on adapter events too
+              const adapterPayload = parseSseDataPayload(block);
+              if (adapterPayload) {
+                maybeCacheSessionInfoFromEvent(adapterPayload);
+                void maybeSendPushForTrigger(adapterPayload);
+              }
+            }
+          }
+        }
+        currentReader = null;
+      } catch (error) {
+        currentReader = null;
+        if (stopped || abortSignal.aborted) return;
+        console.warn('[AdapterSSE] disconnected from Claude Code adapter:', error?.message || error);
+      }
+
+      if (stopped || abortSignal.aborted) return;
+      const backoffMs = Math.min(1000 * Math.pow(2, Math.min(attempt, 4)), 16000);
+      await new Promise((r) => setTimeout(r, backoffMs));
+    }
+  };
+
+  void run();
+
+  return () => {
+    stop();
+    abortSignal.removeEventListener('abort', onAbort);
+  };
+}
+
 function extractApiPrefixFromUrl() {
   return '';
 }
@@ -4959,8 +5960,62 @@ async function createManagedOpenCodeServerProcess({
   cwd,
   env,
 }) {
-  const binary = (process.env.OPENCODE_BINARY || 'opencode').trim() || 'opencode';
-  const args = ['serve', '--hostname', hostname, '--port', String(port)];
+  let binary = (process.env.OPENCODE_BINARY || 'opencode').trim() || 'opencode';
+  let args = ['serve', '--hostname', hostname, '--port', String(port)];
+
+  if (process.platform === 'win32' && useWslForOpencode) {
+    const wslBinary = resolvedWslBinary || resolveWslExecutablePath();
+    if (!wslBinary) {
+      throw new Error('WSL executable not found while attempting to launch OpenCode from WSL');
+    }
+
+    const wslOpencode = resolvedWslOpencodePath && resolvedWslOpencodePath.trim().length > 0
+      ? resolvedWslOpencodePath.trim()
+      : 'opencode';
+    const serveHost = hostname === '127.0.0.1' ? '0.0.0.0' : hostname;
+
+    binary = wslBinary;
+    args = buildWslExecArgs([
+      wslOpencode,
+      'serve',
+      '--hostname',
+      serveHost,
+      '--port',
+      String(port),
+    ], resolvedWslDistro);
+  }
+
+  // On Windows, Bun/Node cannot directly spawn shell wrapper scripts (#!/bin/sh).
+  // Detect if the resolved binary is a shim that wraps a Node/Bun script and
+  // resolve the actual target so we can spawn it with the correct interpreter.
+  if (process.platform === 'win32' && !useWslForOpencode) {
+    const interpreter = opencodeShimInterpreter(binary);
+    if (interpreter) {
+      // Binary itself has a node/bun shebang – spawn via that interpreter.
+      args.unshift(binary);
+      binary = interpreter;
+    } else {
+      // The wrapper might be a shell shim generated by npm.  Try to find the
+      // real JS entry point next to it (e.g. node_modules/opencode-ai/bin/opencode).
+      try {
+        const shimContent = fs.readFileSync(binary, 'utf8');
+        const jsMatch = shimContent.match(/node_modules[\\/]opencode[^\s"']*/);
+        if (jsMatch) {
+          const candidate = path.resolve(path.dirname(binary), jsMatch[0]);
+          if (fs.existsSync(candidate)) {
+            const realInterp = opencodeShimInterpreter(candidate);
+            if (realInterp) {
+              args.unshift(candidate);
+              binary = realInterp;
+            }
+          }
+        }
+      } catch {
+        // ignore – fall through to default spawn
+      }
+    }
+  }
+
   const child = spawn(binary, args, {
     cwd,
     env,
@@ -5143,7 +6198,8 @@ async function restartOpenCode() {
     if (isExternalOpenCode) {
       console.log('Re-probing external OpenCode server...');
       const probePort = openCodePort || ENV_CONFIGURED_OPENCODE_PORT || 4096;
-      const healthy = await probeExternalOpenCode(probePort);
+      const probeOrigin = openCodeBaseUrl ?? ENV_CONFIGURED_OPENCODE_HOST?.origin;
+      const healthy = await probeExternalOpenCode(probePort, probeOrigin);
       if (healthy) {
         console.log(`External OpenCode server on port ${probePort} is healthy`);
         setOpenCodePort(probePort);
@@ -5419,6 +6475,72 @@ async function refreshOpenCodeAfterConfigChange(reason, options = {}) {
   }
 }
 
+async function bootstrapOpenCodeAtStartup() {
+  try {
+    syncFromHmrState();
+    if (await isOpenCodeProcessHealthy()) {
+      console.log(`[HMR] Reusing existing OpenCode process on port ${openCodePort}`);
+    } else if (ENV_SKIP_OPENCODE_START && ENV_EFFECTIVE_PORT) {
+      const label = ENV_CONFIGURED_OPENCODE_HOST ? ENV_CONFIGURED_OPENCODE_HOST.origin : `http://localhost:${ENV_EFFECTIVE_PORT}`;
+      console.log(`Using external OpenCode server at ${label} (skip-start mode)`);
+      openCodeBaseUrl = ENV_CONFIGURED_OPENCODE_HOST?.origin ?? null;
+      setOpenCodePort(ENV_EFFECTIVE_PORT);
+      isOpenCodeReady = true;
+      isExternalOpenCode = true;
+      lastOpenCodeError = null;
+      openCodeNotReadySince = 0;
+      syncToHmrState();
+    } else if (ENV_EFFECTIVE_PORT && await probeExternalOpenCode(ENV_EFFECTIVE_PORT, ENV_CONFIGURED_OPENCODE_HOST?.origin)) {
+      const label = ENV_CONFIGURED_OPENCODE_HOST ? ENV_CONFIGURED_OPENCODE_HOST.origin : `http://localhost:${ENV_EFFECTIVE_PORT}`;
+      console.log(`Auto-detected existing OpenCode server at ${label}`);
+      openCodeBaseUrl = ENV_CONFIGURED_OPENCODE_HOST?.origin ?? null;
+      setOpenCodePort(ENV_EFFECTIVE_PORT);
+      isOpenCodeReady = true;
+      isExternalOpenCode = true;
+      lastOpenCodeError = null;
+      openCodeNotReadySince = 0;
+      syncToHmrState();
+    } else if (!ENV_EFFECTIVE_PORT && await probeExternalOpenCode(4096)) {
+      console.log('Auto-detected existing OpenCode server on default port 4096');
+      setOpenCodePort(4096);
+      isOpenCodeReady = true;
+      isExternalOpenCode = true;
+      lastOpenCodeError = null;
+      openCodeNotReadySince = 0;
+      syncToHmrState();
+    } else {
+      if (ENV_EFFECTIVE_PORT) {
+        console.log(`Using OpenCode port from environment: ${ENV_EFFECTIVE_PORT}`);
+        setOpenCodePort(ENV_EFFECTIVE_PORT);
+      } else {
+        openCodePort = null;
+        syncToHmrState();
+      }
+
+      lastOpenCodeError = null;
+      openCodeProcess = await startOpenCode();
+      syncToHmrState();
+    }
+    await waitForOpenCodePort();
+    try {
+      await waitForOpenCodeReady();
+    } catch (error) {
+      console.error(`OpenCode readiness check failed: ${error.message}`);
+      scheduleOpenCodeApiDetection();
+    }
+    scheduleOpenCodeApiDetection();
+    startHealthMonitoring();
+    void startGlobalEventWatcher().catch((error) => {
+      console.warn(`Global event watcher startup failed: ${error?.message || error}`);
+    });
+  } catch (error) {
+    console.error(`Failed to start OpenCode: ${error.message}`);
+    console.log('Continuing without OpenCode integration...');
+    lastOpenCodeError = error.message;
+    scheduleOpenCodeApiDetection();
+  }
+}
+
 function setupProxy(app) {
   if (app.get('opencodeProxyConfigured')) {
     return;
@@ -5430,6 +6552,54 @@ function setupProxy(app) {
     console.log('Setting up OpenCode API gate (OpenCode not started yet)');
   }
   app.set('opencodeProxyConfigured', true);
+
+  const stripApiPrefix = (rawUrl) => {
+    if (typeof rawUrl !== 'string' || !rawUrl) {
+      return '/';
+    }
+    if (rawUrl === '/api') {
+      return '/';
+    }
+    if (rawUrl.startsWith('/api/')) {
+      return rawUrl.slice(4);
+    }
+    return rawUrl;
+  };
+
+  // Keep route matching stable; only rewrite the proxied upstream path.
+  const rewriteWindowsDirectoryParam = (upstreamPath) => {
+    if (process.platform !== 'win32') {
+      return upstreamPath;
+    }
+    try {
+      const parsed = new URL(upstreamPath, 'http://openchamber.local');
+      const pathname = parsed.pathname || '/';
+      if (pathname === '/session' || pathname.startsWith('/session/')) {
+        return upstreamPath;
+      }
+      const directory = parsed.searchParams.get('directory');
+      if (!directory || !directory.includes('/')) {
+        return upstreamPath;
+      }
+      const fixed = directory.replace(/\//g, '\\');
+      parsed.searchParams.set('directory', fixed);
+      const rewritten = `${parsed.pathname}${parsed.search}${parsed.hash}`;
+      if (rewritten !== upstreamPath) {
+        console.log(`[Win32PathFix] Rewrote directory: "${directory}" → "${fixed}"`);
+        console.log(`[Win32PathFix] URL: "${upstreamPath}" → "${rewritten}"`);
+      }
+      return rewritten;
+    } catch {
+      return upstreamPath;
+    }
+  };
+
+  const getUpstreamPathForRequest = (req) => {
+    const rawUrl = (typeof req.originalUrl === 'string' && req.originalUrl)
+      ? req.originalUrl
+      : (typeof req.url === 'string' ? req.url : '/');
+    return rewriteWindowsDirectoryParam(stripApiPrefix(rawUrl));
+  };
 
   app.use('/api', (req, res, next) => {
     if (
@@ -5466,7 +6636,7 @@ function setupProxy(app) {
 
   const forwardSseRequest = async (req, res) => {
     const startedAt = Date.now();
-    const upstreamPath = req.originalUrl.replace(/^\/api/, '');
+    const upstreamPath = getUpstreamPathForRequest(req);
     const targetUrl = buildOpenCodeUrl(upstreamPath, '');
     const authHeaders = getOpenCodeAuthHeaders();
 
@@ -5482,8 +6652,13 @@ function setupProxy(app) {
     let idleTimer = null;
     let heartbeatTimer = null;
     let endedBy = 'upstream-end';
+    let stopAdapterSse = null;
+
+    // Register this SSE client for UI notification broadcasts
+    uiNotificationClients.add(res);
 
     const cleanup = () => {
+      uiNotificationClients.delete(res);
       if (connectTimer) {
         clearTimeout(connectTimer);
         connectTimer = null;
@@ -5568,6 +6743,9 @@ function setupProxy(app) {
         }
       }, 30 * 1000);
 
+      // Merge Claude Code adapter events into this SSE stream
+      stopAdapterSse = connectAdapterSse(res, controller.signal);
+
       const reader = upstreamResponse.body.getReader();
       try {
         while (true) {
@@ -5591,12 +6769,16 @@ function setupProxy(app) {
         }
       }
 
+      stopAdapterSse();
       cleanup();
       if (!res.writableEnded) {
         res.end();
       }
       console.log(`SSE forward ${upstreamPath} closed (${endedBy}) in ${Date.now() - startedAt}ms`);
     } catch (error) {
+      if (stopAdapterSse) {
+        stopAdapterSse();
+      }
       cleanup();
       const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
       if (!res.headersSent) {
@@ -5634,67 +6816,660 @@ function setupProxy(app) {
   });
 
 
-  const proxyMiddleware = createProxyMiddleware({
-    target: openCodePort ? `http://localhost:${openCodePort}` : 'http://127.0.0.1:0',
-    pathFilter: (path) => !path.startsWith('/share'),
-    router: () => {
-      if (!openCodePort) {
-        return 'http://127.0.0.1:0';
+  const hopByHopRequestHeaders = new Set([
+    'host',
+    'connection',
+    'content-length',
+    'transfer-encoding',
+    'keep-alive',
+    'te',
+    'trailer',
+    'upgrade',
+  ]);
+
+  const hopByHopResponseHeaders = new Set([
+    'connection',
+    'content-length',
+    'transfer-encoding',
+    'keep-alive',
+    'te',
+    'trailer',
+    'upgrade',
+    'www-authenticate',
+  ]);
+
+  const collectForwardHeaders = (req) => {
+    const authHeaders = getOpenCodeAuthHeaders();
+    const headers = {};
+
+    for (const [key, value] of Object.entries(req.headers || {})) {
+      if (!value) continue;
+      const lowerKey = key.toLowerCase();
+      if (hopByHopRequestHeaders.has(lowerKey)) continue;
+      headers[lowerKey] = Array.isArray(value) ? value.join(', ') : String(value);
+    }
+
+    if (authHeaders.Authorization) {
+      headers.Authorization = authHeaders.Authorization;
+    }
+
+    return headers;
+  };
+
+  const collectRequestBodyBuffer = async (req) => {
+    if (Buffer.isBuffer(req.body)) {
+      return req.body;
+    }
+
+    if (typeof req.body === 'string') {
+      return Buffer.from(req.body);
+    }
+
+    if (req.body && typeof req.body === 'object') {
+      return Buffer.from(JSON.stringify(req.body));
+    }
+
+    if (req.readableEnded) {
+      return Buffer.alloc(0);
+    }
+
+    return await new Promise((resolve, reject) => {
+      const chunks = [];
+      req.on('data', (chunk) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+      req.on('end', () => resolve(Buffer.concat(chunks)));
+      req.on('error', reject);
+    });
+  };
+
+  const forwardGenericApiRequest = async (req, res) => {
+    try {
+      const upstreamPath = getUpstreamPathForRequest(req);
+      const targetUrl = buildOpenCodeUrl(upstreamPath, '');
+      const headers = collectForwardHeaders(req);
+      const method = String(req.method || 'GET').toUpperCase();
+      const hasBody = method !== 'GET' && method !== 'HEAD';
+      const bodyBuffer = hasBody ? await collectRequestBodyBuffer(req) : null;
+
+      const upstreamResponse = await fetch(targetUrl, {
+        method,
+        headers,
+        body: hasBody ? bodyBuffer : undefined,
+        signal: AbortSignal.timeout(LONG_REQUEST_TIMEOUT_MS),
+      });
+
+      for (const [key, value] of upstreamResponse.headers.entries()) {
+        const lowerKey = key.toLowerCase();
+        if (hopByHopResponseHeaders.has(lowerKey)) {
+          continue;
+        }
+        res.setHeader(key, value);
       }
-      return `http://localhost:${openCodePort}`;
-    },
-    changeOrigin: true,
-    pathRewrite: (path) => {
-      if (!path.startsWith('/api')) {
-        return path;
+
+      const upstreamBody = Buffer.from(await upstreamResponse.arrayBuffer());
+      res.status(upstreamResponse.status).send(upstreamBody);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'OpenCode request timed out' : 'OpenCode request failed',
+        });
+      }
+    }
+  };
+
+  // Dedicated forwarder for large session message payloads.
+  // This avoids edge-cases in generic proxy streaming for multi-file attachments.
+  app.post('/api/session/:sessionId/message', express.raw({ type: '*/*', limit: '50mb' }), async (req, res) => {
+    try {
+      const upstreamPath = getUpstreamPathForRequest(req);
+      const targetUrl = buildOpenCodeUrl(upstreamPath, '');
+      const authHeaders = getOpenCodeAuthHeaders();
+
+      const headers = {
+        ...(typeof req.headers['content-type'] === 'string' ? { 'content-type': req.headers['content-type'] } : { 'content-type': 'application/json' }),
+        ...(typeof req.headers.accept === 'string' ? { accept: req.headers.accept } : {}),
+        ...(authHeaders.Authorization ? { Authorization: authHeaders.Authorization } : {}),
+      };
+
+      const bodyBuffer = Buffer.isBuffer(req.body)
+        ? req.body
+        : Buffer.from(typeof req.body === 'string' ? req.body : '');
+
+      const upstreamResponse = await fetch(targetUrl, {
+        method: 'POST',
+        headers,
+        body: bodyBuffer,
+        signal: AbortSignal.timeout(LONG_REQUEST_TIMEOUT_MS),
+      });
+
+      const upstreamBody = Buffer.from(await upstreamResponse.arrayBuffer());
+
+      if (upstreamResponse.headers.has('content-type')) {
+        res.setHeader('content-type', upstreamResponse.headers.get('content-type'));
       }
 
-      const suffix = path.slice(4) || '/';
-
-      return suffix;
-    },
-    ws: false,
-    // v3.x API: callbacks go in 'on' object
-    on: {
-      error: (err, req, res) => {
-        console.error(`Proxy error: ${err.message}`);
-        if (!res.headersSent) {
-          res.status(503).json({ error: 'OpenCode service unavailable' });
-        }
-      },
-      proxyReq: (proxyReq, req, res) => {
-        console.log(`Proxying ${req.method} ${req.path} to OpenCode`);
-        const authHeaders = getOpenCodeAuthHeaders();
-        if (authHeaders.Authorization) {
-          proxyReq.setHeader('Authorization', authHeaders.Authorization);
-        }
-
-        if (req.headers.accept && req.headers.accept.includes('text/event-stream')) {
-          proxyReq.setHeader('Accept', 'text/event-stream');
-          proxyReq.setHeader('Cache-Control', 'no-cache');
-          proxyReq.setHeader('Connection', 'keep-alive');
-        }
-      },
-      proxyRes: (proxyRes, req, res) => {
-        // Strip WWW-Authenticate to prevent browser's native Basic Auth popup
-        if (proxyRes.headers['www-authenticate']) {
-          delete proxyRes.headers['www-authenticate'];
-        }
-
-        if (req.url?.includes('/event')) {
-          proxyRes.headers['Access-Control-Allow-Origin'] = '*';
-          proxyRes.headers['Access-Control-Allow-Headers'] = 'Cache-Control, Accept';
-          proxyRes.headers['Content-Type'] = 'text/event-stream';
-          proxyRes.headers['Cache-Control'] = 'no-cache';
-          proxyRes.headers['Connection'] = 'keep-alive';
-          proxyRes.headers['X-Accel-Buffering'] = 'no';
-          proxyRes.headers['X-Content-Type-Options'] = 'nosniff';
-        }
+      res.status(upstreamResponse.status).send(upstreamBody);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'OpenCode message forward timed out' : 'OpenCode message forward failed',
+        });
       }
     }
   });
 
-  app.use('/api', proxyMiddleware);
+  // Intercept GET /config/providers to inject Claude Code provider when adapter is running
+  app.get('/api/config/providers', async (req, res) => {
+    try {
+      const queryString = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
+      const upstreamUrl = buildOpenCodeUrl(`/config/providers${queryString}`, '');
+      const authHeaders = getOpenCodeAuthHeaders();
+
+      const upstreamResponse = await fetch(upstreamUrl, {
+        method: 'GET',
+        headers: {
+          accept: 'application/json',
+          ...(authHeaders.Authorization ? { Authorization: authHeaders.Authorization } : {}),
+        },
+        signal: AbortSignal.timeout(10000),
+      });
+
+      const contentType = upstreamResponse.headers.get('content-type') || 'application/json';
+      if (!upstreamResponse.ok) {
+        const body = await upstreamResponse.text().catch(() => '');
+        res.setHeader('content-type', contentType);
+        return res.status(upstreamResponse.status).send(body);
+      }
+
+      const data = await upstreamResponse.json();
+
+      if (claudeCodeAdapterPort != null) {
+        const providers = Array.isArray(data.providers) ? data.providers : [];
+        providers.push({
+          id: 'claudecode',
+          name: 'Claude Code',
+          source: 'custom',
+          env: [],
+          options: {},
+          models: {
+            default: {
+              id: 'default',
+              providerID: 'claudecode',
+              api: { id: 'claudecode', url: '', npm: '' },
+              name: 'Default (Claude Code manages model selection)',
+              capabilities: {
+                temperature: false,
+                reasoning: false,
+                attachment: true,
+                toolcall: true,
+                input: { text: true, audio: false, image: true, video: false, pdf: true },
+                output: { text: true, audio: false, image: false, video: false, pdf: false },
+                interleaved: false,
+              },
+              cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+              limit: { context: 200000, output: 16384 },
+              status: 'active',
+              options: {},
+              headers: {},
+              release_date: '2025-01-01',
+            },
+          },
+        });
+        data.providers = providers;
+      }
+
+      res.json(data);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'Provider list fetch timed out' : 'Provider list fetch failed',
+        });
+      }
+    }
+  });
+
+  app.use('/api', async (req, res, next) => {
+    if (isSseApiPath(req.path)) {
+      return next();
+    }
+
+    // Let dedicated route handlers below decide whether to forward to the
+    // Claude Code adapter or OpenCode.
+    if (req.method === 'POST' && /^\/session\/[^/]+\/prompt_async$/.test(req.path)) {
+      return next();
+    }
+    if (req.method === 'GET' && /^\/session\/[^/]+\/message$/.test(req.path)) {
+      return next();
+    }
+    // Question reply/reject routes have dedicated handlers that try the Claude Code
+    // adapter first before falling through to OpenCode.
+    if (req.method === 'POST' && /^\/question\/[^/]+\/(reply|reject)$/.test(req.path)) {
+      return next();
+    }
+    // Question list and permission list merge from both backends.
+    if (req.method === 'GET' && (req.path === '/question' || req.path === '/permission')) {
+      return next();
+    }
+
+    // Windows: Merge sessions from all project directories on bare GET /session
+    if (process.platform === 'win32' && req.method === 'GET' && req.path === '/session') {
+      const rawUrl = req.originalUrl || req.url || '';
+      if (!rawUrl.includes('directory=')) {
+        try {
+          const authHeaders = getOpenCodeAuthHeaders();
+          const fetchOpts = {
+            method: 'GET',
+            headers: { Accept: 'application/json', ...authHeaders },
+            signal: AbortSignal.timeout(10000),
+          };
+          const globalRes = await fetch(buildOpenCodeUrl('/session', ''), fetchOpts);
+          const globalPayload = globalRes.ok ? await globalRes.json().catch(() => []) : [];
+          const globalSessions = Array.isArray(globalPayload) ? globalPayload : [];
+
+          const settingsPath = path.join(os.homedir(), '.config', 'openchamber', 'settings.json');
+          let projectDirs = [];
+          try {
+            const settingsRaw = fs.readFileSync(settingsPath, 'utf8');
+            const settings = JSON.parse(settingsRaw);
+            projectDirs = (settings.projects || [])
+              .map((project) => (typeof project?.path === 'string' ? project.path.trim() : ''))
+              .filter(Boolean);
+          } catch {}
+
+          const seen = new Set(
+            globalSessions
+              .map((session) => (session && typeof session.id === 'string' ? session.id : null))
+              .filter((id) => typeof id === 'string')
+          );
+          const extraSessions = [];
+          for (const dir of projectDirs) {
+            const candidates = Array.from(new Set([
+              dir,
+              dir.replace(/\\/g, '/'),
+              dir.replace(/\//g, '\\'),
+            ]));
+            for (const candidateDir of candidates) {
+              const encoded = encodeURIComponent(candidateDir);
+              try {
+                const dirRes = await fetch(buildOpenCodeUrl(`/session?directory=${encoded}`, ''), fetchOpts);
+                if (dirRes.ok) {
+                  const dirPayload = await dirRes.json().catch(() => []);
+                  const dirSessions = Array.isArray(dirPayload) ? dirPayload : [];
+                  for (const session of dirSessions) {
+                    const id = session && typeof session.id === 'string' ? session.id : null;
+                    if (id && !seen.has(id)) {
+                      seen.add(id);
+                      extraSessions.push(session);
+                    }
+                  }
+                }
+              } catch {}
+            }
+          }
+
+          const merged = [...globalSessions, ...extraSessions];
+          merged.sort((a, b) => {
+            const aTime = a && typeof a.time_updated === 'number' ? a.time_updated : 0;
+            const bTime = b && typeof b.time_updated === 'number' ? b.time_updated : 0;
+            return bTime - aTime;
+          });
+          console.log(`[SessionMerge] ${globalSessions.length} global + ${extraSessions.length} extra = ${merged.length} total`);
+          return res.json(merged);
+        } catch (error) {
+          console.log(`[SessionMerge] Error: ${error.message}, falling through`);
+        }
+      }
+    }
+
+    return forwardGenericApiRequest(req, res);
+  });
+
+  // Route POST /api/session/:id/prompt_async to Claude Code adapter when providerID is 'claudecode',
+  // otherwise forward to OpenCode directly (we cannot call next() because express.raw() consumes the body stream).
+  app.post('/api/session/:id/prompt_async', express.raw({ type: '*/*', limit: '10mb' }), async (req, res) => {
+    const rawBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(typeof req.body === 'string' ? req.body : '');
+    let body;
+    try {
+      body = rawBuffer.length > 0 ? JSON.parse(rawBuffer.toString('utf8')) : {};
+    } catch {
+      // JSON parsing failed — forward raw payload to OpenCode and let it handle the error
+      body = {};
+    }
+
+    const providerID = body.model?.providerID;
+    const sessionId = req.params.id;
+
+    if (providerID !== 'claudecode' || claudeCodeAdapterPort == null) {
+      // Not a Claude Code request or adapter not running — forward to OpenCode directly
+      // (we cannot use next() because express.raw() already consumed the body stream)
+      try {
+        const upstreamPath = req.originalUrl.replace(/^\/api/, '');
+        const targetUrl = buildOpenCodeUrl(upstreamPath, '');
+        const authHeaders = getOpenCodeAuthHeaders();
+
+        const headers = {
+          ...(typeof req.headers['content-type'] === 'string' ? { 'content-type': req.headers['content-type'] } : { 'content-type': 'application/json' }),
+          ...(typeof req.headers.accept === 'string' ? { accept: req.headers.accept } : {}),
+          ...(authHeaders.Authorization ? { Authorization: authHeaders.Authorization } : {}),
+        };
+
+        const upstreamResponse = await fetch(targetUrl, {
+          method: 'POST',
+          headers,
+          body: rawBuffer,
+          signal: AbortSignal.timeout(LONG_REQUEST_TIMEOUT_MS),
+        });
+
+        const upstreamBody = Buffer.from(await upstreamResponse.arrayBuffer());
+
+        if (upstreamResponse.headers.has('content-type')) {
+          res.setHeader('content-type', upstreamResponse.headers.get('content-type'));
+        }
+
+        res.status(upstreamResponse.status).send(upstreamBody);
+      } catch (error) {
+        if (!res.headersSent) {
+          const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+          res.status(isTimeout ? 504 : 503).json({
+            error: isTimeout ? 'OpenCode prompt_async forward timed out' : 'OpenCode prompt_async forward failed',
+          });
+        }
+      }
+      return;
+    }
+
+    // Forward to Claude Code adapter, preserving query params (e.g. ?directory=...)
+    const adapterBase = `http://127.0.0.1:${claudeCodeAdapterPort}/session/${encodeURIComponent(sessionId)}/prompt_async`;
+    const origQuery = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
+    const adapterUrl = adapterBase + origQuery;
+    console.log(`[ClaudeCode] Forwarding prompt_async for session ${sessionId} to adapter at port ${claudeCodeAdapterPort}, url=${adapterUrl}`);
+
+    try {
+      const adapterHeaders = { 'content-type': 'application/json' };
+      const dirHeader = req.headers['x-opencode-directory'];
+      if (dirHeader) adapterHeaders['x-opencode-directory'] = dirHeader;
+      const upstreamResponse = await fetch(adapterUrl, {
+        method: 'POST',
+        headers: adapterHeaders,
+        body: rawBuffer,
+        signal: AbortSignal.timeout(LONG_REQUEST_TIMEOUT_MS),
+      });
+
+      const responseBody = await upstreamResponse.text();
+      const contentType = upstreamResponse.headers.get('content-type') || 'application/json';
+      res.setHeader('content-type', contentType);
+      res.status(upstreamResponse.status).send(responseBody);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'Claude Code adapter request timed out' : 'Claude Code adapter unavailable',
+        });
+      }
+    }
+  });
+
+  // GET /api/session/:id/message — check both OpenCode and Claude Code adapter,
+  // preferring whichever has messages (the adapter stores messages for Claude Code sessions).
+  app.get('/api/session/:id/message', async (req, res) => {
+    const sessionId = req.params.id;
+    const queryString = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
+
+    // Fetch from OpenCode
+    let openCodeMessages = [];
+    try {
+      const upstreamPath = `/session/${encodeURIComponent(sessionId)}/message${queryString}`;
+      const targetUrl = buildOpenCodeUrl(upstreamPath, '');
+      const authHeaders = getOpenCodeAuthHeaders();
+      const ocResponse = await fetch(targetUrl, {
+        method: 'GET',
+        headers: { accept: 'application/json', ...authHeaders },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (ocResponse.ok) {
+        const data = await ocResponse.json();
+        openCodeMessages = Array.isArray(data) ? data : [];
+      }
+    } catch {
+      // OpenCode may be unreachable — continue to adapter fallback
+    }
+
+    // If OpenCode returned messages, use those
+    if (openCodeMessages.length > 0 || claudeCodeAdapterPort == null) {
+      return res.json(openCodeMessages);
+    }
+
+    // Try Claude Code adapter
+    try {
+      const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/session/${encodeURIComponent(sessionId)}/message`;
+      const adapterResponse = await fetch(adapterUrl, {
+        method: 'GET',
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (adapterResponse.ok) {
+        const data = await adapterResponse.json();
+        return res.json(Array.isArray(data) ? data : []);
+      }
+    } catch {
+      // adapter unreachable
+    }
+
+    res.json(openCodeMessages);
+  });
+
+  // Merge GET /api/question from both OpenCode and Claude Code adapter
+  app.get('/api/question', async (req, res) => {
+    const queryString = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
+    const authHeaders = getOpenCodeAuthHeaders();
+
+    // Fetch from OpenCode
+    let openCodeQuestions = [];
+    try {
+      const openCodeUrl = buildOpenCodeUrl(`/question${queryString}`, '');
+      const ocResponse = await fetch(openCodeUrl, {
+        method: 'GET',
+        headers: { accept: 'application/json', ...authHeaders },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (ocResponse.ok) {
+        const data = await ocResponse.json();
+        openCodeQuestions = Array.isArray(data) ? data : [];
+      }
+    } catch (err) {
+      console.warn('[ClaudeCode] Failed to fetch questions from OpenCode:', err?.message || err);
+    }
+
+    // Fetch from Claude Code adapter (if running and not same as OpenCode)
+    let adapterQuestions = [];
+    if (claudeCodeAdapterPort != null && claudeCodeAdapterPort !== openCodePort) {
+      try {
+        const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/question`;
+        const adapterResponse = await fetch(adapterUrl, {
+          method: 'GET',
+          headers: { accept: 'application/json' },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (adapterResponse.ok) {
+          const data = await adapterResponse.json();
+          adapterQuestions = Array.isArray(data) ? data : [];
+        }
+      } catch (err) {
+        console.warn('[ClaudeCode] Failed to fetch questions from adapter:', err?.message || err);
+      }
+    }
+
+    res.json([...openCodeQuestions, ...adapterQuestions]);
+  });
+
+  // Route POST /api/question/:requestID/reply — try adapter first, then OpenCode
+  app.post('/api/question/:requestID/reply', express.raw({ type: '*/*', limit: '1mb' }), async (req, res) => {
+    const { requestID } = req.params;
+    const rawBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(typeof req.body === 'string' ? req.body : '');
+    let body;
+    try {
+      body = rawBuffer.length > 0 ? JSON.parse(rawBuffer.toString('utf8')) : {};
+    } catch {
+      body = {};
+    }
+
+    // Try Claude Code adapter first (if running and not same as OpenCode)
+    if (claudeCodeAdapterPort != null && claudeCodeAdapterPort !== openCodePort) {
+      try {
+        const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/question/reply`;
+        const adapterResponse = await fetch(adapterUrl, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ requestID, ...body }),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (adapterResponse.ok) {
+          const data = await adapterResponse.text();
+          res.setHeader('content-type', adapterResponse.headers.get('content-type') || 'application/json');
+          return res.status(200).send(data);
+        }
+        // 404 means adapter doesn't own this question — fall through to OpenCode
+        if (adapterResponse.status !== 404) {
+          const data = await adapterResponse.text();
+          res.setHeader('content-type', adapterResponse.headers.get('content-type') || 'application/json');
+          return res.status(adapterResponse.status).send(data);
+        }
+      } catch (err) {
+        console.warn('[ClaudeCode] Failed to forward question reply to adapter:', err?.message || err);
+      }
+    }
+
+    // Forward to OpenCode
+    try {
+      const upstreamUrl = buildOpenCodeUrl(`/question/${encodeURIComponent(requestID)}/reply`, '');
+      const authHeaders = getOpenCodeAuthHeaders();
+      const upstreamResponse = await fetch(upstreamUrl, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...authHeaders,
+        },
+        body: rawBuffer,
+        signal: AbortSignal.timeout(10000),
+      });
+      const upstreamBody = await upstreamResponse.text();
+      res.setHeader('content-type', upstreamResponse.headers.get('content-type') || 'application/json');
+      res.status(upstreamResponse.status).send(upstreamBody);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'Question reply forward timed out' : 'Question reply forward failed',
+        });
+      }
+    }
+  });
+
+  // Route POST /api/question/:requestID/reject — try adapter first, then OpenCode
+  app.post('/api/question/:requestID/reject', express.raw({ type: '*/*', limit: '1mb' }), async (req, res) => {
+    const { requestID } = req.params;
+    const rawBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(typeof req.body === 'string' ? req.body : '');
+
+    // Try Claude Code adapter first (if running and not same as OpenCode)
+    if (claudeCodeAdapterPort != null && claudeCodeAdapterPort !== openCodePort) {
+      try {
+        const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/question/reject`;
+        const adapterResponse = await fetch(adapterUrl, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ requestID }),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (adapterResponse.ok) {
+          const data = await adapterResponse.text();
+          res.setHeader('content-type', adapterResponse.headers.get('content-type') || 'application/json');
+          return res.status(200).send(data);
+        }
+        // 404 means adapter doesn't own this question — fall through to OpenCode
+        if (adapterResponse.status !== 404) {
+          const data = await adapterResponse.text();
+          res.setHeader('content-type', adapterResponse.headers.get('content-type') || 'application/json');
+          return res.status(adapterResponse.status).send(data);
+        }
+      } catch (err) {
+        console.warn('[ClaudeCode] Failed to forward question reject to adapter:', err?.message || err);
+      }
+    }
+
+    // Forward to OpenCode
+    try {
+      const upstreamUrl = buildOpenCodeUrl(`/question/${encodeURIComponent(requestID)}/reject`, '');
+      const authHeaders = getOpenCodeAuthHeaders();
+      const upstreamResponse = await fetch(upstreamUrl, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...authHeaders,
+        },
+        body: rawBuffer,
+        signal: AbortSignal.timeout(10000),
+      });
+      const upstreamBody = await upstreamResponse.text();
+      res.setHeader('content-type', upstreamResponse.headers.get('content-type') || 'application/json');
+      res.status(upstreamResponse.status).send(upstreamBody);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'Question reject forward timed out' : 'Question reject forward failed',
+        });
+      }
+    }
+  });
+
+  // Merge GET /api/permission from both OpenCode and Claude Code adapter
+  app.get('/api/permission', async (req, res) => {
+    const queryString = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
+    const authHeaders = getOpenCodeAuthHeaders();
+
+    // Fetch from OpenCode
+    let openCodePermissions = [];
+    try {
+      const openCodeUrl = buildOpenCodeUrl(`/permission${queryString}`, '');
+      const ocResponse = await fetch(openCodeUrl, {
+        method: 'GET',
+        headers: { accept: 'application/json', ...authHeaders },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (ocResponse.ok) {
+        const data = await ocResponse.json();
+        openCodePermissions = Array.isArray(data) ? data : [];
+      }
+    } catch (err) {
+      console.warn('[ClaudeCode] Failed to fetch permissions from OpenCode:', err?.message || err);
+    }
+
+    // Fetch from Claude Code adapter (if running and not same as OpenCode)
+    let adapterPermissions = [];
+    if (claudeCodeAdapterPort != null && claudeCodeAdapterPort !== openCodePort) {
+      try {
+        const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/permission`;
+        const adapterResponse = await fetch(adapterUrl, {
+          method: 'GET',
+          headers: { accept: 'application/json' },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (adapterResponse.ok) {
+          const data = await adapterResponse.json();
+          adapterPermissions = Array.isArray(data) ? data : [];
+        }
+      } catch (err) {
+        console.warn('[ClaudeCode] Failed to fetch permissions from adapter:', err?.message || err);
+      }
+    }
+
+    res.json([...openCodePermissions, ...adapterPermissions]);
+  });
+
 }
 
 function startHealthMonitoring() {
@@ -5749,6 +7524,18 @@ async function gracefulShutdown(options = {}) {
     }
   }
 
+  // Stop Claude Code adapter if running
+  if (claudeCodeAdapterInstance) {
+    console.log('Stopping Claude Code adapter...');
+    try {
+      await claudeCodeAdapterInstance.stop();
+    } catch (error) {
+      console.warn('Error stopping Claude Code adapter:', error);
+    }
+    claudeCodeAdapterInstance = null;
+    claudeCodeAdapterPort = null;
+  }
+
   // Only stop OpenCode if we started it ourselves (not when using external server)
   if (!ENV_SKIP_OPENCODE_START && !isExternalOpenCode) {
     const portToKill = openCodePort;
@@ -5763,7 +7550,9 @@ async function gracefulShutdown(options = {}) {
       openCodeProcess = null;
     }
 
-    killProcessOnPort(portToKill);
+    if (ENV_BACKEND !== 'claudecode') {
+      killProcessOnPort(portToKill);
+    }
   } else {
     console.log('Skipping OpenCode shutdown (external server)');
   }
@@ -5794,6 +7583,7 @@ async function gracefulShutdown(options = {}) {
     console.log('Stopping Cloudflare tunnel...');
     cloudflareTunnelController.stop();
     cloudflareTunnelController = null;
+    tunnelAuthController.clearActiveTunnel();
   }
 
   console.log('Graceful shutdown complete');
@@ -5841,45 +7631,37 @@ async function main(options = {}) {
     sayTTSCapability = { available: false, voices: [], reason: 'Not macOS' };
   }
 
-  // Validate stored zen model at startup – best-effort, never blocks startup
-  try {
-    const freeModels = await fetchFreeZenModels();
-    const freeModelIds = freeModels.map((m) => m.id);
-
-    if (freeModelIds.length > 0) {
-      // Set the validated fallback to the first available free model
-      validatedZenFallback = freeModelIds[0];
-
-      const settings = await readSettingsFromDisk();
-      const storedModel = typeof settings?.zenModel === 'string' ? settings.zenModel.trim() : '';
-
-      if (!storedModel || !freeModelIds.includes(storedModel)) {
-        const fallback = freeModelIds[0];
-        console.log(
-          storedModel
-            ? `[zen] Stored model "${storedModel}" not found in free models, falling back to "${fallback}"`
-            : `[zen] No model configured, setting default to "${fallback}"`
-        );
-        await persistSettings({ zenModel: fallback });
-      } else {
-        console.log(`[zen] Stored model "${storedModel}" verified as available`);
-      }
-    } else {
-      console.warn('[zen] No free models returned from API, skipping validation');
-    }
-  } catch (error) {
-    console.warn('[zen] Startup model validation failed (non-blocking):', error?.message || error);
-  }
+  // Startup model validation is best-effort and runs in background.
+  void validateZenModelAtStartup();
 
   const app = express();
+  const serverStartedAt = new Date().toISOString();
   app.set('trust proxy', true);
   expressApp = app;
-  server = http.createServer(app);
+  // Use HTTPS when TLS certificates are available (e.g. from mkcert).
+  // Looks in ~/.config/openchamber/certs/ or OPENCHAMBER_TLS_CERT / OPENCHAMBER_TLS_KEY env vars.
+  const tlsCertPath = process.env.OPENCHAMBER_TLS_CERT || path.join(os.homedir(), '.config', 'openchamber', 'certs', 'cert.pem');
+  const tlsKeyPath = process.env.OPENCHAMBER_TLS_KEY || path.join(os.homedir(), '.config', 'openchamber', 'certs', 'key.pem');
+  let useTls = false;
+  try {
+    if (fs.existsSync(tlsCertPath) && fs.existsSync(tlsKeyPath)) {
+      const tlsOpts = { cert: fs.readFileSync(tlsCertPath), key: fs.readFileSync(tlsKeyPath) };
+      server = https.createServer(tlsOpts, app);
+      useTls = true;
+      console.log(`TLS enabled (cert: ${tlsCertPath})`);
+    }
+  } catch (err) {
+    console.warn(`TLS certificate found but failed to load: ${err.message}`);
+  }
+  if (!useTls) {
+    server = http.createServer(app);
+  }
 
   app.get('/health', (req, res) => {
     res.json({
       status: 'ok',
       timestamp: new Date().toISOString(),
+      backend: ENV_BACKEND,
       openCodePort: openCodePort,
       openCodeRunning: Boolean(openCodePort && isOpenCodeReady && !isRestartingOpenCode),
       openCodeSecureConnection: isOpenCodeConnectionSecure(),
@@ -5891,8 +7673,14 @@ async function main(options = {}) {
       opencodeBinaryResolved: resolvedOpencodeBinary || null,
       opencodeBinarySource: resolvedOpencodeBinarySource || null,
       opencodeShimInterpreter: resolvedOpencodeBinary ? opencodeShimInterpreter(resolvedOpencodeBinary) : null,
+      opencodeViaWsl: useWslForOpencode,
+      opencodeWslBinary: resolvedWslBinary || null,
+      opencodeWslPath: resolvedWslOpencodePath || null,
+      opencodeWslDistro: resolvedWslDistro || null,
       nodeBinaryResolved: resolvedNodeBinary || null,
       bunBinaryResolved: resolvedBunBinary || null,
+      claudeCodeAvailable: claudeCodeAdapterPort != null,
+      claudeCodeAdapterPort: claudeCodeAdapterPort,
     });
   });
 
@@ -5903,12 +7691,23 @@ async function main(options = {}) {
     });
   });
 
+  app.get('/api/system/info', (req, res) => {
+    res.json({
+      openchamberVersion: OPENCHAMBER_VERSION,
+      runtime: process.env.OPENCHAMBER_RUNTIME || 'web',
+      pid: process.pid,
+      startedAt: serverStartedAt,
+    });
+  });
+
   app.use((req, res, next) => {
     if (
       req.path.startsWith('/api/config/agents') ||
       req.path.startsWith('/api/config/commands') ||
+      req.path.startsWith('/api/config/mcp') ||
       req.path.startsWith('/api/config/settings') ||
       req.path.startsWith('/api/config/skills') ||
+      req.path.startsWith('/api/projects') ||
       req.path.startsWith('/api/fs') ||
       req.path.startsWith('/api/git') ||
       req.path.startsWith('/api/prompts') ||
@@ -5917,7 +7716,8 @@ async function main(options = {}) {
       req.path.startsWith('/api/push') ||
       req.path.startsWith('/api/voice') ||
       req.path.startsWith('/api/tts') ||
-      req.path.startsWith('/api/share')
+      req.path.startsWith('/api/share') ||
+      req.path.startsWith('/api/openchamber/tunnel')
     ) {
 
       express.json({ limit: '50mb' })(req, res, next);
@@ -5942,10 +7742,71 @@ async function main(options = {}) {
     console.log('UI password protection enabled for browser sessions');
   }
 
-  app.get('/auth/session', (req, res) => uiAuthController.handleSessionStatus(req, res));
-  app.post('/auth/session', (req, res) => uiAuthController.handleSessionCreate(req, res));
+  app.get('/auth/session', async (req, res) => {
+    const requestScope = tunnelAuthController.classifyRequestScope(req);
+    if (requestScope === 'tunnel' || requestScope === 'unknown-public') {
+      const tunnelSession = tunnelAuthController.getTunnelSessionFromRequest(req);
+      if (tunnelSession) {
+        return res.json({ authenticated: true, scope: 'tunnel' });
+      }
+      tunnelAuthController.clearTunnelSessionCookie(req, res);
+      return res.status(401).json({ authenticated: false, locked: true, tunnelLocked: true });
+    }
 
-  app.use('/api', (req, res, next) => uiAuthController.requireAuth(req, res, next));
+    try {
+      await uiAuthController.handleSessionStatus(req, res);
+    } catch (err) {
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+  app.post('/auth/session', (req, res) => {
+    const requestScope = tunnelAuthController.classifyRequestScope(req);
+    if (requestScope === 'tunnel' || requestScope === 'unknown-public') {
+      return res.status(403).json({ error: 'Password login is disabled for tunnel scope', tunnelLocked: true });
+    }
+    return uiAuthController.handleSessionCreate(req, res);
+  });
+
+  app.get('/connect', async (req, res) => {
+    try {
+      const token = typeof req.query?.t === 'string' ? req.query.t : '';
+      const settings = await readSettingsFromDiskMigrated();
+      const tunnelSessionTtlMs = normalizeTunnelSessionTtlMs(settings?.tunnelSessionTtlMs);
+
+      const exchange = tunnelAuthController.exchangeBootstrapToken({
+        req,
+        res,
+        token,
+        sessionTtlMs: tunnelSessionTtlMs,
+      });
+
+      res.setHeader('Cache-Control', 'no-store');
+
+      if (!exchange.ok) {
+        if (exchange.reason === 'rate-limited') {
+          res.setHeader('Retry-After', String(exchange.retryAfter || 60));
+          return res.status(429).type('text/plain').send('Too many attempts. Please try again later.');
+        }
+        return res.status(401).type('text/plain').send('Connection link is invalid or expired.');
+      }
+
+      return res.redirect(302, '/');
+    } catch (error) {
+      return res.status(500).type('text/plain').send('Failed to process connect request.');
+    }
+  });
+
+  app.use('/api', async (req, res, next) => {
+    try {
+      const requestScope = tunnelAuthController.classifyRequestScope(req);
+      if (requestScope === 'tunnel' || requestScope === 'unknown-public') {
+        return tunnelAuthController.requireTunnelSession(req, res, next);
+      }
+      await uiAuthController.requireAuth(req, res, next);
+    } catch (err) {
+      next(err);
+    }
+  });
 
   const parsePushSubscribeBody = (body) => {
     if (!body || typeof body !== 'object') return null;
@@ -5986,7 +7847,7 @@ async function main(options = {}) {
     await ensurePushInitialized();
 
     const uiToken = uiAuthController?.ensureSessionToken
-      ? uiAuthController.ensureSessionToken(req, res)
+      ? await uiAuthController.ensureSessionToken(req, res)
       : getUiSessionTokenFromRequest(req);
     if (!uiToken) {
       return res.status(401).json({ error: 'UI session missing' });
@@ -6034,7 +7895,7 @@ async function main(options = {}) {
     await ensurePushInitialized();
 
     const uiToken = uiAuthController?.ensureSessionToken
-      ? uiAuthController.ensureSessionToken(req, res)
+      ? await uiAuthController.ensureSessionToken(req, res)
       : getUiSessionTokenFromRequest(req);
     if (!uiToken) {
       return res.status(401).json({ error: 'UI session missing' });
@@ -6049,9 +7910,9 @@ async function main(options = {}) {
     res.json({ ok: true });
   });
 
-  app.post('/api/push/visibility', (req, res) => {
+  app.post('/api/push/visibility', async (req, res) => {
     const uiToken = uiAuthController?.ensureSessionToken
-      ? uiAuthController.ensureSessionToken(req, res)
+      ? await uiAuthController.ensureSessionToken(req, res)
       : getUiSessionTokenFromRequest(req);
     if (!uiToken) {
       return res.status(401).json({ error: 'UI session missing' });
@@ -6082,7 +7943,9 @@ async function main(options = {}) {
 
   // Voice token endpoint - returns OpenAI TTS availability status
   app.post('/api/voice/token', async (req, res) => {
-    console.log('[Voice] Token request received:', { body: req.body, headers: req.headers['content-type'] });
+    console.log('[Voice] Token request received:', {
+      contentType: req.headers['content-type'] || null,
+    });
     try {
       const openaiApiKey = process.env.OPENAI_API_KEY;
       console.log('[Voice] OpenAI API Key present:', !!openaiApiKey);
@@ -6121,7 +7984,7 @@ async function main(options = {}) {
       }
 
       // Dynamically import the TTS service (ESM)
-      const { ttsService } = await import('./lib/tts-service.js');
+      const { ttsService } = await import('./lib/tts/index.js');
 
       // Check availability - either server-configured or client-provided API key
       const hasServerKey = ttsService.isAvailable();
@@ -6138,7 +8001,7 @@ async function main(options = {}) {
       // Optionally summarize long text before speaking using zen API
       if (summarize && textToSpeak.length > threshold) {
         try {
-          const { summarizeText } = await import('./lib/summarization-service.js');
+          const { summarizeText } = await import('./lib/tts/index.js');
           const speakZenModel = await resolveZenModel(typeof req.body?.zenModel === 'string' ? req.body.zenModel : undefined);
           const result = await summarizeText({ text: textToSpeak, threshold, maxLength, zenModel: speakZenModel });
           
@@ -6198,7 +8061,7 @@ async function main(options = {}) {
   });
 
   // Import summarization service
-  const { summarizeText, sanitizeForTTS } = await import('./lib/summarization-service.js');
+  const { summarizeText, sanitizeForTTS } = await import('./lib/tts/index.js');
 
   app.post('/api/tts/summarize', async (req, res) => {
     try {
@@ -6223,7 +8086,7 @@ async function main(options = {}) {
   // TTS status endpoint
   app.get('/api/tts/status', async (_req, res) => {
     try {
-      const { ttsService } = await import('./lib/tts-service.js');
+      const { ttsService } = await import('./lib/tts/index.js');
       res.json({
         available: ttsService.isAvailable(),
         voices: [
@@ -6618,6 +8481,36 @@ async function main(options = {}) {
 
       const pm = detectPackageManager();
       const updateCmd = getUpdateCommand(pm);
+      const isContainer =
+        fs.existsSync('/.dockerenv') ||
+        Boolean(process.env.CONTAINER) ||
+        process.env.container === 'docker';
+
+      if (isContainer) {
+        res.json({
+          success: true,
+          message: 'Update starting, server will stay online',
+          version: updateInfo.version,
+          packageManager: pm,
+          autoRestart: false,
+        });
+
+        setTimeout(() => {
+          console.log(`\nInstalling update using ${pm} (container mode)...`);
+          console.log(`Running: ${updateCmd}`);
+
+          const shell = process.platform === 'win32' ? (process.env.ComSpec || 'cmd.exe') : 'sh';
+          const shellFlag = process.platform === 'win32' ? '/c' : '-c';
+          const child = spawnChild(shell, [shellFlag, updateCmd], {
+            detached: true,
+            stdio: 'ignore',
+            env: process.env,
+          });
+          child.unref();
+        }, 500);
+
+        return;
+      }
 
       // Get current server port for restart
       const currentPort = server.address()?.port || 3000;
@@ -6635,19 +8528,39 @@ async function main(options = {}) {
 
       const isWindows = process.platform === 'win32';
 
-      // Build restart command with stored options
-      let restartCmd = `openchamber serve --port ${storedOptions.port} --daemon`;
+      const quotePosix = (value) => `'${String(value).replace(/'/g, "'\\''")}'`;
+      const quoteCmd = (value) => {
+        const stringValue = String(value);
+        return `"${stringValue.replace(/"/g, '""')}"`;
+      };
+
+      // Build restart command using explicit runtime + CLI path.
+      // Avoids relying on `openchamber` being in PATH for service environments.
+      const cliPath = path.resolve(__dirname, '..', 'bin', 'cli.js');
+      const restartParts = [
+        isWindows ? quoteCmd(process.execPath) : quotePosix(process.execPath),
+        isWindows ? quoteCmd(cliPath) : quotePosix(cliPath),
+        'serve',
+        '--port',
+        String(storedOptions.port),
+        '--daemon',
+      ];
+      let restartCmdPrimary = restartParts.join(' ');
+      let restartCmdFallback = `openchamber serve --port ${storedOptions.port} --daemon`;
       if (storedOptions.uiPassword) {
         if (isWindows) {
           // Escape for cmd.exe quoted argument
           const escapedPw = storedOptions.uiPassword.replace(/"/g, '""');
-          restartCmd += ` --ui-password "${escapedPw}"`;
+          restartCmdPrimary += ` --ui-password "${escapedPw}"`;
+          restartCmdFallback += ` --ui-password "${escapedPw}"`;
         } else {
           // Escape for POSIX single-quoted argument
           const escapedPw = storedOptions.uiPassword.replace(/'/g, "'\\''");
-          restartCmd += ` --ui-password '${escapedPw}'`;
+          restartCmdPrimary += ` --ui-password '${escapedPw}'`;
+          restartCmdFallback += ` --ui-password '${escapedPw}'`;
         }
       }
+      const restartCmd = `(${restartCmdPrimary}) || (${restartCmdFallback})`;
 
       // Respond immediately - update will happen after response
       res.json({
@@ -6655,6 +8568,7 @@ async function main(options = {}) {
         message: 'Update starting, server will restart shortly',
         version: updateInfo.version,
         packageManager: pm,
+        autoRestart: true,
       });
 
       // Give time for response to be sent
@@ -6692,13 +8606,31 @@ async function main(options = {}) {
             fi
           `;
 
-        // Spawn detached shell to run update after we exit
+        // Spawn detached shell to run update after we exit.
+        // Capture output to disk so restart failures are diagnosable.
+        const updateLogPath = path.join(OPENCHAMBER_DATA_DIR, 'update-install.log');
+        let logFd = null;
+        try {
+          fs.mkdirSync(path.dirname(updateLogPath), { recursive: true });
+          logFd = fs.openSync(updateLogPath, 'a');
+        } catch (logError) {
+          console.warn('Failed to open update log file, continuing without log capture:', logError);
+        }
+
         const child = spawnChild(shell, [shellFlag, script], {
           detached: true,
-          stdio: 'ignore',
+          stdio: logFd !== null ? ['ignore', logFd, logFd] : 'ignore',
           env: process.env,
         });
         child.unref();
+
+        if (logFd !== null) {
+          try {
+            fs.closeSync(logFd);
+          } catch {
+            // ignore
+          }
+        }
 
         console.log('Update process spawned, shutting down server...');
 
@@ -6780,6 +8712,250 @@ async function main(options = {}) {
     }
   });
 
+  // ── Cloudflare Tunnel API ──────────────────────────────────────────
+
+  app.get('/api/openchamber/tunnel/check', async (_req, res) => {
+    try {
+      const result = await checkCloudflaredAvailable();
+      res.json({ available: result.available, version: result.version || null });
+    } catch (error) {
+      console.warn('Cloudflare tunnel check failed:', error);
+      res.json({ available: false, version: null });
+    }
+  });
+
+  app.get('/api/openchamber/tunnel/status', async (_req, res) => {
+    try {
+      const settings = await readSettingsFromDiskMigrated();
+      const mode = normalizeTunnelMode(settings?.tunnelMode);
+      const namedHostname = normalizeNamedTunnelHostname(settings?.namedTunnelHostname);
+      const namedTunnelConfig = await readNamedTunnelConfigFromDisk();
+      const hasLegacyNamedToken = typeof settings?.namedTunnelToken === 'string' && settings.namedTunnelToken.trim().length > 0;
+      const hasNamedTunnelToken = runtimeNamedTunnelToken.length > 0 || namedTunnelConfig.tunnels.length > 0 || hasLegacyNamedToken;
+      const bootstrapTtlMs = settings?.tunnelBootstrapTtlMs === null
+        ? null
+        : normalizeTunnelBootstrapTtlMs(settings?.tunnelBootstrapTtlMs);
+      const sessionTtlMs = normalizeTunnelSessionTtlMs(settings?.tunnelSessionTtlMs);
+      const activeSessions = tunnelAuthController.listTunnelSessions();
+
+      const publicUrl = cloudflareTunnelController?.getPublicUrl?.() ?? null;
+      if (!publicUrl) {
+        return res.json({
+          active: false,
+          url: null,
+          mode,
+          hasNamedTunnelToken,
+          namedTunnelHostname: namedHostname || null,
+          namedTunnelTokenPresetIds: namedTunnelConfig.tunnels.map((entry) => entry.id),
+          hasBootstrapToken: false,
+          bootstrapExpiresAt: null,
+          policy: 'tunnel-gated',
+          activeTunnelMode: tunnelAuthController.getActiveTunnelMode() || null,
+          activeSessions,
+          localPort: activePort,
+          ttlConfig: {
+            bootstrapTtlMs,
+            sessionTtlMs,
+          },
+        });
+      }
+
+      const activeMode = cloudflareTunnelController?.mode === TUNNEL_MODE_NAMED ? TUNNEL_MODE_NAMED : TUNNEL_MODE_QUICK;
+
+      if (!tunnelAuthController.getActiveTunnelId() || !tunnelAuthController.getActiveTunnelHost()) {
+        tunnelAuthController.setActiveTunnel({ tunnelId: crypto.randomUUID(), publicUrl, mode: activeMode });
+      }
+
+      const bootstrapStatus = tunnelAuthController.getBootstrapStatus();
+
+      return res.json({
+        active: true,
+        url: publicUrl,
+        mode: activeMode,
+        hasNamedTunnelToken,
+        namedTunnelHostname: namedHostname || null,
+        namedTunnelTokenPresetIds: namedTunnelConfig.tunnels.map((entry) => entry.id),
+        hasBootstrapToken: bootstrapStatus.hasBootstrapToken,
+        bootstrapExpiresAt: bootstrapStatus.bootstrapExpiresAt,
+        policy: 'tunnel-gated',
+        activeTunnelMode: activeMode,
+        activeSessions: tunnelAuthController.listTunnelSessions(),
+        localPort: activePort,
+        ttlConfig: {
+          bootstrapTtlMs,
+          sessionTtlMs,
+        },
+      });
+    } catch (error) {
+      return res.status(500).json({ error: 'Failed to get tunnel status' });
+    }
+  });
+
+  app.put('/api/openchamber/tunnel/named-token', async (req, res) => {
+    try {
+      const presetId = typeof req?.body?.presetId === 'string' ? req.body.presetId.trim() : '';
+      const presetName = typeof req?.body?.presetName === 'string' ? req.body.presetName.trim() : '';
+      const namedTunnelHostname = normalizeNamedTunnelHostname(req?.body?.namedTunnelHostname);
+      const namedTunnelToken = typeof req?.body?.namedTunnelToken === 'string' ? req.body.namedTunnelToken.trim() : '';
+
+      if (!presetId || !presetName || !namedTunnelHostname || !namedTunnelToken) {
+        return res.status(400).json({ ok: false, error: 'presetId, presetName, namedTunnelHostname and namedTunnelToken are required' });
+      }
+
+      await upsertNamedTunnelToken({
+        id: presetId,
+        name: presetName,
+        hostname: namedTunnelHostname,
+        token: namedTunnelToken,
+      });
+
+      const namedTunnelConfig = await readNamedTunnelConfigFromDisk();
+      return res.json({ ok: true, namedTunnelTokenPresetIds: namedTunnelConfig.tunnels.map((entry) => entry.id) });
+    } catch (error) {
+      return res.status(500).json({ ok: false, error: 'Failed to save named tunnel token' });
+    }
+  });
+
+  app.post('/api/openchamber/tunnel/start', async (_req, res) => {
+    try {
+      const settings = await readSettingsFromDiskMigrated();
+      const mode = normalizeTunnelMode(_req?.body?.mode ?? settings?.tunnelMode);
+      const selectedPresetId = typeof _req?.body?.namedTunnelPresetId === 'string' ? _req.body.namedTunnelPresetId.trim() : '';
+      const selectedPresetName = typeof _req?.body?.namedTunnelPresetName === 'string' ? _req.body.namedTunnelPresetName.trim() : '';
+      const requestNamedHostname = normalizeNamedTunnelHostname(_req?.body?.namedTunnelHostname);
+      const namedHostname = requestNamedHostname || normalizeNamedTunnelHostname(settings?.namedTunnelHostname);
+      const requestNamedToken = typeof _req?.body?.namedTunnelToken === 'string' ? _req.body.namedTunnelToken.trim() : '';
+      const legacyNamedToken = typeof settings?.namedTunnelToken === 'string' ? settings.namedTunnelToken.trim() : '';
+      const configNamedToken = await resolveNamedTunnelToken({ presetId: selectedPresetId, hostname: namedHostname });
+      const namedToken = requestNamedToken
+        || ((runtimeNamedTunnelHostname && namedHostname && runtimeNamedTunnelHostname === namedHostname) ? runtimeNamedTunnelToken : '')
+        || configNamedToken
+        || legacyNamedToken
+        ;
+      const bootstrapTtlMs = settings?.tunnelBootstrapTtlMs === null
+        ? null
+        : normalizeTunnelBootstrapTtlMs(settings?.tunnelBootstrapTtlMs);
+      const sessionTtlMs = normalizeTunnelSessionTtlMs(settings?.tunnelSessionTtlMs);
+
+      let publicUrl = cloudflareTunnelController?.getPublicUrl?.() ?? null;
+      const activeMode = cloudflareTunnelController?.mode === TUNNEL_MODE_NAMED ? TUNNEL_MODE_NAMED : TUNNEL_MODE_QUICK;
+
+      if (publicUrl && activeMode !== mode) {
+        cloudflareTunnelController.stop();
+        cloudflareTunnelController = null;
+        tunnelAuthController.clearActiveTunnel();
+        publicUrl = null;
+      }
+
+      if (!publicUrl) {
+        const cfCheck = await checkCloudflaredAvailable();
+        if (!cfCheck.available) {
+          return res.status(400).json({
+            ok: false,
+            error: 'cloudflared is not installed. Install it with: brew install cloudflared',
+          });
+        }
+
+        if (mode === TUNNEL_MODE_NAMED) {
+          if (!namedHostname) {
+            return res.status(400).json({ ok: false, error: 'Named tunnel hostname is required' });
+          }
+          if (!namedToken) {
+            return res.status(400).json({ ok: false, error: 'Named tunnel token is required' });
+          }
+
+          runtimeNamedTunnelHostname = namedHostname;
+          runtimeNamedTunnelToken = namedToken;
+
+          if (requestNamedToken && namedHostname) {
+            await upsertNamedTunnelToken({
+              id: selectedPresetId || namedHostname,
+              name: selectedPresetName || namedHostname,
+              hostname: namedHostname,
+              token: requestNamedToken,
+            });
+          }
+
+          cloudflareTunnelController = await startCloudflareNamedTunnel({
+            token: namedToken,
+            hostname: namedHostname,
+          });
+        } else {
+          const originUrl = `http://127.0.0.1:${activePort}`;
+          cloudflareTunnelController = await startCloudflareQuickTunnel({ originUrl, port: activePort });
+        }
+
+        publicUrl = cloudflareTunnelController.getPublicUrl();
+
+        if (!publicUrl) {
+          cloudflareTunnelController.stop();
+          cloudflareTunnelController = null;
+          tunnelAuthController.clearActiveTunnel();
+          return res.status(500).json({ ok: false, error: 'Tunnel started but no public URL was assigned' });
+        }
+
+        if (mode === TUNNEL_MODE_QUICK) {
+          printTunnelWarning();
+        }
+        console.log(`Cloudflare tunnel active: ${publicUrl}`);
+      }
+
+      if (!tunnelAuthController.getActiveTunnelId() || !tunnelAuthController.getActiveTunnelHost()) {
+        tunnelAuthController.setActiveTunnel({ tunnelId: crypto.randomUUID(), publicUrl, mode });
+      }
+
+      const bootstrapToken = tunnelAuthController.issueBootstrapToken({ ttlMs: bootstrapTtlMs });
+      const connectUrl = `${publicUrl.replace(/\/$/, '')}/connect?t=${encodeURIComponent(bootstrapToken.token)}`;
+      const namedTunnelConfig = await readNamedTunnelConfigFromDisk();
+
+      return res.json({
+        ok: true,
+        url: publicUrl,
+        mode,
+        namedTunnelHostname: namedHostname || null,
+        namedTunnelTokenPresetIds: namedTunnelConfig.tunnels.map((entry) => entry.id),
+        connectUrl,
+        bootstrapExpiresAt: bootstrapToken.expiresAt,
+        policy: 'tunnel-gated',
+        activeTunnelMode: mode,
+        activeSessions: tunnelAuthController.listTunnelSessions(),
+        localPort: activePort,
+        ttlConfig: {
+          bootstrapTtlMs,
+          sessionTtlMs,
+        },
+      });
+    } catch (error) {
+      console.error('Failed to start Cloudflare tunnel:', error);
+      cloudflareTunnelController = null;
+      tunnelAuthController.clearActiveTunnel();
+      return res.status(500).json({ ok: false, error: error?.message || 'Failed to start tunnel' });
+    }
+  });
+
+  app.post('/api/openchamber/tunnel/stop', (_req, res) => {
+    let revokedBootstrapCount = 0;
+    let invalidatedSessionCount = 0;
+    const activeTunnelId = tunnelAuthController.getActiveTunnelId();
+
+    if (activeTunnelId) {
+      const revoked = tunnelAuthController.revokeTunnelArtifacts(activeTunnelId);
+      revokedBootstrapCount = revoked.revokedBootstrapCount;
+      invalidatedSessionCount = revoked.invalidatedSessionCount;
+    }
+
+    if (cloudflareTunnelController) {
+      console.log('Stopping Cloudflare tunnel (user requested)...');
+      cloudflareTunnelController.stop();
+      cloudflareTunnelController = null;
+    }
+
+    tunnelAuthController.clearActiveTunnel();
+    res.json({ ok: true, revokedBootstrapCount, invalidatedSessionCount });
+  });
+
+  // ── End Cloudflare Tunnel API ─────────────────────────────────────
+
   app.get('/api/global/event', async (req, res) => {
     let targetUrl;
     try {
@@ -6843,6 +9019,9 @@ async function main(options = {}) {
     const heartbeatInterval = setInterval(() => {
       writeSseEvent(res, { type: 'openchamber:heartbeat', timestamp: Date.now() });
     }, 15000);
+
+    // Merge Claude Code adapter events into this SSE stream
+    const stopAdapterSse = connectAdapterSse(res, controller.signal);
 
     const decoder = new TextDecoder();
     const reader = upstream.body.getReader();
@@ -6916,6 +9095,7 @@ async function main(options = {}) {
         console.warn('SSE proxy stream error:', error);
       }
     } finally {
+      stopAdapterSse();
       clearInterval(heartbeatInterval);
       cleanupClient();
       cleanup();
@@ -6993,6 +9173,9 @@ async function main(options = {}) {
       writeSseEvent(res, { type: 'openchamber:heartbeat', timestamp: Date.now() });
     }, 15000);
 
+    // Merge Claude Code adapter events into this SSE stream
+    const stopAdapterSse = connectAdapterSse(res, controller.signal);
+
     const decoder = new TextDecoder();
     const reader = upstream.body.getReader();
     let buffer = '';
@@ -7063,6 +9246,7 @@ async function main(options = {}) {
         console.warn('SSE proxy stream error:', error);
       }
     } finally {
+      stopAdapterSse();
       clearInterval(heartbeatInterval);
       cleanup();
       try {
@@ -7118,6 +9302,10 @@ async function main(options = {}) {
         detectedNow,
         detectedSourceNow,
         shim,
+        viaWsl: useWslForOpencode,
+        wslBinary: resolvedWslBinary || null,
+        wslPath: resolvedWslOpencodePath || null,
+        wslDistro: resolvedWslDistro || null,
         node: resolvedNodeBinary || null,
         bun: resolvedBunBinary || null,
       });
@@ -7139,15 +9327,244 @@ async function main(options = {}) {
 
   app.put('/api/config/settings', async (req, res) => {
     console.log(`[API:PUT /api/config/settings] Received request`);
-    console.log(`[API:PUT /api/config/settings] Request body:`, JSON.stringify(req.body, null, 2));
     try {
       const updated = await persistSettings(req.body ?? {});
       console.log(`[API:PUT /api/config/settings] Success, returning ${updated.projects?.length || 0} projects`);
+
+      // Update Claude Code adapter permission mode at runtime if it changed
+      if (typeof req.body?.claudeCodePermissionMode === 'string' && claudeCodeAdapterInstance) {
+        try {
+          const { setPermissionMode } = await import('./lib/claudecode/adapter.js');
+          setPermissionMode(req.body.claudeCodePermissionMode);
+        } catch {
+          // non-fatal
+        }
+      }
+
       res.json(updated);
     } catch (error) {
       console.error(`[API:PUT /api/config/settings] Failed to save settings:`, error);
       console.error(`[API:PUT /api/config/settings] Error stack:`, error.stack);
       res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to save settings' });
+    }
+  });
+
+  app.get('/api/projects/:projectId/icon', async (req, res) => {
+    const projectId = typeof req.params.projectId === 'string' ? req.params.projectId.trim() : '';
+    if (!projectId) {
+      return res.status(400).json({ error: 'projectId is required' });
+    }
+
+    try {
+      const settings = await readSettingsFromDiskMigrated();
+      const { project } = findProjectById(settings, projectId);
+      if (!project) {
+        return res.status(404).json({ error: 'Project not found' });
+      }
+
+      const metadataMime = normalizeProjectIconMime(project.iconImage?.mime);
+      const preferredPath = metadataMime ? projectIconPathForMime(projectId, metadataMime) : null;
+      const candidates = preferredPath
+        ? [preferredPath, ...projectIconPathCandidates(projectId).filter((candidate) => candidate !== preferredPath)]
+        : projectIconPathCandidates(projectId);
+
+      const themeQuery = Array.isArray(req.query?.theme) ? req.query.theme[0] : req.query?.theme;
+      const requestedThemeVariant = normalizeProjectIconThemeVariant(themeQuery);
+      const iconColorQuery = Array.isArray(req.query?.iconColor) ? req.query.iconColor[0] : req.query?.iconColor;
+      const requestedIconColor = normalizeProjectIconColor(iconColorQuery);
+
+      for (const iconPath of candidates) {
+        try {
+          const data = await fsPromises.readFile(iconPath);
+          const ext = path.extname(iconPath).slice(1).toLowerCase();
+          const resolvedMime = metadataMime || PROJECT_ICON_EXTENSION_TO_MIME[ext] || 'application/octet-stream';
+          const contentType = resolvedMime === 'image/svg+xml' ? 'image/svg+xml; charset=utf-8' : resolvedMime;
+
+          if (resolvedMime === 'image/svg+xml' && requestedThemeVariant) {
+            const svgMarkup = data.toString('utf8');
+            const themedSvgMarkup = applyProjectIconSvgTheme(svgMarkup, requestedThemeVariant, requestedIconColor);
+            res.setHeader('Content-Type', contentType);
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+            return res.send(themedSvgMarkup);
+          }
+
+          if (resolvedMime === 'image/svg+xml' && requestedIconColor) {
+            const svgMarkup = data.toString('utf8');
+            const themedSvgMarkup = applyProjectIconSvgTheme(svgMarkup, requestedThemeVariant, requestedIconColor);
+            res.setHeader('Content-Type', contentType);
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+            return res.send(themedSvgMarkup);
+          }
+
+          res.setHeader('Content-Type', contentType);
+          res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          return res.send(data);
+        } catch (error) {
+          if (!error || typeof error !== 'object' || error.code !== 'ENOENT') {
+            console.warn('Failed to read project icon:', error);
+            return res.status(500).json({ error: 'Failed to read project icon' });
+          }
+        }
+      }
+
+      return res.status(404).json({ error: 'Project icon not found' });
+    } catch (error) {
+      console.warn('Failed to load project icon:', error);
+      return res.status(500).json({ error: 'Failed to load project icon' });
+    }
+  });
+
+  app.put('/api/projects/:projectId/icon', async (req, res) => {
+    const projectId = typeof req.params.projectId === 'string' ? req.params.projectId.trim() : '';
+    if (!projectId) {
+      return res.status(400).json({ error: 'projectId is required' });
+    }
+
+    const parsed = parseProjectIconDataUrl(req.body?.dataUrl);
+    if (!parsed.ok) {
+      return res.status(400).json({ error: parsed.error });
+    }
+
+    try {
+      const settings = await readSettingsFromDiskMigrated();
+      const { projects, project } = findProjectById(settings, projectId);
+      if (!project) {
+        return res.status(404).json({ error: 'Project not found' });
+      }
+
+      const iconPath = projectIconPathForMime(projectId, parsed.mime);
+      if (!iconPath) {
+        return res.status(400).json({ error: 'Unsupported icon format' });
+      }
+
+      await fsPromises.mkdir(PROJECT_ICONS_DIR_PATH, { recursive: true });
+      await fsPromises.writeFile(iconPath, parsed.bytes);
+      await removeProjectIconFiles(projectId, iconPath);
+
+      const updatedAt = Date.now();
+      const nextProjects = projects.map((entry) => (
+        entry.id === projectId
+          ? { ...entry, iconImage: { mime: parsed.mime, updatedAt, source: 'custom' } }
+          : entry
+      ));
+      const updatedSettings = await persistSettings({ projects: nextProjects });
+      const updatedProject = (updatedSettings.projects || []).find((entry) => entry.id === projectId) || null;
+
+      return res.json({ project: updatedProject, settings: updatedSettings });
+    } catch (error) {
+      console.warn('Failed to upload project icon:', error);
+      return res.status(500).json({ error: 'Failed to upload project icon' });
+    }
+  });
+
+  app.delete('/api/projects/:projectId/icon', async (req, res) => {
+    const projectId = typeof req.params.projectId === 'string' ? req.params.projectId.trim() : '';
+    if (!projectId) {
+      return res.status(400).json({ error: 'projectId is required' });
+    }
+
+    try {
+      const settings = await readSettingsFromDiskMigrated();
+      const { projects, project } = findProjectById(settings, projectId);
+      if (!project) {
+        return res.status(404).json({ error: 'Project not found' });
+      }
+
+      await removeProjectIconFiles(projectId);
+
+      const nextProjects = projects.map((entry) => (
+        entry.id === projectId
+          ? { ...entry, iconImage: null }
+          : entry
+      ));
+      const updatedSettings = await persistSettings({ projects: nextProjects });
+      const updatedProject = (updatedSettings.projects || []).find((entry) => entry.id === projectId) || null;
+
+      return res.json({ project: updatedProject, settings: updatedSettings });
+    } catch (error) {
+      console.warn('Failed to remove project icon:', error);
+      return res.status(500).json({ error: 'Failed to remove project icon' });
+    }
+  });
+
+  app.post('/api/projects/:projectId/icon/discover', async (req, res) => {
+    const projectId = typeof req.params.projectId === 'string' ? req.params.projectId.trim() : '';
+    if (!projectId) {
+      return res.status(400).json({ error: 'projectId is required' });
+    }
+
+    try {
+      const settings = await readSettingsFromDiskMigrated();
+      const { projects, project } = findProjectById(settings, projectId);
+      if (!project) {
+        return res.status(404).json({ error: 'Project not found' });
+      }
+
+      const force = req.body?.force === true;
+      if (project.iconImage?.source === 'custom' && !force) {
+        return res.json({
+          project,
+          skipped: true,
+          reason: 'custom-icon-present',
+        });
+      }
+
+      const faviconCandidates = await searchFilesystemFiles(project.path, {
+        limit: 200,
+        query: 'favicon',
+        includeHidden: true,
+        respectGitignore: false,
+      });
+
+      const filtered = faviconCandidates
+        .filter((entry) => /(^|\/)favicon\.(ico|png|svg|jpg|jpeg|webp)$/i.test(entry.path))
+        .sort((a, b) => a.path.length - b.path.length);
+
+      const selected = filtered[0];
+      if (!selected) {
+        return res.status(404).json({ error: 'No favicon found in project' });
+      }
+
+      const ext = path.extname(selected.path).slice(1).toLowerCase();
+      const mime = PROJECT_ICON_EXTENSION_TO_MIME[ext] || null;
+      if (!mime) {
+        return res.status(415).json({ error: 'Unsupported favicon format' });
+      }
+
+      const bytes = await fsPromises.readFile(selected.path);
+      if (bytes.length === 0) {
+        return res.status(400).json({ error: 'Discovered icon is empty' });
+      }
+      if (bytes.length > PROJECT_ICON_MAX_BYTES) {
+        return res.status(400).json({ error: 'Discovered icon exceeds size limit (5 MB)' });
+      }
+
+      const iconPath = projectIconPathForMime(projectId, mime);
+      if (!iconPath) {
+        return res.status(415).json({ error: 'Unsupported favicon format' });
+      }
+
+      await fsPromises.mkdir(PROJECT_ICONS_DIR_PATH, { recursive: true });
+      await fsPromises.writeFile(iconPath, bytes);
+      await removeProjectIconFiles(projectId, iconPath);
+
+      const updatedAt = Date.now();
+      const nextProjects = projects.map((entry) => (
+        entry.id === projectId
+          ? { ...entry, iconImage: { mime, updatedAt, source: 'auto' } }
+          : entry
+      ));
+      const updatedSettings = await persistSettings({ projects: nextProjects });
+      const updatedProject = (updatedSettings.projects || []).find((entry) => entry.id === projectId) || null;
+
+      return res.json({
+        project: updatedProject,
+        settings: updatedSettings,
+        discoveredPath: selected.path,
+      });
+    } catch (error) {
+      console.warn('Failed to discover project icon:', error);
+      return res.status(500).json({ error: 'Failed to discover project icon' });
     }
   });
 
@@ -7166,7 +9583,12 @@ async function main(options = {}) {
     getProviderSources,
     removeProviderConfig,
     AGENT_SCOPE,
-    COMMAND_SCOPE
+    COMMAND_SCOPE,
+    listMcpConfigs,
+    getMcpConfig,
+    createMcpConfig,
+    updateMcpConfig,
+    deleteMcpConfig,
   } = await import('./lib/opencode/index.js');
 
   app.get('/api/config/agents/:name', async (req, res) => {
@@ -7291,6 +9713,116 @@ async function main(options = {}) {
     } catch (error) {
       console.error('Failed to delete agent:', error);
       res.status(500).json({ error: error.message || 'Failed to delete agent' });
+    }
+  });
+
+  // ============================================================
+  // MCP Config Routes
+  // ============================================================
+
+  app.get('/api/config/mcp', async (req, res) => {
+    try {
+      const { directory, error } = await resolveOptionalProjectDirectory(req);
+      if (error) {
+        return res.status(400).json({ error });
+      }
+      const configs = listMcpConfigs(directory);
+      res.json(configs);
+    } catch (error) {
+      console.error('[API:GET /api/config/mcp] Failed:', error);
+      res.status(500).json({ error: error.message || 'Failed to list MCP configs' });
+    }
+  });
+
+  app.get('/api/config/mcp/:name', async (req, res) => {
+    try {
+      const name = req.params.name;
+      const { directory, error } = await resolveOptionalProjectDirectory(req);
+      if (error) {
+        return res.status(400).json({ error });
+      }
+      const config = getMcpConfig(name, directory);
+      if (!config) {
+        return res.status(404).json({ error: `MCP server "${name}" not found` });
+      }
+      res.json(config);
+    } catch (error) {
+      console.error('[API:GET /api/config/mcp/:name] Failed:', error);
+      res.status(500).json({ error: error.message || 'Failed to get MCP config' });
+    }
+  });
+
+  app.post('/api/config/mcp/:name', async (req, res) => {
+    try {
+      const name = req.params.name;
+      const { scope, ...config } = req.body || {};
+      const { directory, error } = await resolveOptionalProjectDirectory(req);
+      if (error) {
+        return res.status(400).json({ error });
+      }
+      console.log(`[API:POST /api/config/mcp] Creating MCP server: ${name}`);
+
+      createMcpConfig(name, config, directory, scope);
+      await refreshOpenCodeAfterConfigChange('mcp creation', { mcpName: name });
+
+      res.json({
+        success: true,
+        requiresReload: true,
+        message: `MCP server "${name}" created. Reloading interface…`,
+        reloadDelayMs: CLIENT_RELOAD_DELAY_MS,
+      });
+    } catch (error) {
+      console.error('[API:POST /api/config/mcp/:name] Failed:', error);
+      res.status(500).json({ error: error.message || 'Failed to create MCP server' });
+    }
+  });
+
+  app.patch('/api/config/mcp/:name', async (req, res) => {
+    try {
+      const name = req.params.name;
+      const updates = req.body;
+      const { directory, error } = await resolveOptionalProjectDirectory(req);
+      if (error) {
+        return res.status(400).json({ error });
+      }
+      console.log(`[API:PATCH /api/config/mcp] Updating MCP server: ${name}`);
+
+      updateMcpConfig(name, updates, directory);
+      await refreshOpenCodeAfterConfigChange('mcp update');
+
+      res.json({
+        success: true,
+        requiresReload: true,
+        message: `MCP server "${name}" updated. Reloading interface…`,
+        reloadDelayMs: CLIENT_RELOAD_DELAY_MS,
+      });
+    } catch (error) {
+      console.error('[API:PATCH /api/config/mcp/:name] Failed:', error);
+      res.status(500).json({ error: error.message || 'Failed to update MCP server' });
+    }
+  });
+
+  app.delete('/api/config/mcp/:name', async (req, res) => {
+    try {
+      const name = req.params.name;
+      const { directory, error } = await resolveOptionalProjectDirectory(req);
+      if (error) {
+        return res.status(400).json({ error });
+      }
+      console.log(`[API:DELETE /api/config/mcp] Deleting MCP server: ${name}`);
+
+      deleteMcpConfig(name, directory);
+      await refreshOpenCodeAfterConfigChange('mcp deletion');
+
+      res.json({
+        success: true,
+        requiresReload: true,
+        message: `MCP server "${name}" deleted. Reloading interface…`,
+        reloadDelayMs: CLIENT_RELOAD_DELAY_MS,
+      });
+    } catch (error) {
+      console.error('[API:DELETE /api/config/mcp/:name] Failed:', error);
+      res.status(500).json({ error: error.message || 'Failed to delete MCP server' });
     }
   });
 
@@ -7572,12 +10104,18 @@ async function main(options = {}) {
 
   // ============== SKILLS CATALOG + INSTALL ENDPOINTS ==============
 
-  const { getCuratedSkillsSources } = await import('./lib/skills-catalog/curated-sources.js');
-  const { getCacheKey, getCachedScan, setCachedScan } = await import('./lib/skills-catalog/cache.js');
-  const { parseSkillRepoSource } = await import('./lib/skills-catalog/source.js');
-  const { scanSkillsRepository } = await import('./lib/skills-catalog/scan.js');
-  const { installSkillsFromRepository } = await import('./lib/skills-catalog/install.js');
-  const { scanClawdHubPage, installSkillsFromClawdHub, isClawdHubSource } = await import('./lib/skills-catalog/clawdhub/index.js');
+  const {
+    getCuratedSkillsSources,
+    getCacheKey,
+    getCachedScan,
+    setCachedScan,
+    parseSkillRepoSource,
+    scanSkillsRepository,
+    installSkillsFromRepository,
+    scanClawdHubPage,
+    installSkillsFromClawdHub,
+    isClawdHubSource,
+  } = await import('./lib/skills-catalog/index.js');
   const { getProfiles, getProfile } = await import('./lib/git/index.js');
 
   const listGitIdentitiesForResponse = () => {
@@ -7926,6 +10464,9 @@ async function main(options = {}) {
     try {
       const skillName = req.params.name;
       const filePath = decodeURIComponent(req.params.filePath); // Decode URL-encoded path
+      if (isUnsafeSkillRelativePath(filePath)) {
+        return res.status(400).json({ error: 'Invalid file path' });
+      }
       const { directory, error } = await resolveProjectDirectory(req);
       if (!directory) {
         return res.status(400).json({ error });
@@ -7945,6 +10486,9 @@ async function main(options = {}) {
 
       res.json({ path: filePath, content });
     } catch (error) {
+      if (error && typeof error === 'object' && (error.code === 'EACCES' || error.code === 'EPERM')) {
+        return res.status(403).json({ error: 'Access to file denied' });
+      }
       console.error('Failed to read skill file:', error);
       res.status(500).json({ error: 'Failed to read skill file' });
     }
@@ -8011,6 +10555,9 @@ async function main(options = {}) {
     try {
       const skillName = req.params.name;
       const filePath = decodeURIComponent(req.params.filePath); // Decode URL-encoded path
+      if (isUnsafeSkillRelativePath(filePath)) {
+        return res.status(400).json({ error: 'Invalid file path' });
+      }
       const { content } = req.body;
       const { directory, error } = await resolveProjectDirectory(req);
       if (!directory) {
@@ -8031,6 +10578,9 @@ async function main(options = {}) {
         message: `File ${filePath} saved successfully`,
       });
     } catch (error) {
+      if (error && typeof error === 'object' && (error.code === 'EACCES' || error.code === 'EPERM')) {
+        return res.status(403).json({ error: 'Access to file denied' });
+      }
       console.error('Failed to write skill file:', error);
       res.status(500).json({ error: error.message || 'Failed to write skill file' });
     }
@@ -8041,6 +10591,9 @@ async function main(options = {}) {
     try {
       const skillName = req.params.name;
       const filePath = decodeURIComponent(req.params.filePath); // Decode URL-encoded path
+      if (isUnsafeSkillRelativePath(filePath)) {
+        return res.status(400).json({ error: 'Invalid file path' });
+      }
       const { directory, error } = await resolveProjectDirectory(req);
       if (!directory) {
         return res.status(400).json({ error });
@@ -8060,6 +10613,9 @@ async function main(options = {}) {
         message: `File ${filePath} deleted successfully`,
       });
     } catch (error) {
+      if (error && typeof error === 'object' && (error.code === 'EACCES' || error.code === 'EPERM')) {
+        return res.status(403).json({ error: 'Access to file denied' });
+      }
       console.error('Failed to delete skill file:', error);
       res.status(500).json({ error: error.message || 'Failed to delete skill file' });
     }
@@ -8393,36 +10949,40 @@ async function main(options = {}) {
         return res.json({ connected: true, repo: null, branch, pr: null, checks: null, canMerge: false });
       }
 
-       // Determine the head owner for PR search
-       // Priority: 1) tracking branch remote, 2) origin (if different from target), 3) target repo owner
-       let headOwnerForSearch = null;
-       
-       // First, check the branch's tracking info to see which remote it's on
+       let originRepo = null;
+       if (remote !== 'origin') {
+         const originResolved = await resolveGitHubRepoFromDirectory(directory, 'origin').catch(() => ({ repo: null }));
+         originRepo = originResolved?.repo || null;
+       }
+
+       const candidateHeadOwners = [];
+       const pushHeadOwner = (owner) => {
+         if (typeof owner !== 'string') return;
+         const normalized = owner.trim();
+         if (!normalized) return;
+         if (candidateHeadOwners.includes(normalized)) return;
+         candidateHeadOwners.push(normalized);
+       };
+
+       // First, use branch tracking remote owner (where branch is usually pushed).
        const { getStatus } = await import('./lib/git/index.js');
        const status = await getStatus(directory).catch(() => null);
        if (status?.tracking) {
          const trackingRemote = status.tracking.split('/')[0];
-         if (trackingRemote && trackingRemote !== remote) {
-           // Branch is tracked on a different remote - get that remote's owner
-           const { repo: trackingRepo } = await resolveGitHubRepoFromDirectory(directory, trackingRemote);
-           if (trackingRepo && trackingRepo.owner !== repo.owner) {
-             headOwnerForSearch = trackingRepo.owner;
-           }
-         }
-       }
-       
-       // Fallback: if targeting non-origin, check if origin has a different owner (fork scenario)
-       if (!headOwnerForSearch && remote !== 'origin') {
-         const { repo: originRepo } = await resolveGitHubRepoFromDirectory(directory, 'origin');
-         if (originRepo && originRepo.owner !== repo.owner) {
-           headOwnerForSearch = originRepo.owner;
+         if (trackingRemote) {
+           const trackingResolved = await resolveGitHubRepoFromDirectory(directory, trackingRemote).catch(() => ({ repo: null }));
+           pushHeadOwner(trackingResolved?.repo?.owner);
          }
        }
 
-       const listByHead = async (state, headOwner = repo.owner) => {
+       // Then same-repo and origin fallback owners.
+       pushHeadOwner(repo.owner);
+       pushHeadOwner(originRepo?.owner);
+
+       const listByHead = async (targetRepo, state, headOwner) => {
          const resp = await octokit.rest.pulls.list({
-           owner: repo.owner,
-           repo: repo.repo,
+           owner: targetRepo.owner,
+           repo: targetRepo.repo,
            state,
            head: `${headOwner}:${branch}`,
            per_page: 10,
@@ -8430,10 +10990,10 @@ async function main(options = {}) {
          return Array.isArray(resp?.data) ? resp.data[0] : null;
        };
 
-       const listByHeadRef = async (state) => {
+       const listByHeadRef = async (targetRepo, state) => {
          const resp = await octokit.rest.pulls.list({
-           owner: repo.owner,
-           repo: repo.repo,
+           owner: targetRepo.owner,
+           repo: targetRepo.repo,
            state,
            per_page: 100,
          });
@@ -8443,34 +11003,41 @@ async function main(options = {}) {
          return matches[0] ?? null;
        };
 
-       // PR status by branch:
-       // - Prefer open PRs.
-       // - If none, also surface closed/merged PRs.
-       // - For cross-repo PRs: first try with head owner, then fall back to target owner, then ref match.
-       let first = null;
-       
-       // For cross-repo workflows, try head owner first
-       if (headOwnerForSearch) {
-         first = await listByHead('open', headOwnerForSearch);
-         if (!first) first = await listByHead('closed', headOwnerForSearch);
+       const tryFindPr = async (targetRepo) => {
+         let found = null;
+         for (const owner of candidateHeadOwners) {
+           found = await listByHead(targetRepo, 'open', owner);
+           if (found) return found;
+           found = await listByHead(targetRepo, 'closed', owner);
+           if (found) return found;
+         }
+         found = await listByHeadRef(targetRepo, 'open');
+         if (found) return found;
+         return listByHeadRef(targetRepo, 'closed');
+       };
+
+       // Try requested remote target repo first, then origin target repo fallback for fork flows.
+       let searchRepo = repo;
+       let first = await tryFindPr(searchRepo);
+       if (!first && originRepo) {
+         const isDifferentRepo = originRepo.owner !== repo.owner || originRepo.repo !== repo.repo;
+         if (isDifferentRepo) {
+           const originMatch = await tryFindPr(originRepo);
+           if (originMatch) {
+             first = originMatch;
+             searchRepo = originRepo;
+           }
+         }
        }
-       
-       // Try with target repo owner (same-repo PRs)
-       if (!first) first = await listByHead('open');
-       if (!first) first = await listByHead('closed');
-       
-       // Fall back to matching head.ref directly (handles edge cases)
-       if (!first) first = await listByHeadRef('open');
-       if (!first) first = await listByHeadRef('closed');
       if (!first) {
-        return res.json({ connected: true, repo, branch, pr: null, checks: null, canMerge: false });
+        return res.json({ connected: true, repo: searchRepo, branch, pr: null, checks: null, canMerge: false });
       }
 
       // Enrich with mergeability fields
-      const prFull = await octokit.rest.pulls.get({ owner: repo.owner, repo: repo.repo, pull_number: first.number });
+      const prFull = await octokit.rest.pulls.get({ owner: searchRepo.owner, repo: searchRepo.repo, pull_number: first.number });
       const prData = prFull?.data;
       if (!prData) {
-        return res.json({ connected: true, repo, branch, pr: null, checks: null, canMerge: false });
+        return res.json({ connected: true, repo: searchRepo, branch, pr: null, checks: null, canMerge: false });
       }
 
       // Checks summary: prefer check-runs (Actions), fallback to classic statuses.
@@ -8479,8 +11046,8 @@ async function main(options = {}) {
       if (sha) {
         try {
           const runs = await octokit.rest.checks.listForRef({
-            owner: repo.owner,
-            repo: repo.repo,
+            owner: searchRepo.owner,
+            repo: searchRepo.repo,
             ref: sha,
             per_page: 100,
           });
@@ -8517,8 +11084,8 @@ async function main(options = {}) {
         if (!checks) {
           try {
             const combined = await octokit.rest.repos.getCombinedStatusForRef({
-              owner: repo.owner,
-              repo: repo.repo,
+              owner: searchRepo.owner,
+              repo: searchRepo.repo,
               ref: sha,
             });
             const statuses = Array.isArray(combined?.data?.statuses) ? combined.data.statuses : [];
@@ -8546,8 +11113,8 @@ async function main(options = {}) {
         const username = auth?.user?.login;
         if (username) {
           const perm = await octokit.rest.repos.getCollaboratorPermissionLevel({
-            owner: repo.owner,
-            repo: repo.repo,
+            owner: searchRepo.owner,
+            repo: searchRepo.repo,
             username,
           });
           const level = perm?.data?.permission;
@@ -8562,7 +11129,7 @@ async function main(options = {}) {
 
       return res.json({
         connected: true,
-        repo,
+        repo: searchRepo,
         branch,
         pr: {
           number: prData.number,
@@ -9835,11 +12402,16 @@ async function main(options = {}) {
   });
 
   app.get('/api/git/status', async (req, res) => {
-    const { getStatus } = await getGitLibraries();
+    const { getStatus, isGitRepository } = await getGitLibraries();
     try {
       const directory = req.query.directory;
       if (!directory) {
         return res.status(400).json({ error: 'directory parameter is required' });
+      }
+
+      const isRepo = await isGitRepository(directory);
+      if (!isRepo) {
+        return res.json({ isGitRepository: false, files: [], branch: null, ahead: 0, behind: 0 });
       }
 
       const status = await getStatus(directory);
@@ -9930,236 +12502,6 @@ async function main(options = {}) {
     } catch (error) {
       console.error('Failed to revert git file:', error);
       res.status(500).json({ error: error.message || 'Failed to revert git file' });
-    }
-  });
-
-  app.post('/api/git/commit-message', async (req, res) => {
-    const { collectDiffs } = await getGitLibraries();
-    try {
-      const directory = req.query.directory;
-      if (!directory || typeof directory !== 'string') {
-        return res.status(400).json({ error: 'directory parameter is required' });
-      }
-
-      const files = Array.isArray(req.body?.files) ? req.body.files : [];
-      if (files.length === 0) {
-        return res.status(400).json({ error: 'At least one file is required' });
-      }
-
-      const diffs = await collectDiffs(directory, files);
-      if (diffs.length === 0) {
-        return res.status(400).json({ error: 'No diffs available for selected files' });
-      }
-
-      const MAX_DIFF_LENGTH = 4000;
-      const diffSummaries = diffs
-        .map(({ path, diff }) => {
-          const trimmed = diff.length > MAX_DIFF_LENGTH ? `${diff.slice(0, MAX_DIFF_LENGTH)}\n...` : diff;
-          return `FILE: ${path}\n${trimmed}`;
-        })
-        .join('\n\n');
-
-      const prompt = `You are generating a Conventional Commits subject line from the provided diff.
-
-Return EXACTLY one JSON object (no code fences, no extra keys, no extra text):
-{"subject": string, "highlights": string[]}
-
-Non-negotiable:
-- Output must be valid JSON (double quotes).
-- Only claim what is supported by the diff. If unsure, be more general; do not guess.
-
-subject:
-- Format: <type>: <summary> (NO scope; never write type(scope))
-- Allowed types: feat, fix, refactor, perf, docs, test, build, ci, chore, style, revert
-- Choose type (prefer fix when ambiguous):
-  - fix: any bug/regression/wrong behavior (state, selection, navigation, persistence, crash)
-  - feat: new user-facing capability or new workflow (not just guardrails/defaults)
-  - refactor/perf/docs/test/build/ci/style/chore/revert: only when clearly the primary change
-- Summary style:
-  - imperative, present tense, outcome-first
-  - <= 72 characters, no trailing period
-  - avoid filenames, internal function names, and implementation details
-
-highlights:
-- 0-3 items; it is OK to return [].
-- Each item: one plain sentence, <= 90 chars, starts with an Uppercase verb.
-- Must add information not already in the subject.
-- Prefer user-observable behaviors (UI flow, navigation, selection, default view, persistence).
-- No markdown bullets, no file paths, no helper names.
-
-Diff summary (may be truncated):
-${diffSummaries}`;
-
-      const model = await resolveZenModel(typeof req.body?.zenModel === 'string' ? req.body.zenModel : undefined);
-
-      const completionTimeout = createTimeoutSignal(LONG_REQUEST_TIMEOUT_MS);
-      let response;
-      try {
-        response = await fetch('https://opencode.ai/zen/v1/responses', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model,
-            input: [{ role: 'user', content: prompt }],
-            max_output_tokens: 1000,
-            stream: false,
-            reasoning: {
-              effort: 'low'
-            }
-          }),
-          signal: completionTimeout.signal,
-        });
-      } finally {
-        completionTimeout.cleanup();
-      }
-
-      if (!response.ok) {
-        const errorBody = await response.json().catch(() => ({}));
-        console.error('Commit message generation failed:', errorBody);
-        return res.status(502).json({ error: 'Failed to generate commit message' });
-      }
-
-      const data = await response.json();
-      const raw = data?.output?.find((item) => item?.type === 'message')?.content?.find((item) => item?.type === 'output_text')?.text?.trim();
-
-      if (!raw) {
-        return res.status(502).json({ error: 'No commit message returned by generator' });
-      }
-
-      const cleanedJson = stripJsonMarkdownWrapper(raw);
-      const extractedJson = extractJsonObject(cleanedJson) || extractJsonObject(raw);
-      const candidates = [cleanedJson, extractedJson, raw].filter((candidate, index, array) => {
-        return candidate && array.indexOf(candidate) === index;
-      });
-
-      for (const candidate of candidates) {
-        if (!(candidate.startsWith('{') || candidate.startsWith('['))) {
-          continue;
-        }
-        try {
-          const parsed = JSON.parse(candidate);
-          return res.json({ message: parsed });
-        } catch (parseError) {
-          console.warn('Commit message generation returned non-JSON body:', parseError);
-        }
-      }
-
-      res.json({ message: { subject: raw, highlights: [] } });
-    } catch (error) {
-      console.error('Failed to generate commit message:', error);
-      res.status(500).json({ error: error.message || 'Failed to generate commit message' });
-    }
-  });
-
-  app.post('/api/git/pr-description', async (req, res) => {
-    const { getRangeDiff, getRangeFiles } = await getGitLibraries();
-    try {
-      const directory = req.query.directory;
-      if (!directory || typeof directory !== 'string') {
-        return res.status(400).json({ error: 'directory parameter is required' });
-      }
-
-      const base = typeof req.body?.base === 'string' ? req.body.base.trim() : '';
-      const head = typeof req.body?.head === 'string' ? req.body.head.trim() : '';
-      if (!base || !head) {
-        return res.status(400).json({ error: 'base and head are required' });
-      }
-
-      const filesToDiff = await getRangeFiles(directory, { base, head });
-
-      const diffs = [];
-      for (const filePath of filesToDiff) {
-        const diff = await getRangeDiff(directory, { base, head, path: filePath, contextLines: 3 }).catch(() => '');
-        if (diff && diff.trim().length > 0) {
-          diffs.push({ path: filePath, diff });
-        }
-      }
-      if (diffs.length === 0) {
-        return res.status(400).json({ error: 'No diffs available for base...head' });
-      }
-
-      const diffSummaries = diffs.map(({ path, diff }) => `FILE: ${path}\n${diff}`).join('\n\n');
-      const context = typeof req.body?.context === 'string' ? req.body.context.trim() : '';
-
-      let prompt = `You are drafting a GitHub Pull Request title + description for a squash-merge workflow.
-Respond in JSON of the shape {"title": string, "body": string} (ONLY JSON in response, no markdown fences) with these rules:
-- Title format: conventional, outcome-first, <= 90 chars, no trailing punctuation.
-- Use: <type>(<scope>): <summary>. Types: feat, fix, refactor, perf, docs, test, chore.
-- Pick the most important user-facing outcome first; include a second major outcome only when needed.
-- Body: GitHub-flavored markdown with sections in this exact order: ## Summary, ## Why, ## Testing.
-- Summary: 3-6 bullets, concrete product/workflow impact, no vague filler, no internal helper names.
-- Why: 1-3 bullets explaining motivation/tradeoff (what problem this solves for users/devs).
-- Testing: checkbox list using "- [ ]"; include realistic manual/automated checks inferred from the diff.
-- If tests were not run, include "- [ ] Not run locally" as first testing item.
-- Keep language crisp and specific; avoid generic boilerplate.
-
-Context:
-- base branch: ${base}
-- head branch: ${head}`;
-
-      if (context) {
-        prompt += `\n\nAdditional context provided by user:\n${context}`;
-      }
-
-      prompt += `\n\nDiff summary:\n${diffSummaries}`;
-
-      const model = await resolveZenModel(typeof req.body?.zenModel === 'string' ? req.body.zenModel : undefined);
-
-      const completionTimeout = createTimeoutSignal(LONG_REQUEST_TIMEOUT_MS);
-      let response;
-      try {
-        response = await fetch('https://opencode.ai/zen/v1/responses', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model,
-            input: [{ role: 'user', content: prompt }],
-            max_output_tokens: 1200,
-            stream: false,
-            reasoning: { effort: 'low' },
-          }),
-          signal: completionTimeout.signal,
-        });
-      } finally {
-        completionTimeout.cleanup();
-      }
-
-      if (!response.ok) {
-        const errorBody = await response.json().catch(() => ({}));
-        console.error('PR description generation failed:', errorBody);
-        return res.status(502).json({ error: 'Failed to generate PR description' });
-      }
-
-      const data = await response.json();
-      const raw = data?.output?.find((item) => item?.type === 'message')?.content?.find((item) => item?.type === 'output_text')?.text?.trim();
-      if (!raw) {
-        return res.status(502).json({ error: 'No PR description returned by generator' });
-      }
-
-      const cleanedJson = stripJsonMarkdownWrapper(raw);
-      const extractedJson = extractJsonObject(cleanedJson) || extractJsonObject(raw);
-      const candidates = [cleanedJson, extractedJson, raw].filter((candidate, index, array) => {
-        return candidate && array.indexOf(candidate) === index;
-      });
-
-      for (const candidate of candidates) {
-        if (!(candidate.startsWith('{') || candidate.startsWith('['))) {
-          continue;
-        }
-        try {
-          const parsed = JSON.parse(candidate);
-          const title = typeof parsed?.title === 'string' ? parsed.title : '';
-          const body = typeof parsed?.body === 'string' ? parsed.body : '';
-          return res.json({ title, body });
-        } catch (parseError) {
-          console.warn('PR description generation returned non-JSON body:', parseError);
-        }
-      }
-
-      return res.json({ title: '', body: raw });
-    } catch (error) {
-      console.error('Failed to generate PR description:', error);
-      return res.status(500).json({ error: error.message || 'Failed to generate PR description' });
     }
   });
 
@@ -10712,17 +13054,26 @@ Context:
     }
 
     try {
-      const resolvedPath = path.resolve(normalizeDirectoryPath(filePath));
-      if (resolvedPath.includes('..')) {
-        return res.status(400).json({ error: 'Invalid path: path traversal not allowed' });
+      const resolved = await resolveWorkspacePathFromContext(req, filePath);
+      if (!resolved.ok) {
+        return res.status(400).json({ error: resolved.error });
       }
 
-      const stats = await fsPromises.stat(resolvedPath);
+      const [canonicalPath, canonicalBase] = await Promise.all([
+        fsPromises.realpath(resolved.resolved),
+        fsPromises.realpath(resolved.base).catch(() => path.resolve(resolved.base)),
+      ]);
+
+      if (!isPathWithinRoot(canonicalPath, canonicalBase)) {
+        return res.status(403).json({ error: 'Access to file denied' });
+      }
+
+      const stats = await fsPromises.stat(canonicalPath);
       if (!stats.isFile()) {
         return res.status(400).json({ error: 'Specified path is not a file' });
       }
 
-      const content = await fsPromises.readFile(resolvedPath, 'utf8');
+      const content = await fsPromises.readFile(canonicalPath, 'utf8');
       res.type('text/plain').send(content);
     } catch (error) {
       const err = error;
@@ -10745,17 +13096,26 @@ Context:
     }
 
     try {
-      const resolvedPath = path.resolve(normalizeDirectoryPath(filePath));
-      if (resolvedPath.includes('..')) {
-        return res.status(400).json({ error: 'Invalid path: path traversal not allowed' });
+      const resolved = await resolveWorkspacePathFromContext(req, filePath);
+      if (!resolved.ok) {
+        return res.status(400).json({ error: resolved.error });
       }
 
-      const stats = await fsPromises.stat(resolvedPath);
+      const [canonicalPath, canonicalBase] = await Promise.all([
+        fsPromises.realpath(resolved.resolved),
+        fsPromises.realpath(resolved.base).catch(() => path.resolve(resolved.base)),
+      ]);
+
+      if (!isPathWithinRoot(canonicalPath, canonicalBase)) {
+        return res.status(403).json({ error: 'Access to file denied' });
+      }
+
+      const stats = await fsPromises.stat(canonicalPath);
       if (!stats.isFile()) {
         return res.status(400).json({ error: 'Specified path is not a file' });
       }
 
-      const ext = path.extname(resolvedPath).toLowerCase();
+      const ext = path.extname(canonicalPath).toLowerCase();
       const mimeMap = {
         '.png': 'image/png',
         '.jpg': 'image/jpeg',
@@ -10769,7 +13129,7 @@ Context:
       };
       const mimeType = mimeMap[ext] || 'application/octet-stream';
 
-      const content = await fsPromises.readFile(resolvedPath);
+      const content = await fsPromises.readFile(canonicalPath);
       res.setHeader('Cache-Control', 'no-store');
       res.type(mimeType).send(content);
     } catch (error) {
@@ -10881,6 +13241,49 @@ Context:
       }
       console.error('Failed to rename path:', error);
       res.status(500).json({ error: (error && error.message) || 'Failed to rename path' });
+    }
+  });
+
+  // Reveal a file or folder in the system file manager (Finder on macOS, Explorer on Windows, etc.)
+  app.post('/api/fs/reveal', async (req, res) => {
+    const { path: targetPath } = req.body || {};
+    if (!targetPath || typeof targetPath !== 'string') {
+      return res.status(400).json({ error: 'Path is required' });
+    }
+
+    try {
+      const resolved = path.resolve(targetPath.trim());
+
+      // Verify path exists
+      await fsPromises.access(resolved);
+
+      const platform = process.platform;
+      if (platform === 'darwin') {
+        // macOS: open -R selects the file in Finder; open opens a folder
+        const stat = await fsPromises.stat(resolved);
+        if (stat.isDirectory()) {
+          spawn('open', [resolved], { stdio: 'ignore', detached: true }).unref();
+        } else {
+          spawn('open', ['-R', resolved], { stdio: 'ignore', detached: true }).unref();
+        }
+      } else if (platform === 'win32') {
+        // Windows: explorer /select, highlights the file
+        spawn('explorer', ['/select,', resolved], { stdio: 'ignore', detached: true }).unref();
+      } else {
+        // Linux: xdg-open opens the parent directory
+        const stat = await fsPromises.stat(resolved);
+        const dir = stat.isDirectory() ? resolved : path.dirname(resolved);
+        spawn('xdg-open', [dir], { stdio: 'ignore', detached: true }).unref();
+      }
+
+      res.json({ success: true, path: resolved });
+    } catch (error) {
+      const err = error;
+      if (err && typeof err === 'object' && err.code === 'ENOENT') {
+        return res.status(404).json({ error: 'Path not found' });
+      }
+      console.error('Failed to reveal path:', error);
+      res.status(500).json({ error: (error && error.message) || 'Failed to reveal path' });
     }
   });
 
@@ -11271,53 +13674,6 @@ Context:
     }
   });
 
-  app.get('/api/fs/search', async (req, res) => {
-    const rawRoot = typeof req.query.root === 'string' && req.query.root.trim().length > 0
-      ? req.query.root.trim()
-      : typeof req.query.directory === 'string' && req.query.directory.trim().length > 0
-        ? req.query.directory.trim()
-        : os.homedir();
-  const rawQuery = typeof req.query.q === 'string' ? req.query.q : '';
-  const includeHidden = req.query.includeHidden === 'true';
-  const respectGitignore = req.query.respectGitignore !== 'false';
-  const limitParam = typeof req.query.limit === 'string' ? Number.parseInt(req.query.limit, 10) : undefined;
-    const parsedLimit = Number.isFinite(limitParam) ? Number(limitParam) : DEFAULT_FILE_SEARCH_LIMIT;
-    const limit = Math.max(1, Math.min(parsedLimit, MAX_FILE_SEARCH_LIMIT));
-
-    try {
-      const resolvedRoot = path.resolve(normalizeDirectoryPath(rawRoot));
-      const stats = await fsPromises.stat(resolvedRoot);
-      if (!stats.isDirectory()) {
-        return res.status(400).json({ error: 'Specified root is not a directory' });
-      }
-
-      const files = await searchFilesystemFiles(resolvedRoot, {
-        limit,
-        query: rawQuery || '',
-        includeHidden,
-        respectGitignore,
-      });
-      res.json({
-        root: resolvedRoot,
-        count: files.length,
-        files
-      });
-    } catch (error) {
-      console.error('Failed to search filesystem:', error);
-      const err = error;
-      if (err && typeof err === 'object' && 'code' in err) {
-        const code = err.code;
-        if (code === 'ENOENT') {
-          return res.status(404).json({ error: 'Directory not found' });
-        }
-        if (code === 'EACCES') {
-          return res.status(403).json({ error: 'Access to directory denied' });
-        }
-      }
-      res.status(500).json({ error: (error && error.message) || 'Failed to search files' });
-    }
-  });
-
   let ptyProviderPromise = null;
   const getPtyProvider = async () => {
     if (ptyProviderPromise) {
@@ -11353,9 +13709,104 @@ Context:
     return ptyProviderPromise;
   };
 
+  const getTerminalShellCandidates = () => {
+    if (process.platform === 'win32') {
+      const windowsCandidates = [
+        process.env.OPENCHAMBER_TERMINAL_SHELL,
+        process.env.SHELL,
+        process.env.ComSpec,
+        path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+        'pwsh.exe',
+        'powershell.exe',
+        'cmd.exe',
+      ].filter(Boolean);
+
+      const resolved = [];
+      const seen = new Set();
+      for (const candidateRaw of windowsCandidates) {
+        const candidate = String(candidateRaw).trim();
+        if (!candidate) continue;
+
+        const lookedUp = candidate.includes('\\') || candidate.includes('/')
+          ? candidate
+          : searchPathFor(candidate);
+        const executable = lookedUp && isExecutable(lookedUp) ? lookedUp : (isExecutable(candidate) ? candidate : null);
+        if (!executable || seen.has(executable)) continue;
+        seen.add(executable);
+        resolved.push(executable);
+      }
+      return resolved;
+    }
+
+    const unixCandidates = [
+      process.env.OPENCHAMBER_TERMINAL_SHELL,
+      process.env.SHELL,
+      '/bin/zsh',
+      '/bin/bash',
+      '/bin/sh',
+      'zsh',
+      'bash',
+      'sh',
+    ].filter(Boolean);
+
+    const resolved = [];
+    const seen = new Set();
+    for (const candidateRaw of unixCandidates) {
+      const candidate = String(candidateRaw).trim();
+      if (!candidate) continue;
+
+      const lookedUp = candidate.includes('/') ? candidate : searchPathFor(candidate);
+      const executable = lookedUp && isExecutable(lookedUp) ? lookedUp : (isExecutable(candidate) ? candidate : null);
+      if (!executable || seen.has(executable)) continue;
+      seen.add(executable);
+      resolved.push(executable);
+    }
+
+    return resolved;
+  };
+
+  const spawnTerminalPtyWithFallback = (pty, { cols, rows, cwd, env }) => {
+    const shellCandidates = getTerminalShellCandidates();
+    if (shellCandidates.length === 0) {
+      throw new Error('No executable shell found for terminal session');
+    }
+
+    let lastError = null;
+    for (const shell of shellCandidates) {
+      try {
+        const ptyProcess = pty.spawn(shell, [], {
+          name: 'xterm-256color',
+          cols: cols || 80,
+          rows: rows || 24,
+          cwd,
+          env: {
+            ...env,
+            TERM: 'xterm-256color',
+            COLORTERM: 'truecolor',
+          },
+        });
+
+        return { ptyProcess, shell };
+      } catch (error) {
+        lastError = error;
+        console.warn(`Failed to spawn PTY using shell ${shell}:`, error && error.message ? error.message : error);
+      }
+    }
+
+    const baseMessage = lastError && lastError.message ? lastError.message : 'PTY spawn failed';
+    throw new Error(`Failed to spawn terminal PTY with available shells (${shellCandidates.join(', ')}): ${baseMessage}`);
+  };
+
   const terminalSessions = new Map();
   const MAX_TERMINAL_SESSIONS = 20;
   const TERMINAL_IDLE_TIMEOUT = 30 * 60 * 1000;
+  const sanitizeTerminalEnv = (env) => {
+    const next = { ...env };
+    delete next.BASH_XTRACEFD;
+    delete next.BASH_ENV;
+    delete next.ENV;
+    return next;
+  };
   const terminalInputCapabilities = {
     input: {
       preferred: 'ws',
@@ -11514,7 +13965,8 @@ Context:
     const handleUpgrade = async () => {
       try {
         if (uiAuthController?.enabled) {
-          const sessionToken = uiAuthController?.ensureSessionToken?.(req, null);
+          // Must be awaited: this call performs async token verification.
+          const sessionToken = await uiAuthController?.ensureSessionToken?.(req, null);
           if (!sessionToken) {
             rejectWebSocketUpgrade(socket, 401, 'UI authentication required');
             return;
@@ -11575,25 +14027,18 @@ Context:
         return res.status(400).json({ error: 'Invalid working directory' });
       }
 
-      const shell = process.env.SHELL || (process.platform === 'win32' ? 'powershell.exe' : '/bin/zsh');
-
       const sessionId = Math.random().toString(36).substring(2, 15) +
                         Math.random().toString(36).substring(2, 15);
 
       const envPath = buildAugmentedPath();
-      const resolvedEnv = { ...process.env, PATH: envPath };
+      const resolvedEnv = sanitizeTerminalEnv({ ...process.env, PATH: envPath });
 
       const pty = await getPtyProvider();
-      const ptyProcess = pty.spawn(shell, [], {
-        name: 'xterm-256color',
-        cols: cols || 80,
-        rows: rows || 24,
-        cwd: cwd,
-        env: {
-          ...resolvedEnv,
-          TERM: 'xterm-256color',
-          COLORTERM: 'truecolor',
-        },
+      const { ptyProcess, shell } = spawnTerminalPtyWithFallback(pty, {
+        cols,
+        rows,
+        cwd,
+        env: resolvedEnv,
       });
 
       const session = {
@@ -11611,7 +14056,7 @@ Context:
         terminalSessions.delete(sessionId);
       });
 
-      console.log(`Created terminal session: ${sessionId} in ${cwd}`);
+      console.log(`Created terminal session: ${sessionId} in ${cwd} using shell ${shell}`);
       res.json({ sessionId, cols: cols || 80, rows: rows || 24, capabilities: terminalInputCapabilities });
     } catch (error) {
       console.error('Failed to create terminal session:', error);
@@ -11796,25 +14241,18 @@ Context:
         return res.status(400).json({ error: 'Invalid working directory: not accessible' });
       }
 
-      const shell = process.env.SHELL || (process.platform === 'win32' ? 'powershell.exe' : '/bin/zsh');
-
       const newSessionId = Math.random().toString(36).substring(2, 15) +
                           Math.random().toString(36).substring(2, 15);
 
       const envPath = buildAugmentedPath();
-      const resolvedEnv = { ...process.env, PATH: envPath };
+      const resolvedEnv = sanitizeTerminalEnv({ ...process.env, PATH: envPath });
 
       const pty = await getPtyProvider();
-      const ptyProcess = pty.spawn(shell, [], {
-        name: 'xterm-256color',
-        cols: cols || 80,
-        rows: rows || 24,
-        cwd: cwd,
-        env: {
-          ...resolvedEnv,
-          TERM: 'xterm-256color',
-          COLORTERM: 'truecolor',
-        },
+      const { ptyProcess, shell } = spawnTerminalPtyWithFallback(pty, {
+        cols,
+        rows,
+        cwd,
+        env: resolvedEnv,
       });
 
       const session = {
@@ -11832,7 +14270,7 @@ Context:
         terminalSessions.delete(newSessionId);
       });
 
-      console.log(`Restarted terminal session: ${sessionId} -> ${newSessionId} in ${cwd}`);
+      console.log(`Restarted terminal session: ${sessionId} -> ${newSessionId} in ${cwd} using shell ${shell}`);
       res.json({ sessionId: newSessionId, cols: cols || 80, rows: rows || 24, capabilities: terminalInputCapabilities });
     } catch (error) {
       console.error('Failed to restart terminal session:', error);
@@ -11880,64 +14318,70 @@ Context:
     res.json({ success: true, killedCount });
   });
 
-  try {
-    syncFromHmrState();
-    if (await isOpenCodeProcessHealthy()) {
-      console.log(`[HMR] Reusing existing OpenCode process on port ${openCodePort}`);
-    } else if (ENV_SKIP_OPENCODE_START && ENV_CONFIGURED_OPENCODE_PORT) {
-      console.log(`Using external OpenCode server on port ${ENV_CONFIGURED_OPENCODE_PORT} (skip-start mode)`);
-      setOpenCodePort(ENV_CONFIGURED_OPENCODE_PORT);
-      isOpenCodeReady = true;
-      isExternalOpenCode = true;
-      lastOpenCodeError = null;
-      openCodeNotReadySince = 0;
-      syncToHmrState();
-    } else if (ENV_CONFIGURED_OPENCODE_PORT && await probeExternalOpenCode(ENV_CONFIGURED_OPENCODE_PORT)) {
-      console.log(`Auto-detected existing OpenCode server on port ${ENV_CONFIGURED_OPENCODE_PORT}`);
-      setOpenCodePort(ENV_CONFIGURED_OPENCODE_PORT);
-      isOpenCodeReady = true;
-      isExternalOpenCode = true;
-      lastOpenCodeError = null;
-      openCodeNotReadySince = 0;
-      syncToHmrState();
-    } else if (!ENV_CONFIGURED_OPENCODE_PORT && await probeExternalOpenCode(4096)) {
-      console.log('Auto-detected existing OpenCode server on default port 4096');
-      setOpenCodePort(4096);
-      isOpenCodeReady = true;
-      isExternalOpenCode = true;
-      lastOpenCodeError = null;
-      openCodeNotReadySince = 0;
-      syncToHmrState();
-    } else {
-      if (ENV_CONFIGURED_OPENCODE_PORT) {
-        console.log(`Using OpenCode port from environment: ${ENV_CONFIGURED_OPENCODE_PORT}`);
-        setOpenCodePort(ENV_CONFIGURED_OPENCODE_PORT);
-      } else {
-        openCodePort = null;
-        syncToHmrState();
-      }
+  // Detect Claude Code CLI availability (runs before backend init)
+  detectClaudeCodeCli();
 
-      lastOpenCodeError = null;
-      openCodeProcess = await startOpenCode();
-      syncToHmrState();
+  // Read persisted permission mode; fall back to env var, then default
+  let claudeCodePermissionMode = ENV_CLAUDECODE_PERMISSION_MODE;
+  try {
+    const startupSettings = await readSettingsFromDisk();
+    if (typeof startupSettings.claudeCodePermissionMode === 'string') {
+      const mode = startupSettings.claudeCodePermissionMode.trim();
+      if (mode === 'default' || mode === 'acceptEdits' || mode === 'bypassPermissions') {
+        claudeCodePermissionMode = mode;
+      }
     }
-    await waitForOpenCodePort();
+  } catch {
+    // non-fatal, use env var default
+  }
+
+  if (ENV_BACKEND === 'claudecode') {
     try {
-      await waitForOpenCodeReady();
+      const binary = resolvedClaudeBinary || ENV_CLAUDECODE_BINARY;
+      console.log(`[openchamber] Starting with Claude Code backend (binary: ${binary})`);
+      const { startClaudeCodeAdapter } = await import('./lib/claudecode/adapter.js');
+      claudeCodeAdapterInstance = await startClaudeCodeAdapter({
+        port: 0,
+        claudeBinary: binary,
+        cwd: process.cwd(),
+        permissionMode: claudeCodePermissionMode,
+      });
+      console.log(`[openchamber] Claude Code adapter listening on port ${claudeCodeAdapterInstance.port}`);
+      setOpenCodePort(claudeCodeAdapterInstance.port);
+      claudeCodeAdapterPort = claudeCodeAdapterInstance.port;
+      isOpenCodeReady = true;
+      isExternalOpenCode = false;
+      lastOpenCodeError = null;
+      openCodeNotReadySince = 0;
+      setupProxy(app);
     } catch (error) {
-      console.error(`OpenCode readiness check failed: ${error.message}`);
-      scheduleOpenCodeApiDetection();
+      console.error(`Failed to start Claude Code adapter: ${error.message}`);
+      console.log('Continuing without Claude Code integration...');
+      lastOpenCodeError = error.message;
+      setupProxy(app);
     }
+  } else {
     setupProxy(app);
     scheduleOpenCodeApiDetection();
-    startHealthMonitoring();
-    void startGlobalEventWatcher();
-  } catch (error) {
-    console.error(`Failed to start OpenCode: ${error.message}`);
-    console.log('Continuing without OpenCode integration...');
-    lastOpenCodeError = error.message;
-    setupProxy(app);
-    scheduleOpenCodeApiDetection();
+    void bootstrapOpenCodeAtStartup().then(async () => {
+      // Start Claude Code adapter in hybrid mode if CLI was detected
+      if (resolvedClaudeBinary) {
+        try {
+          const { startClaudeCodeAdapter } = await import('./lib/claudecode/adapter.js');
+          claudeCodeAdapterInstance = await startClaudeCodeAdapter({
+            port: 0,
+            claudeBinary: resolvedClaudeBinary,
+            cwd: process.cwd(),
+            permissionMode: claudeCodePermissionMode,
+          });
+          claudeCodeAdapterPort = claudeCodeAdapterInstance.port;
+          console.log(`[openchamber] Claude Code adapter (hybrid) listening on port ${claudeCodeAdapterPort}`);
+        } catch (adapterError) {
+          console.warn(`[openchamber] Failed to start Claude Code adapter: ${adapterError.message}`);
+          claudeCodeAdapterPort = null;
+        }
+      }
+    });
   }
 
   const distPath = (() => {
@@ -11959,9 +14403,230 @@ Context:
         },
       }));
 
-      // Alias for PWA manifest (.webmanifest redirect → /site.webmanifest)
-      app.get('/manifest.webmanifest', (req, res) => {
-        res.redirect(301, '/site.webmanifest');
+      const recentPwaSessionsCache = new Map();
+
+      const getRecentPwaSessionShortcuts = async (req) => {
+        const now = Date.now();
+
+        const resolvedDirectoryResult = await resolveProjectDirectory(req).catch(() => ({ directory: null }));
+        const preferredDirectory = typeof resolvedDirectoryResult?.directory === 'string'
+          ? resolvedDirectoryResult.directory
+          : null;
+
+        const cacheKey = preferredDirectory ? `dir:${preferredDirectory}` : 'global';
+        const cached = recentPwaSessionsCache.get(cacheKey);
+        if (cached && now - cached.at < 5000) {
+          return cached.data;
+        }
+
+        const normalizeShortcutTitle = (value, fallback) => {
+          const normalized = normalizePwaAppName(value, fallback);
+          return normalized.length > 48 ? normalized.slice(0, 48) : normalized;
+        };
+
+        const toFiniteNumber = (value) => {
+          if (typeof value === 'number' && Number.isFinite(value)) {
+            return value;
+          }
+          if (typeof value === 'string' && value.trim().length > 0) {
+            const parsed = Number(value);
+            if (Number.isFinite(parsed)) {
+              return parsed;
+            }
+          }
+          return null;
+        };
+
+        const normalizeDirectory = (value) => {
+          if (typeof value !== 'string') {
+            return '';
+          }
+          const trimmed = value.trim();
+          if (!trimmed) {
+            return '';
+          }
+          const normalized = trimmed.replace(/\\/g, '/');
+          if (normalized === '/') {
+            return '/';
+          }
+          return normalized.length > 1 ? normalized.replace(/\/+$/, '') : normalized;
+        };
+
+        const sessionUpdatedAt = (session) => {
+          const time = session && typeof session.time === 'object' ? session.time : null;
+          return toFiniteNumber(time?.updated) ?? toFiniteNumber(time?.created) ?? 0;
+        };
+
+        const filterSessionsByDirectory = (sessions, directory) => {
+          const normalizedDirectory = normalizeDirectory(directory);
+          if (!normalizedDirectory) {
+            return sessions;
+          }
+
+          const prefix = normalizedDirectory === '/' ? '/' : `${normalizedDirectory}/`;
+          return sessions.filter((session) => {
+            const sessionDirectory = normalizeDirectory(session?.directory);
+            if (!sessionDirectory) {
+              return false;
+            }
+            return sessionDirectory === normalizedDirectory || (prefix !== '/' && sessionDirectory.startsWith(prefix));
+          });
+        };
+
+        const listSessions = async (directory) => {
+          const query = (() => {
+            if (typeof directory !== 'string' || directory.length === 0) {
+              return '';
+            }
+            const preparedDirectory = process.platform === 'win32'
+              ? directory.replace(/\//g, '\\')
+              : directory;
+            return `?directory=${encodeURIComponent(preparedDirectory)}`;
+          })();
+
+          const response = await fetch(buildOpenCodeUrl(`/session${query}`, ''), {
+            method: 'GET',
+            headers: {
+              Accept: 'application/json',
+              ...getOpenCodeAuthHeaders(),
+            },
+            signal: AbortSignal.timeout(2500),
+          });
+
+          if (!response.ok) {
+            return [];
+          }
+
+          const payload = await response.json().catch(() => null);
+          return Array.isArray(payload) ? payload : [];
+        };
+
+        try {
+          let payload = [];
+
+          if (preferredDirectory) {
+            const scopedPayload = await listSessions(preferredDirectory);
+            const filteredScopedPayload = filterSessionsByDirectory(scopedPayload, preferredDirectory);
+
+            if (filteredScopedPayload.length > 0) {
+              payload = filteredScopedPayload;
+            } else {
+              const globalPayload = await listSessions(null);
+              const filteredGlobalPayload = filterSessionsByDirectory(globalPayload, preferredDirectory);
+              payload = filteredGlobalPayload.length > 0 ? filteredGlobalPayload : globalPayload;
+            }
+          } else {
+            payload = await listSessions(null);
+          }
+
+          const seen = new Set();
+          const rows = [];
+
+          for (const item of payload) {
+            if (!item || typeof item !== 'object') {
+              continue;
+            }
+
+            const id = typeof item.id === 'string' ? item.id.trim().slice(0, 160) : '';
+            if (!id || seen.has(id)) {
+              continue;
+            }
+
+            seen.add(id);
+            const title = normalizeShortcutTitle(item.title, `Session ${rows.length + 1}`);
+            const updatedAt = sessionUpdatedAt(item);
+
+            rows.push({ id, title, updatedAt });
+          }
+
+          rows.sort((a, b) => b.updatedAt - a.updatedAt);
+
+          const shortcuts = rows.slice(0, 3).map((session) => ({
+            name: session.title,
+            short_name: session.title.length > 32 ? session.title.slice(0, 32) : session.title,
+            description: 'Open recent session',
+            url: `/?session=${encodeURIComponent(session.id)}`,
+            icons: [{ src: '/pwa-192.png', sizes: '192x192', type: 'image/png' }],
+          }));
+
+          recentPwaSessionsCache.set(cacheKey, { at: now, data: shortcuts });
+          return shortcuts;
+        } catch {
+          recentPwaSessionsCache.set(cacheKey, { at: now, data: [] });
+          return [];
+        }
+      };
+
+      app.get('/manifest.webmanifest', async (req, res) => {
+        const hasQueryOverride =
+          typeof req.query?.pwa_name === 'string'
+          || typeof req.query?.app_name === 'string'
+          || typeof req.query?.appName === 'string';
+
+        let queryValueRaw = '';
+        if (typeof req.query?.pwa_name === 'string') {
+          queryValueRaw = req.query.pwa_name;
+        } else if (typeof req.query?.app_name === 'string') {
+          queryValueRaw = req.query.app_name;
+        } else if (typeof req.query?.appName === 'string') {
+          queryValueRaw = req.query.appName;
+        }
+
+        const queryOverrideName = normalizePwaAppName(queryValueRaw, '');
+
+        let storedName = '';
+        try {
+          const settings = await readSettingsFromDiskMigrated();
+          storedName = normalizePwaAppName(settings?.pwaAppName, '');
+        } catch {
+          storedName = '';
+        }
+
+        const appName = hasQueryOverride
+          ? (queryOverrideName || DEFAULT_PWA_APP_NAME)
+          : (storedName || DEFAULT_PWA_APP_NAME);
+
+        const shortName = appName.length > 30 ? appName.slice(0, 30) : appName;
+        const recentSessionShortcuts = await getRecentPwaSessionShortcuts(req);
+
+        const manifest = {
+          name: appName,
+          short_name: shortName,
+          description: 'Web interface companion for OpenCode AI coding agent',
+          id: '/',
+          start_url: '/',
+          scope: '/',
+          display: 'standalone',
+          background_color: '#151313',
+          theme_color: '#edb449',
+          orientation: 'any',
+          icons: [
+            { src: '/pwa-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+            { src: '/pwa-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+            { src: '/pwa-maskable-192.png', sizes: '192x192', type: 'image/png', purpose: 'any maskable' },
+            { src: '/pwa-maskable-512.png', sizes: '512x512', type: 'image/png', purpose: 'any maskable' },
+            { src: '/apple-touch-icon-180x180.png', sizes: '180x180', type: 'image/png', purpose: 'any' },
+            { src: '/apple-touch-icon-152x152.png', sizes: '152x152', type: 'image/png', purpose: 'any' },
+            { src: '/favicon-32.png', sizes: '32x32', type: 'image/png' },
+            { src: '/favicon-16.png', sizes: '16x16', type: 'image/png' },
+          ],
+          shortcuts: [
+            {
+              name: 'Appearance Settings',
+              short_name: 'Settings',
+              description: 'Open appearance settings',
+              url: '/?settings=appearance',
+              icons: [{ src: '/pwa-192.png', sizes: '192x192', type: 'image/png' }],
+            },
+            ...recentSessionShortcuts,
+          ],
+          categories: ['developer', 'tools', 'productivity'],
+          lang: 'en',
+        };
+
+        res.setHeader('Cache-Control', 'no-store, must-revalidate');
+        res.type('application/manifest+json');
+        res.send(JSON.stringify(manifest));
       });
 
     app.get(/^(?!\/api|.*\.(js|css|svg|png|jpg|jpeg|gif|ico|woff|woff2|ttf|eot|map)).*$/, (req, res) => {
@@ -11997,9 +14662,10 @@ Context:
         // ignore
       }
 
-      console.log(`OpenChamber server running on port ${activePort}`);
-      console.log(`Health check: http://localhost:${activePort}/health`);
-      console.log(`Web interface: http://localhost:${activePort}`);
+      const proto = useTls ? 'https' : 'http';
+      console.log(`OpenChamber server running on port ${activePort}${useTls ? ' (TLS)' : ''}`);
+      console.log(`Health check: ${proto}://localhost:${activePort}/health`);
+      console.log(`Web interface: ${proto}://localhost:${activePort}`);
 
       if (tryCfTunnel) {
         console.log('\nInitializing Cloudflare Quick Tunnel...');
@@ -12007,13 +14673,29 @@ Context:
         if (cfCheck.available) {
           try {
             const originUrl = `http://localhost:${activePort}`;
-            cloudflareTunnelController = await startCloudflareTunnel({ originUrl, port: activePort });
+            cloudflareTunnelController = await startCloudflareQuickTunnel({ originUrl, port: activePort });
             printTunnelWarning();
-            if (onTunnelReady) {
-              const tunnelUrl = cloudflareTunnelController.getPublicUrl();
-              if (tunnelUrl) {
-                onTunnelReady(tunnelUrl);
+            const tunnelUrl = cloudflareTunnelController.getPublicUrl();
+            if (tunnelUrl) {
+              tunnelAuthController.setActiveTunnel({
+                tunnelId: crypto.randomUUID(),
+                publicUrl: tunnelUrl,
+                mode: TUNNEL_MODE_QUICK,
+              });
+              const settings = await readSettingsFromDiskMigrated();
+              const bootstrapTtlMs = settings?.tunnelBootstrapTtlMs === null
+                ? null
+                : normalizeTunnelBootstrapTtlMs(settings?.tunnelBootstrapTtlMs);
+              const bootstrapToken = tunnelAuthController.issueBootstrapToken({ ttlMs: bootstrapTtlMs });
+              const connectUrl = `${tunnelUrl.replace(/\/$/, '')}/connect?t=${encodeURIComponent(bootstrapToken.token)}`;
+              if (onTunnelReady) {
+                onTunnelReady(tunnelUrl, connectUrl);
+              } else {
+                console.log(`\n🌐 Tunnel URL: ${connectUrl}`);
+                console.log('🔑 One-time connect link (expires after first use)\n');
               }
+            } else if (onTunnelReady) {
+              onTunnelReady(tunnelUrl, null);
             }
           } catch (error) {
             console.error(`Failed to start Cloudflare tunnel: ${error.message}`);

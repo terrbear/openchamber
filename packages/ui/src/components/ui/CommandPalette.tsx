@@ -20,6 +20,8 @@ import { RiAddLine, RiChatAi3Line, RiCheckLine, RiCodeLine, RiComputerLine, RiGi
 import { RiFolderLine } from '@remixicon/react';
 import { createWorktreeSession } from '@/lib/worktreeSessionCreator';
 import { formatShortcutForDisplay, getEffectiveShortcutCombo } from '@/lib/shortcuts';
+import { isDesktopShell, isVSCodeRuntime, isWebRuntime } from '@/lib/desktop';
+import { SETTINGS_PAGE_METADATA, SETTINGS_GROUP_LABELS, type SettingsRuntimeContext } from '@/lib/settings/metadata';
 
 export const CommandPalette: React.FC = () => {
   const {
@@ -28,6 +30,7 @@ export const CommandPalette: React.FC = () => {
     setHelpDialogOpen,
     setActiveMainTab,
     setSettingsDialogOpen,
+    setSettingsPage,
     setSessionSwitcherOpen,
     setTimelineDialogOpen,
     toggleSidebar,
@@ -116,6 +119,34 @@ export const CommandPalette: React.FC = () => {
     handleClose();
   };
 
+  const handleOpenSettingsPage = (slug: string) => {
+    setSettingsPage(slug);
+    setSettingsDialogOpen(true);
+    handleClose();
+  };
+
+  const settingsRuntimeCtx = React.useMemo<SettingsRuntimeContext>(() => {
+    const isDesktop = isDesktopShell();
+    return { isVSCode: isVSCodeRuntime(), isWeb: !isDesktop && isWebRuntime(), isDesktop };
+  }, []);
+
+  const settingsPages = React.useMemo(() => {
+    return SETTINGS_PAGE_METADATA
+      .filter((p) => p.slug !== 'home')
+      .filter((p) => (p.isAvailable ? p.isAvailable(settingsRuntimeCtx) : true));
+  }, [settingsRuntimeCtx]);
+
+  const settingsItems = React.useMemo(() => {
+    const groupLabel = (group: string) => (SETTINGS_GROUP_LABELS as Record<string, string>)[group] ?? group;
+    return settingsPages
+      .slice()
+      .sort((a, b) => {
+        const g = groupLabel(a.group).localeCompare(groupLabel(b.group));
+        if (g !== 0) return g;
+        return a.title.localeCompare(b.title);
+      });
+  }, [settingsPages]);
+
   const handleToggleRightSidebar = () => {
     toggleRightSidebar();
     handleClose();
@@ -178,14 +209,14 @@ export const CommandPalette: React.FC = () => {
             <RiAddLine className="mr-2 h-4 w-4" />
             <span>New Session</span>
             <CommandShortcut>
-              {settingsAutoCreateWorktree ? shortcut('new_chat_worktree') : shortcut('new_chat')}
+              {shortcut('new_chat')}
             </CommandShortcut>
           </CommandItem>
           <CommandItem onSelect={handleCreateWorktreeSession}>
             <RiGitBranchLine className="mr-2 h-4 w-4" />
             <span>New Session with Worktree</span>
             <CommandShortcut>
-              {settingsAutoCreateWorktree ? shortcut('new_chat') : shortcut('new_chat_worktree')}
+              {shortcut('new_chat_worktree')}
             </CommandShortcut>
           </CommandItem>
           <CommandItem onSelect={handleToggleRightSidebar}>
@@ -243,6 +274,19 @@ export const CommandPalette: React.FC = () => {
             <span>Open Settings</span>
             <CommandShortcut>{shortcut('open_settings')}</CommandShortcut>
           </CommandItem>
+          <CommandItem onSelect={() => handleOpenSettingsPage('skills.catalog')}>
+            <RiSettings3Line className="mr-2 h-4 w-4" />
+            <span>Open Skills Catalog</span>
+          </CommandItem>
+        </CommandGroup>
+
+        <CommandGroup heading="Settings">
+          {settingsItems.map((page) => (
+            <CommandItem key={page.slug} onSelect={() => handleOpenSettingsPage(page.slug)}>
+              <RiSettings3Line className="mr-2 h-4 w-4" />
+              <span>{SETTINGS_GROUP_LABELS[page.group]}: {page.title}</span>
+            </CommandItem>
+          ))}
         </CommandGroup>
 
         {projects.length >= 2 && (

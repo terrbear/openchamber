@@ -1,0 +1,184 @@
+## Codebase Patterns
+- server/index.js is a large monolith (~12K lines) with all Express routes, proxy setup, and startup logic
+- The existing Claude Code adapter (server/lib/claudecode/adapter.js) is a standalone Express app with its own session management and SSE broadcasting
+- Provider list comes from OpenCode via GET /config/providers, intercepted by a dedicated route handler in setupProxy() that augments the response
+- To intercept a proxied route, add an app.get/app.post BEFORE app.use('/api', proxyMiddleware) in setupProxy() -- Express matches first-registered route first
+- SSE events flow: OpenCode -> server proxy -> client; adapter events merged via connectAdapterSse() in hybrid mode
+- SSE route registration order in main(): the sophisticated handlers (with block parsing, transcript capture, session activity tracking) are registered BEFORE setupProxy() -- they handle /api/event and /api/global/event; the forwardSseRequest in setupProxy() is a fallback that is never reached for these paths
+- In legacy claudecode mode, openCodePort === claudeCodeAdapterPort -- skip adapter SSE merge to avoid duplicates
+- Message routing: client POST /api/session/:id/prompt_async -> server proxy -> OpenCode (or adapter when providerID=claudecode)
+- For routes that conditionally call next() to fall through to the proxy, use express.raw() not express.json() to preserve the body buffer
+- ENV_BACKEND is read once at module load: const ENV_BACKEND = process.env.OPENCHAMBER_BACKEND || 'opencode'
+- The setupProxy() function in server/index.js sets up all /api/* routing to the openCodePort
+- cli.js already has --backend and --claude-binary flags from the previous PRD iteration (US-001 marked as passes: true in old prd.json)
+- Provider logos: local SVGs in packages/ui/src/assets/provider-logos/*.svg, fallback to https://models.dev/logos/{id}.svg
+- useProviderLogo.ts has alias map: 'claude' -> 'anthropic'; use 'claudecode' as provider ID to avoid conflict
+
+- Settings whitelist: `sanitizeSettingsUpdate()` in server/index.js controls which fields can be persisted. New settings must be added there (and also returned via `formatSettingsResponse`).
+- Adapter runtime config: module-level variables in adapter.js can be updated at runtime via exported setters (e.g., `setPermissionMode()`); new claude subprocess spawns pick up changes immediately
+- resolvedClaudeBinary is the module-level variable in server/index.js that holds the detected claude CLI path (null if not found)
+- detectClaudeCodeCli() is called once before the ENV_BACKEND if/else block in the startup section (~line 12170)
+- resolveClaudeCodeCliPath() checks CLAUDECODE_BINARY env first, then searchPathFor('claude')
+- server/index.js already has isExecutable() and searchPathFor() helper functions at ~line 3280
+- claudeCodeAdapterPort is a module-level variable that stores the hybrid adapter's port (null when not running)
+- claudeCodeAdapterInstance stores the adapter object; used by both legacy (claudecode) and hybrid (opencode) modes
+- The hybrid adapter starts AFTER setupProxy(app) and health monitoring, so it doesn't delay OpenCode startup
+- /health endpoint exposes claudeCodeAvailable (boolean) and claudeCodeAdapterPort (number|null)
+- Question/permission routing: adapter uses body-based routes (/question/reply with requestID in body), SDK uses path-based routes (/question/{requestID}/reply). Server translates between them.
+- For dual-backend routing (try adapter, fall through to OpenCode on 404): adapter returns 404 for unknown requestIDs, which signals to forward to OpenCode instead
+- Adapter auto-creates sessions on prompt_async for unknown session IDs (needed for hybrid mode where OpenCode manages sessions)
+- The adapter's runClaude() helper returns { code, assistantText, usedResume, stderr } -- caller retries without --resume when usedResume && code !== 0 && !assistantText
+- Session persistence file: ~/.local/share/openchamber/claudecode-sessions.json (loaded on startup, saved on changes via chained promises)
+
+---
+
+## 2026-02-26 - US-001
+- Implemented Claude Code CLI detection on server startup
+- Files changed: packages/web/server/index.js
+- Added `resolvedClaudeBinary` module-level variable (line 3279)
+- Added `resolveClaudeCodeCliPath()` function that checks CLAUDECODE_BINARY env var, then PATH
+- Added `detectClaudeCodeCli()` function that resolves and logs the result
+- Called `detectClaudeCodeCli()` before the ENV_BACKEND if/else block in startup
+- **Learnings for future iterations:**
+  - server/index.js already has `isExecutable()` and `searchPathFor()` that can be reused for binary detection
+  - The existing `resolveOpencodeCliPath()` pattern is the template for CLI resolution functions
+  - Pre-existing lint errors in @openchamber/ui (Header.tsx, NotificationSettings.tsx, etc.) are not related to server changes
+  - The startup section is around line 12170 in server/index.js (after terminal session force-kill endpoint)
+---
+
+## 2026-02-26 - US-002
+- Implemented hybrid mode: Claude Code adapter starts alongside OpenCode when CLI is detected
+- Files changed: packages/web/server/index.js
+- Added `claudeCodeAdapterPort` module-level variable (line 2914)
+- In the `else` branch (ENV_BACKEND === 'opencode'), after setupProxy/healthMonitoring/globalEventWatcher, added conditional block that starts the Claude Code adapter on port 0 if `resolvedClaudeBinary` is set
+- Updated `/health` endpoint to include `claudeCodeAvailable` and `claudeCodeAdapterPort` fields
+- Updated `gracefulShutdown()` to reset `claudeCodeAdapterPort = null` when stopping the adapter
+- Also improved legacy branch to use `resolvedClaudeBinary || ENV_CLAUDECODE_BINARY` for consistency
+- **Learnings for future iterations:**
+  - The hybrid adapter block is inside the try/catch of the opencode startup, so if OpenCode itself fails to start, the adapter won't start either (intentional -- no point running adapter without OpenCode)
+  - `startClaudeCodeAdapter({ port: 0 })` picks a random available port, returned as `instance.port`
+  - The adapter's `stop()` method handles cleanup of child processes and the Express server
+  - Pre-existing dirty state in Makefile and adapter.js on this branch -- be careful to only stage files relevant to the current story
+---
+
+## 2026-02-26 - US-003
+- Injected Claude Code provider into /config/providers response when adapter is running
+- Files changed: packages/web/server/index.js
+- Added GET /api/config/providers route handler in setupProxy(), placed before the catch-all proxy middleware
+- Handler fetches upstream /config/providers from OpenCode, parses JSON, appends claudecode provider entry if claudeCodeAdapterPort != null
+- Provider entry shape matches the Provider type from @opencode-ai/sdk/v2: { id, name, source, env, options, models: { [modelId]: Model } }
+- Model object includes all required fields (capabilities, cost, limit, status, etc.) with sensible defaults
+- Also fixed: health endpoint now uses `claudeCodeAdapterPort` directly instead of `claudeCodeAdapterPort || null` (port 0 was falsy)
+- Also fixed: legacy (claudecode) mode now sets claudeCodeAdapterPort so provider injection works in both modes
+- **Learnings for future iterations:**
+  - To intercept a proxied API route, register a specific route handler (app.get/app.post) BEFORE the catch-all app.use('/api', proxyMiddleware) in setupProxy()
+  - The Provider type requires models as a Record<string, Model>, not an array -- frontend converts to array in loadProviders()
+  - Model type has many required fields (capabilities, cost, limit, status, api, headers, release_date, options) -- provide sensible defaults for all
+  - Query string forwarding is important: /config/providers?directory=... must be forwarded to upstream
+  - Pre-existing lint errors in @openchamber/ui are unchanged and not related to server changes
+---
+
+## 2026-02-26 - US-004
+- Routed POST /api/session/:id/prompt_async requests to Claude Code adapter when model.providerID is 'claudecode'
+- Files changed: packages/web/server/index.js
+- Added app.post('/api/session/:id/prompt_async') handler in setupProxy(), placed before app.use('/api', proxyMiddleware)
+- Uses express.raw({ type: 'application/json' }) to buffer the body as a Buffer, then JSON.parse to inspect providerID
+- When providerID === 'claudecode' and claudeCodeAdapterPort != null, proxies to http://127.0.0.1:<port>/session/:id/prompt_async
+- When providerID is anything else (or adapter not running), calls next() to fall through to OpenCode proxy
+- Error handling returns 504 for timeouts, 503 for connection failures
+- **Learnings for future iterations:**
+  - express.raw() is safer than express.json() when the route might fall through to a proxy -- express.json() consumes the stream and the proxy can't re-read it
+  - The adapter's prompt_async expects the standard OpenCode body format (parts array with text parts) and returns { id: userMessageId }
+  - The adapter creates sessions on-the-fly when it receives a prompt_async for an unknown session ID
+  - LONG_REQUEST_TIMEOUT_MS (4 min) is the standard timeout for forwarded requests in this codebase
+---
+
+## 2026-02-26 - US-005
+- Merged Claude Code adapter SSE events into the client event stream
+- Files changed: packages/web/server/index.js
+- Added `connectAdapterSse(res, abortSignal)` helper function that connects to the adapter's /event SSE endpoint, forwards events to the client response, and reconnects with exponential backoff on drops
+- Integrated connectAdapterSse into three SSE handlers: forwardSseRequest (setupProxy), /api/global/event (main), and /api/event (main)
+- Added guard to skip adapter SSE in legacy mode (when openCodePort === claudeCodeAdapterPort) to avoid duplicate events
+- Cleanup: each handler calls stopAdapterSse() in its finally block; also aborts on client disconnect via AbortController signal
+- **Learnings for future iterations:**
+  - There are TWO sets of SSE route handlers: the sophisticated ones registered in main() (with block parsing, transcript capture, session tracking) and simpler forwardSseRequest ones in setupProxy(). The main() handlers are registered first and take priority.
+  - In legacy claudecode mode, openCodePort and claudeCodeAdapterPort are set to the same port (the adapter IS OpenCode). Must check for this to avoid double-connecting.
+  - The adapter's /event endpoint follows standard SSE protocol (data: JSON\n\n blocks), same as OpenCode's /global/event
+  - connectAdapterSse uses exponential backoff (1s -> 2s -> 4s -> 8s -> 16s max) for reconnection
+---
+
+## 2026-02-26 - US-006
+- Forwarded Claude Code question and permission requests to client through merged endpoints
+- Files changed: packages/web/server/index.js
+- Added GET /api/question handler that fetches from both OpenCode and the Claude Code adapter, merging results into a single array
+- Added POST /api/question/:requestID/reply handler that tries the adapter first (if running), falls through to OpenCode on 404
+- Added POST /api/question/:requestID/reject handler with the same try-adapter-then-OpenCode pattern
+- Added GET /api/permission handler that merges results from both backends
+- All four handlers are registered before the catch-all proxy middleware in setupProxy()
+- Legacy mode guard: skip adapter fetch when claudeCodeAdapterPort === openCodePort to avoid duplicate results
+- Also fixed stopAdapterSse variable scoping in forwardSseRequest to properly clean up on error
+- **Learnings for future iterations:**
+  - The SDK uses path-based routes (/question/{requestID}/reply) but the adapter uses body-based routes (/question/reply with {requestID} in body). Must translate between them when routing.
+  - The adapter returns 404 for unknown requestIDs, which is the signal to fall through to OpenCode
+  - For POST routes that conditionally forward to different backends, use express.raw() to buffer the body, then forward the raw buffer to OpenCode (preserving the original body) or JSON.stringify a translated body for the adapter
+  - GET /question and GET /permission can be fetched from both backends in parallel but we fetch sequentially for simplicity since latency is low (both are localhost)
+---
+
+## 2026-02-26 - US-007
+- Implemented session state mapping for --resume continuity in the Claude Code adapter
+- Files changed: packages/web/server/lib/claudecode/adapter.js
+- Refactored the prompt_async handler to extract claude spawning into a `runClaude()` helper function that returns a promise with `{ code, assistantText, usedResume, stderr }`
+- Added auto-create session logic: when prompt_async receives an unknown session ID, it creates a new session entry instead of returning 404 (needed for hybrid mode where OpenCode manages sessions)
+- Added retry-on-resume-failure: if `--resume` fails (non-zero exit, no output), clears `claudeSessionId`, retries without `--resume`, and the new session ID is captured from the result event
+- Changed session_id capture in result event to always update (not just when null), so retries after stale --resume correctly store the new session ID
+- Session mapping persists via loadSessions/saveSessions to ~/.local/share/openchamber/claudecode-sessions.json (already existed from prior work)
+- **Learnings for future iterations:**
+  - The `runClaude()` pattern (returning a promise with result metadata) makes retry logic clean -- the caller can inspect `usedResume` to decide whether to retry
+  - When destructuring env vars to exclude them, use `{ VAR: _alias, ...rest }` instead of eslint-disable to avoid lint warnings
+  - The adapter's prompt_async must auto-create sessions for hybrid mode since the server forwards OpenCode session IDs that the adapter hasn't seen
+  - The `close` event handler cleanup (pending questions) must happen inside `runClaude` for each attempt, not just once at the end
+---
+
+## 2026-02-26 - US-008
+- Added Claude Code provider logo (terminal/CLI-themed SVG icon)
+- Files changed: packages/ui/src/assets/provider-logos/claudecode.svg (new file)
+- The SVG is a terminal window icon with a `>` chevron prompt and `_` cursor, visually distinct from the Anthropic sparkle logo
+- No code changes needed: the useProviderLogo.ts hook auto-discovers local SVGs via import.meta.glob matching the provider ID
+- **Learnings for future iterations:**
+  - Adding a new provider logo only requires dropping a .svg file in packages/ui/src/assets/provider-logos/ with the filename matching the provider ID
+  - The useProviderLogo hook uses import.meta.glob for eager loading -- no index file or manual registration needed
+  - SVGs should use fill="#000000" since ProviderLogo.tsx applies dark:invert for dark mode support
+  - The viewBox="0 0 24 24" format works well at small sizes (h-3.5 w-3.5 and h-4 w-4)
+---
+
+## 2026-02-26 - US-009
+- Show Claude Code status in provider settings page
+- Files changed: packages/ui/src/components/sections/providers/ProvidersPage.tsx
+- Added `isClaudeCode` flag (`selectedProvider.id === 'claudecode'`) to conditionally render the provider detail view
+- When Claude Code is selected: shows "Status" section with green checkmark "Available" indicator and "Claude Code CLI detected" label, plus a note that no API key is needed
+- When Claude Code is selected: hides the Authentication section (API key input, OAuth, Reconnect button) and Connection Details section (config sources, Disconnect button)
+- The Models section renders normally for Claude Code (shows "Default (Claude Code manages model selection)")
+- Claude Code only appears if it's in the providers list (injected by the server in US-003 when CLI is detected)
+- ProvidersSidebar gracefully handles Claude Code: the /api/provider/:id/source fetch returns an error for claudecode which is silently ignored, so it shows under "User Providers"
+- **Learnings for future iterations:**
+  - To add provider-specific rendering in ProvidersPage, check `selectedProvider.id` and conditionally render sections. The component has three main sections: Authentication, Connection Details, Models.
+  - The ProvidersSidebar's source-loading logic silently ignores fetch errors per provider, so injected providers that don't have OpenCode config sources work fine
+  - Pre-existing lint errors in @openchamber/ui are unchanged (Header.tsx, NotificationSettings.tsx, SidebarFilesTree.tsx, SessionSidebar.tsx)
+---
+
+## 2026-02-26 - US-010
+- Added Claude Code permission mode configuration
+- Files changed: packages/web/server/index.js, packages/web/server/lib/claudecode/adapter.js, packages/ui/src/components/sections/providers/ProvidersPage.tsx
+- Added `claudeCodePermissionMode` to `sanitizeSettingsUpdate()` whitelist in server/index.js (validates 'default', 'acceptEdits', 'bypassPermissions')
+- Added `setPermissionMode()` export to adapter.js for runtime updates
+- On startup, reads `claudeCodePermissionMode` from `~/.config/openchamber/settings.json`, falls back to `ENV_CLAUDECODE_PERMISSION_MODE`, then 'acceptEdits'
+- PUT /api/config/settings handler now calls `setPermissionMode()` on the adapter when `claudeCodePermissionMode` is in the request body
+- Added dropdown UI in ProvidersPage.tsx Claude Code section: fetches current mode on mount, saves via PUT on change, shows toast feedback
+- The isClaudeCode branch now wrapped in a `<>...</>` fragment to accommodate both Status and Permission Mode sections
+- **Learnings for future iterations:**
+  - The ternary conditional in JSX needs a single root element per branch -- use `<>...</>` fragment when adding multiple sections to a branch
+  - `sanitizeSettingsUpdate()` is the whitelist for all persisted settings -- any new setting must be added there
+  - `mergePersistedSettings()` uses spread to merge, so simple scalar fields Just Work once whitelisted
+  - The adapter's `_permissionMode` module-level variable can be updated at runtime; new spawns pick up the change immediately
+  - `formatSettingsResponse()` calls `sanitizeSettingsUpdate()` which also acts as the output filter, so the new field is automatically included in GET responses
+---

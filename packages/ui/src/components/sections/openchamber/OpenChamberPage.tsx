@@ -5,10 +5,10 @@ import { SessionRetentionSettings } from './SessionRetentionSettings';
 import { MemoryLimitsSettings } from './MemoryLimitsSettings';
 import { DefaultsSettings } from './DefaultsSettings';
 import { GitSettings } from './GitSettings';
-import { WorktreeSectionContent } from './WorktreeSectionContent';
 import { NotificationSettings } from './NotificationSettings';
 import { GitHubSettings } from './GitHubSettings';
 import { VoiceSettings } from './VoiceSettings';
+import { TunnelSettings } from './TunnelSettings';
 import { OpenCodeCliSettings } from './OpenCodeCliSettings';
 import { ConnectionsSettings } from './ConnectionsSettings';
 import { ProjectTodos } from './ProjectTodos';
@@ -16,7 +16,7 @@ import { KeyboardShortcutsSettings } from './KeyboardShortcutsSettings';
 import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
 import { useDeviceInfo } from '@/lib/device';
 import { isVSCodeRuntime, isWebRuntime } from '@/lib/desktop';
-import type { OpenChamberSection } from './OpenChamberSidebar';
+import type { OpenChamberSection } from './types';
 
 interface OpenChamberPageProps {
     /** Which section to display. If undefined, shows all sections (mobile/legacy behavior) */
@@ -36,7 +36,7 @@ export const OpenChamberPage: React.FC<OpenChamberPageProps> = ({ section }) => 
                 outerClassName="h-full"
                 className="w-full"
             >
-                <div className="openchamber-page-body mx-auto max-w-3xl space-y-3 p-3 sm:space-y-6 sm:p-6">
+                <div className="openchamber-page-body mx-auto max-w-3xl space-y-3 p-3 sm:space-y-6 sm:p-6 sm:pt-8">
                     <OpenChamberVisualSettings />
                     <div className="border-t border-border/40 pt-6">
                         <DefaultsSettings />
@@ -82,6 +82,8 @@ export const OpenChamberPage: React.FC<OpenChamberPageProps> = ({ section }) => 
                 return <NotificationSectionContent />;
             case 'voice':
                 return <VoiceSectionContent />;
+            case 'tunnel':
+                return <TunnelSectionContent />;
             default:
                 return null;
         }
@@ -93,7 +95,7 @@ export const OpenChamberPage: React.FC<OpenChamberPageProps> = ({ section }) => 
             outerClassName="h-full"
             className="w-full"
         >
-            <div className="openchamber-page-body mx-auto max-w-3xl space-y-6 p-3 sm:p-6">
+            <div className="openchamber-page-body mx-auto max-w-3xl space-y-6 p-3 sm:p-6 sm:pt-8">
                 {renderSectionContent()}
             </div>
         </ScrollableOverlay>
@@ -104,14 +106,24 @@ const ShortcutsSectionContent: React.FC = () => {
     return <KeyboardShortcutsSettings />;
 };
 
-// Visual section: Theme Mode, Font Size, Spacing, Corner Radius, Input Bar Offset (mobile)
+// Visual section: Theme Mode, Font Size, Spacing, Corner Radius, Input Bar Offset (mobile), Nav Rail
 const VisualSectionContent: React.FC = () => {
-    return <OpenChamberVisualSettings visibleSettings={['theme', 'fontSize', 'terminalFontSize', 'spacing', 'cornerRadius', 'inputBarOffset', 'terminalQuickKeys']} />;
+    const isVSCode = isVSCodeRuntime();
+    return <OpenChamberVisualSettings visibleSettings={[
+        'theme',
+        'pwaInstallName',
+        'fontSize',
+        'terminalFontSize',
+        'spacing',
+        'cornerRadius',
+        'inputBarOffset',
+        ...(!isVSCode ? ['terminalQuickKeys' as const, 'navRail' as const] : []),
+    ]} />;
 };
 
-// Chat section: Default Tool Output, Diff layout, Show reasoning traces, Queue mode, Persist draft
+// Chat section: Default Tool Output, User message rendering, Diff layout, Mobile status bar, Show reasoning traces, Justification activity, Activity header timestamps, Queue mode, Persist draft
 const ChatSectionContent: React.FC = () => {
-    return <OpenChamberVisualSettings visibleSettings={['toolOutput', 'diffLayout', 'dotfiles', 'reasoning', 'textJustificationActivity', 'queueMode', 'persistDraft']} />;
+    return <OpenChamberVisualSettings visibleSettings={['toolOutput', 'mermaidRendering', 'userMessageRendering', 'stickyUserHeader', 'diffLayout', 'mobileStatusBar', 'dotfiles', 'reasoning', 'textJustificationActivity', 'activityHeaderTimestamps', 'queueMode', 'persistDraft', 'inputSpellcheck']} />;
 };
 
 // Sessions section: Default model & agent, Session retention, Memory limits
@@ -140,15 +152,6 @@ const GitSectionContent: React.FC = () => {
     return (
         <div className="space-y-6">
             <GitSettings />
-            <div className="border-t border-border/40 pt-6">
-                <div className="space-y-1 mb-4">
-                    <h3 className="typography-ui-header font-semibold text-foreground">Worktree</h3>
-                    <p className="typography-meta text-muted-foreground">
-                        Configure worktree branch defaults and manage existing worktrees.
-                    </p>
-                </div>
-                <WorktreeSectionContent />
-            </div>
         </div>
     );
 };
@@ -182,4 +185,11 @@ const ConnectionsSectionContent: React.FC = () => {
 // Todos section: Per-project todo list
 const TodosSectionContent: React.FC = () => {
     return <ProjectTodos />;
+};
+
+const TunnelSectionContent: React.FC = () => {
+    if (isVSCodeRuntime()) {
+        return null;
+    }
+    return <TunnelSettings />;
 };

@@ -8,6 +8,8 @@ import {
   RiDeleteBinLine,
   RiCheckLine,
   RiCloseLine,
+  RiAddLine,
+  RiFolderAddLine,
 } from '@remixicon/react';
 import { cn } from '@/lib/utils';
 import type { SessionFolder } from '@/stores/useSessionFoldersStore';
@@ -15,6 +17,8 @@ import type { SessionFolder } from '@/stores/useSessionFoldersStore';
 interface SessionFolderItemProps<TSessionNode> {
   folder: SessionFolder;
   sessions: TSessionNode[];
+  /** Sub-folders that belong directly to this folder */
+  subFolderItems?: React.ReactNode;
   isCollapsed: boolean;
   onToggle: () => void;
   onRename: (name: string) => void;
@@ -24,6 +28,7 @@ interface SessionFolderItemProps<TSessionNode> {
     depth?: number,
     groupDir?: string | null,
     projectId?: string | null,
+    archivedBucket?: boolean,
   ) => React.ReactNode;
   groupDirectory?: string | null;
   projectId?: string | null;
@@ -33,11 +38,26 @@ interface SessionFolderItemProps<TSessionNode> {
   onRenameDraftChange?: (value: string) => void;
   onRenameSave?: () => void;
   onRenameCancel?: () => void;
+  /** Ref callback from useDroppable – attach to folder header to make it a drop zone */
+  droppableRef?: (node: HTMLElement | null) => void;
+  /** Whether a draggable session is currently hovering over this folder */
+  isDropTarget?: boolean;
+  /** Create a new session scoped to this folder */
+  onNewSession?: () => void;
+  /** Create a new sub-folder inside this folder */
+  onNewSubFolder?: () => void;
+  /** Visual indent depth (0 = root folder, 1 = sub-folder) */
+  depth?: number;
+  /** Hide folder action buttons (rename/delete/new) */
+  hideActions?: boolean;
+  /** Whether folder belongs to archived section */
+  archivedBucket?: boolean;
 }
 
 const SessionFolderItemBase = <TSessionNode,>({
   folder,
   sessions,
+  subFolderItems,
   isCollapsed,
   onToggle,
   onRename,
@@ -51,6 +71,13 @@ const SessionFolderItemBase = <TSessionNode,>({
   onRenameDraftChange,
   onRenameSave,
   onRenameCancel,
+  droppableRef,
+  isDropTarget = false,
+  onNewSession,
+  onNewSubFolder,
+  depth = 0,
+  hideActions = false,
+  archivedBucket = false,
 }: SessionFolderItemProps<TSessionNode>) => {
   const [localRenaming, setLocalRenaming] = React.useState(false);
   const [localDraft, setLocalDraft] = React.useState('');
@@ -95,7 +122,7 @@ const SessionFolderItemBase = <TSessionNode,>({
     [isRenaming, onRenameDraftChange],
   );
 
-  // Auto-focus rename when externally triggered (e.g. from session menu)
+  // Auto-focus rename when externally triggered
   React.useEffect(() => {
     if (!isRenaming) return;
     const focusInput = () => {
@@ -113,14 +140,17 @@ const SessionFolderItemBase = <TSessionNode,>({
   }, [isRenaming]);
 
   const FolderIcon = isCollapsed ? RiFolderLine : RiFolderOpenLine;
+  const isSubFolder = depth > 0;
 
   return (
-    <div className="oc-folder">
-      {/* Folder header */}
+    <div className={cn('oc-folder', isSubFolder && 'ml-3')}>
+      {/* Folder header – also acts as a drop zone when droppableRef is provided */}
       <div
+        ref={droppableRef}
         className={cn(
           'group/folder flex items-center justify-between gap-1.5 py-1 min-w-0 rounded-sm',
           'hover:bg-interactive-hover/50 cursor-pointer',
+          isDropTarget && 'bg-primary/10 ring-1 ring-inset ring-primary/30',
         )}
         onClick={renaming ? undefined : onToggle}
         role={renaming ? undefined : 'button'}
@@ -138,7 +168,7 @@ const SessionFolderItemBase = <TSessionNode,>({
         aria-label={isCollapsed ? `Expand folder ${folder.name}` : `Collapse folder ${folder.name}`}
       >
         <div className="min-w-0 flex items-center gap-1.5 pl-1.5 flex-1">
-          <FolderIcon className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
+          <FolderIcon className={cn('h-3.5 w-3.5 flex-shrink-0', isDropTarget ? 'text-primary' : 'text-muted-foreground')} />
 
           {renaming ? (
             <form
@@ -188,7 +218,7 @@ const SessionFolderItemBase = <TSessionNode,>({
             </form>
           ) : (
             <div className="min-w-0 flex items-center gap-1.5 flex-1">
-              <span className="typography-ui-label font-semibold text-muted-foreground truncate">
+              <span className={cn('typography-ui-label font-semibold truncate', isDropTarget ? 'text-primary' : 'text-muted-foreground')}>
                 {folder.name}
               </span>
               <span className="typography-micro text-muted-foreground/70 flex-shrink-0">
@@ -205,7 +235,7 @@ const SessionFolderItemBase = <TSessionNode,>({
         </div>
 
         {/* Action buttons */}
-        {!renaming ? (
+        {!renaming && !hideActions ? (
           <div className="flex items-center gap-0.5 px-0.5">
             <div
               className={cn(
@@ -213,6 +243,35 @@ const SessionFolderItemBase = <TSessionNode,>({
                 mobileVariant ? 'opacity-100' : 'opacity-0 group-hover/folder:opacity-100 group-focus-within/folder:opacity-100',
               )}
             >
+              {onNewSession ? (
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onNewSession();
+                  }}
+                  className="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-interactive-hover/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+                  aria-label={`New session in ${folder.name}`}
+                  title="New session"
+                >
+                  <RiAddLine className="h-3.5 w-3.5" />
+                </button>
+              ) : null}
+              {/* Only allow sub-folders at depth 0 (one level deep max) */}
+              {onNewSubFolder && depth === 0 ? (
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onNewSubFolder();
+                  }}
+                  className="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-interactive-hover/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+                  aria-label={`New sub-folder in ${folder.name}`}
+                  title="New sub-folder"
+                >
+                  <RiFolderAddLine className="h-3.5 w-3.5" />
+                </button>
+              ) : null}
               <button
                 type="button"
                 onClick={(event) => {
@@ -243,15 +302,18 @@ const SessionFolderItemBase = <TSessionNode,>({
       {/* Folder body */}
       {!isCollapsed ? (
         <div className="pb-1 pl-2">
+          {/* Sub-folders first */}
+          {subFolderItems}
+          {/* Then sessions */}
           {sessions.length > 0 ? (
             sessions.map((node) =>
-              renderSessionNode(node, 0, groupDirectory ?? null, projectId ?? null),
+              renderSessionNode(node, 0, groupDirectory ?? null, projectId ?? null, archivedBucket),
             )
-          ) : (
+          ) : !subFolderItems ? (
             <div className="py-1 pl-1.5 text-left typography-micro text-muted-foreground/70">
               Empty folder
             </div>
-          )}
+          ) : null}
         </div>
       ) : null}
     </div>

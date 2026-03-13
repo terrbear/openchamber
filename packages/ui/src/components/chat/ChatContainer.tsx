@@ -1,5 +1,5 @@
 import React from 'react';
-import { RiArrowDownLine } from '@remixicon/react';
+import { RiArrowDownLine, RiArrowLeftLine } from '@remixicon/react';
 import { useShallow } from 'zustand/react/shallow';
 import type { Message, Part } from '@opencode-ai/sdk/v2';
 
@@ -9,16 +9,18 @@ import { useSessionStore } from '@/stores/useSessionStore';
 import { useUIStore } from '@/stores/useUIStore';
 import { Skeleton } from '@/components/ui/skeleton';
 import ChatEmptyState from './ChatEmptyState';
-import MessageList from './MessageList';
+import MessageList, { type MessageListHandle } from './MessageList';
 import { ScrollShadow } from '@/components/ui/ScrollShadow';
 import { useChatScrollManager } from '@/hooks/useChatScrollManager';
 import { useDeviceInfo } from '@/lib/device';
 import { getMemoryLimits } from '@/stores/types/sessionTypes';
 import { Button } from '@/components/ui/button';
+import { ButtonSmall } from '@/components/ui/button-small';
 import { OverlayScrollbar } from '@/components/ui/OverlayScrollbar';
 import { TimelineDialog } from './TimelineDialog';
 import type { PermissionRequest } from '@/types/permission';
 import type { QuestionRequest } from '@/types/question';
+import { cn } from '@/lib/utils';
 
 const EMPTY_MESSAGES: Array<{ info: Message; parts: Part[] }> = [];
 const EMPTY_PERMISSIONS: PermissionRequest[] = [];
@@ -76,6 +78,7 @@ export const ChatContainer: React.FC = () => {
         loadMoreMessages,
         updateViewportAnchor,
         openNewSessionDraft,
+        setCurrentSession,
         trimToViewportWindow,
         newSessionDraft,
     } = useSessionStore(
@@ -86,6 +89,7 @@ export const ChatContainer: React.FC = () => {
             loadMoreMessages: state.loadMoreMessages,
             updateViewportAnchor: state.updateViewportAnchor,
             openNewSessionDraft: state.openNewSessionDraft,
+            setCurrentSession: state.setCurrentSession,
             trimToViewportWindow: state.trimToViewportWindow,
             newSessionDraft: state.newSessionDraft,
         }))
@@ -102,6 +106,8 @@ export const ChatContainer: React.FC = () => {
     const {
         isTimelineDialogOpen,
         setTimelineDialogOpen,
+        isExpandedInput,
+        stickyUserHeader,
     } = useUIStore();
 
     const sessionMessages = useSessionStore(
@@ -110,6 +116,8 @@ export const ChatContainer: React.FC = () => {
             [currentSessionId]
         )
     );
+
+    const sessions = useSessionStore((state) => state.sessions);
 
     const blockingRequestState = useSessionStore(
         useShallow((state) => ({
@@ -164,6 +172,44 @@ export const ChatContainer: React.FC = () => {
 
     const { isMobile } = useDeviceInfo();
     const draftOpen = Boolean(newSessionDraft?.open);
+    const isDesktopExpandedInput = isExpandedInput && !isMobile;
+    const messageListRef = React.useRef<MessageListHandle | null>(null);
+
+    const parentSession = React.useMemo(() => {
+        if (!currentSessionId) {
+            return null;
+        }
+
+        const current = sessions.find((session) => session.id === currentSessionId);
+        const parentID = current?.parentID;
+        if (!parentID) {
+            return null;
+        }
+
+        return sessions.find((session) => session.id === parentID) ?? null;
+    }, [currentSessionId, sessions]);
+
+    const handleReturnToParentSession = React.useCallback(() => {
+        if (!parentSession) {
+            return;
+        }
+        void setCurrentSession(parentSession.id);
+    }, [parentSession, setCurrentSession]);
+
+    const returnToParentButton = parentSession ? (
+        <ButtonSmall
+            type="button"
+            variant="outline"
+            size="xs"
+            onClick={handleReturnToParentSession}
+            className="absolute left-3 top-3 z-20 !font-normal bg-[var(--surface-background)]/95"
+            aria-label="Return to parent session"
+            title={parentSession.title?.trim() ? `Return to: ${parentSession.title}` : 'Return to parent session'}
+        >
+            <RiArrowLeftLine className="h-4 w-4" />
+            Parent
+        </ButtonSmall>
+    ) : null;
 
     React.useEffect(() => {
         if (!currentSessionId && !draftOpen) {
@@ -174,8 +220,9 @@ export const ChatContainer: React.FC = () => {
     const [turnStart, setTurnStart] = React.useState(0);
     const turnHandleRef = React.useRef<number | null>(null);
     const turnIdleRef = React.useRef(false);
-    const TURN_INIT = 20;
-    const TURN_BATCH = 20;
+    const initializedTurnStartSessionRef = React.useRef<string | null>(null);
+    const TURN_INIT = 5;
+    const TURN_BATCH = 8;
 
     const userTurnIndexes = React.useMemo(() => {
         const indexes: number[] = [];
@@ -281,9 +328,46 @@ export const ChatContainer: React.FC = () => {
         trimToViewportWindow,
     });
 
+    React.useLayoutEffect(() => {
+        const container = scrollRef.current;
+        if (!container) {
+            return;
+        }
+
+        const updateChatScrollHeight = () => {
+            container.style.setProperty('--chat-scroll-height', `${container.clientHeight}px`);
+        };
+
+        updateChatScrollHeight();
+
+        if (typeof ResizeObserver === 'undefined') {
+            window.addEventListener('resize', updateChatScrollHeight);
+            return () => {
+                window.removeEventListener('resize', updateChatScrollHeight);
+            };
+        }
+
+        const resizeObserver = new ResizeObserver(updateChatScrollHeight);
+        resizeObserver.observe(container);
+
+        return () => {
+            resizeObserver.disconnect();
+        };
+    }, [currentSessionId, isDesktopExpandedInput, scrollRef]);
+
     React.useEffect(() => {
         cancelTurnBackfill();
         if (!currentSessionId) {
+            initializedTurnStartSessionRef.current = null;
+            setTurnStart(0);
+            return;
+        }
+
+        if (initializedTurnStartSessionRef.current === currentSessionId) {
+            return;
+        }
+
+        if (sessionMessages.length === 0) {
             setTurnStart(0);
             return;
         }
@@ -291,18 +375,25 @@ export const ChatContainer: React.FC = () => {
         const turnCount = userTurnIndexes.length;
         const start = turnCount > TURN_INIT ? turnCount - TURN_INIT : 0;
         setTurnStart(start);
-    }, [cancelTurnBackfill, currentSessionId, userTurnIndexes.length]);
+        initializedTurnStartSessionRef.current = currentSessionId;
+    }, [cancelTurnBackfill, currentSessionId, sessionMessages.length, userTurnIndexes.length]);
+
+    const isSessionActive = sessionStatusForCurrent.type === 'busy' || sessionStatusForCurrent.type === 'retry';
 
     React.useEffect(() => {
+        if (isSessionActive) {
+            cancelTurnBackfill();
+            return;
+        }
         scheduleTurnBackfill();
         return () => {
             cancelTurnBackfill();
         };
-    }, [cancelTurnBackfill, scheduleTurnBackfill, turnStart]);
+    }, [cancelTurnBackfill, isSessionActive, scheduleTurnBackfill, turnStart]);
 
     const hasMoreAbove = React.useMemo(() => {
         if (!memoryState) {
-            return false;
+            return sessionMessages.length >= getMemoryLimits().HISTORICAL_MESSAGES;
         }
         if (memoryState.historyComplete === true) {
             return false;
@@ -321,6 +412,13 @@ export const ChatContainer: React.FC = () => {
 
         return false;
     }, [memoryState, sessionMessages.length]);
+
+    const hasHistoryMetadata = React.useMemo(() => {
+        if (!memoryState) {
+            return false;
+        }
+        return memoryState.hasMoreAbove !== undefined || memoryState.historyComplete !== undefined;
+    }, [memoryState]);
     const [isLoadingOlder, setIsLoadingOlder] = React.useState(false);
     React.useEffect(() => {
         setIsLoadingOlder(false);
@@ -335,19 +433,22 @@ export const ChatContainer: React.FC = () => {
         setTurnStart(0);
 
         const container = scrollRef.current;
+        const anchor = messageListRef.current?.captureViewportAnchor() ?? null;
         const prevHeight = container?.scrollHeight ?? null;
         const prevTop = container?.scrollTop ?? null;
 
         setIsLoadingOlder(true);
-        try {
-            await loadMoreMessages(currentSessionId, 'up');
-            if (container && prevHeight !== null && prevTop !== null) {
-                const heightDiff = container.scrollHeight - prevHeight;
-                scrollToPosition(prevTop + heightDiff, { instant: true });
-            }
-        } finally {
-            setIsLoadingOlder(false);
-        }
+        void loadMoreMessages(currentSessionId, 'up')
+            .then(() => {
+                const restored = anchor ? (messageListRef.current?.restoreViewportAnchor(anchor) ?? false) : false;
+                if (!restored && container && prevHeight !== null && prevTop !== null) {
+                    const heightDiff = container.scrollHeight - prevHeight;
+                    scrollToPosition(prevTop + heightDiff, { instant: true });
+                }
+            })
+            .finally(() => {
+                setIsLoadingOlder(false);
+            });
     }, [cancelTurnBackfill, currentSessionId, isLoadingOlder, loadMoreMessages, scrollRef, scrollToPosition]);
 
     const handleRenderEarlier = React.useCallback(() => {
@@ -357,6 +458,10 @@ export const ChatContainer: React.FC = () => {
 
     // Scroll to a specific message by ID (for timeline dialog)
     const scrollToMessage = React.useCallback((messageId: string) => {
+        if (messageListRef.current?.scrollToMessageId(messageId, { behavior: 'smooth' })) {
+            return;
+        }
+
         const container = scrollRef.current;
         if (!container) return;
 
@@ -382,17 +487,14 @@ export const ChatContainer: React.FC = () => {
         }
 
         const hasSessionMessages = hasSessionMessagesEntry;
-        if (hasSessionMessages) {
+        if (hasSessionMessages && hasHistoryMetadata) {
             return;
         }
 
         const load = async () => {
-            try {
-                await loadMessages(currentSessionId);
-            } finally {
+            await loadMessages(currentSessionId).finally(() => {
                 const statusType = sessionStatusForCurrent.type ?? 'idle';
                 const isActivePhase = statusType === 'busy' || statusType === 'retry';
-                // When pinned and active, scroll is already maintained automatically
                 const shouldSkipScroll = isActivePhase && isPinned;
 
                 if (!shouldSkipScroll) {
@@ -404,11 +506,11 @@ export const ChatContainer: React.FC = () => {
                         });
                     }
                 }
-            }
+            });
         };
 
         void load();
-    }, [currentSessionId, hasSessionMessagesEntry, isPinned, loadMessages, scrollToBottom, sessionMessages.length, sessionStatusForCurrent.type]);
+    }, [currentSessionId, hasHistoryMetadata, hasSessionMessagesEntry, isPinned, loadMessages, scrollToBottom, sessionMessages.length, sessionStatusForCurrent.type]);
 
     if (!currentSessionId && !draftOpen) {
         return (
@@ -424,14 +526,22 @@ export const ChatContainer: React.FC = () => {
     if (!currentSessionId && draftOpen) {
         return (
             <div
-                className="flex flex-col h-full bg-background transform-gpu"
+                className="relative flex flex-col h-full bg-background transform-gpu"
                 style={isMobile ? { paddingBottom: 'var(--oc-keyboard-inset, 0px)' } : undefined}
             >
+                {!isDesktopExpandedInput ? (
                 <div className="flex-1 flex items-center justify-center">
                     <ChatEmptyState showDraftContext />
                 </div>
-                <div className="relative bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 z-10">
-                    {currentSessionId && <PausedSessionBanner sessionId={currentSessionId} />}
+                ) : null}
+                <div
+                    className={cn(
+                        'relative z-10',
+                        isDesktopExpandedInput
+                            ? 'flex-1 min-h-0 bg-background'
+                            : 'bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80'
+                    )}
+                >
                     <ChatInput scrollToBottom={scrollToBottom} />
                 </div>
             </div>
@@ -447,9 +557,10 @@ export const ChatContainer: React.FC = () => {
         if (!hasMessagesEntry) {
             return (
                 <div
-                    className="flex flex-col h-full bg-background gap-0"
+                    className="relative flex flex-col h-full bg-background gap-0"
                     style={isMobile ? { paddingBottom: 'var(--oc-keyboard-inset, 0px)' } : undefined}
                 >
+                    {returnToParentButton}
                     <div className="flex-1 overflow-y-auto p-4 bg-background">
                         <div className="chat-message-column space-y-4">
                             {[1, 2, 3].map((i) => (
@@ -473,14 +584,23 @@ export const ChatContainer: React.FC = () => {
     if (sessionMessages.length === 0 && !streamingMessageId) {
         return (
             <div
-                className="flex flex-col h-full bg-background transform-gpu"
+                className="relative flex flex-col h-full bg-background transform-gpu"
                 style={isMobile ? { paddingBottom: 'var(--oc-keyboard-inset, 0px)' } : undefined}
             >
+                {returnToParentButton}
+                {!isDesktopExpandedInput ? (
                 <div className="flex-1 flex items-center justify-center">
                     <ChatEmptyState />
                 </div>
-                <div className="relative bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 z-10">
-                    {currentSessionId && <PausedSessionBanner sessionId={currentSessionId} />}
+                ) : null}
+                <div
+                    className={cn(
+                        'relative z-10',
+                        isDesktopExpandedInput
+                            ? 'flex-1 min-h-0 bg-background'
+                            : 'bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80'
+                    )}
+                >
                     <ChatInput scrollToBottom={scrollToBottom} />
                 </div>
             </div>
@@ -489,21 +609,31 @@ export const ChatContainer: React.FC = () => {
 
     return (
         <div
-            className="flex flex-col h-full bg-background"
+            className="relative flex flex-col h-full bg-background"
             style={isMobile ? { paddingBottom: 'var(--oc-keyboard-inset, 0px)' } : undefined}
         >
-            <div className="relative flex-1 min-h-0">
-
+            {returnToParentButton}
+            <div
+                className={cn(
+                    'relative min-h-0',
+                    isDesktopExpandedInput
+                        ? 'absolute inset-0 opacity-0 pointer-events-none'
+                        : 'flex-1'
+                )}
+                aria-hidden={isDesktopExpandedInput}
+            >
                 <div className="absolute inset-0">
-                    <ScrollShadow
-                        className="absolute inset-0 overflow-y-auto overflow-x-hidden z-0 chat-scroll overlay-scrollbar-target"
-                        ref={scrollRef}
-                        observeMutations={false}
-                        data-scroll-shadow="true"
-                        data-scrollbar="chat"
-                    >
+                        <ScrollShadow
+                            className="absolute inset-0 overflow-y-auto overflow-x-hidden z-0 chat-scroll overlay-scrollbar-target"
+                            ref={scrollRef}
+                            observeMutations={false}
+                            hideTopShadow={isMobile && stickyUserHeader}
+                            data-scroll-shadow="true"
+                            data-scrollbar="chat"
+                        >
                         <div className="relative z-0 min-h-full">
                             <MessageList
+                                ref={messageListRef}
                                 messages={renderedSessionMessages}
                                 permissions={sessionPermissions}
                                 questions={sessionQuestions}
@@ -515,6 +645,7 @@ export const ChatContainer: React.FC = () => {
                                 hasRenderEarlier={turnStart > 0}
                                 onRenderEarlier={handleRenderEarlier}
                                 scrollToBottom={scrollToBottom}
+                                scrollRef={scrollRef}
                             />
                         </div>
                     </ScrollShadow>
@@ -522,8 +653,15 @@ export const ChatContainer: React.FC = () => {
                 </div>
             </div>
 
-            <div className="relative bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 z-10">
-                {showScrollButton && sessionMessages.length > 0 && (
+            <div
+                className={cn(
+                    'relative z-10',
+                    isDesktopExpandedInput
+                        ? 'flex-1 min-h-0 bg-background'
+                        : 'bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80'
+                )}
+            >
+                {!isDesktopExpandedInput && showScrollButton && sessionMessages.length > 0 && (
                     <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2">
                                 <Button
                                   variant="outline"

@@ -15,15 +15,18 @@ export const useKeyboardShortcuts = () => {
     toggleCommandPalette,
     toggleHelpDialog,
     toggleSidebar,
+    toggleNavRail,
     toggleRightSidebar,
     setRightSidebarOpen,
     setRightSidebarTab,
     toggleBottomTerminal,
     setBottomTerminalExpanded,
+    isMobile,
     setSessionSwitcherOpen,
     setActiveMainTab,
     setSettingsDialogOpen,
     setModelSelectorOpen,
+    toggleExpandedInput,
     shortcutOverrides,
   } = useUIStore();
   const { themeMode, setThemeMode } = useThemeSystem();
@@ -67,25 +70,20 @@ export const useKeyboardShortcuts = () => {
         return;
       }
 
-      if (eventMatchesShortcut(e, combo('new_chat')) || eventMatchesShortcut(e, combo('new_chat_worktree'))) {
+      const matchedNewSessionShortcut = eventMatchesShortcut(e, combo('new_chat'));
+      const matchedWorktreeShortcut = eventMatchesShortcut(e, combo('new_chat_worktree'));
+
+      if (matchedNewSessionShortcut || matchedWorktreeShortcut) {
         e.preventDefault();
 
-        const isVSCode = isVSCodeRuntime();
-        const autoWorktree = useConfigStore.getState().settingsAutoCreateWorktree;
-        const matchedPrimaryShortcut = eventMatchesShortcut(e, combo('new_chat'));
-        const shouldCreateWorktree = isVSCode
-          ? false
-          : (matchedPrimaryShortcut ? autoWorktree : !autoWorktree);
+        setActiveMainTab('chat');
+        setSessionSwitcherOpen(false);
 
-        if (shouldCreateWorktree) {
-          setActiveMainTab('chat');
-          setSessionSwitcherOpen(false);
+        if (!isVSCodeRuntime() && matchedWorktreeShortcut) {
           createWorktreeSession();
           return;
         }
 
-        setActiveMainTab('chat');
-        setSessionSwitcherOpen(false);
         openNewSessionDraft();
         return;
       }
@@ -133,6 +131,12 @@ export const useKeyboardShortcuts = () => {
         } else {
           toggleSidebar();
         }
+        return;
+      }
+
+      if (eventMatchesShortcut(e, combo('toggle_nav_rail'))) {
+        e.preventDefault();
+        toggleNavRail();
         return;
       }
 
@@ -286,6 +290,58 @@ export const useKeyboardShortcuts = () => {
         return;
       }
 
+      // Ctrl+] / Ctrl+[: Cycle through starred models (same gating as Shift+M)
+      if (
+        eventMatchesShortcut(e, combo('cycle_favorite_model_forward')) ||
+        eventMatchesShortcut(e, combo('cycle_favorite_model_backward'))
+      ) {
+        const {
+          isSettingsDialogOpen,
+          isCommandPaletteOpen,
+          isHelpDialogOpen,
+          isSessionSwitcherOpen,
+          isAboutDialogOpen,
+          activeMainTab,
+          favoriteModels,
+          addRecentModel,
+        } = useUIStore.getState();
+
+        if (isSettingsDialogOpen) {
+          return;
+        }
+
+        const hasOverlay = isCommandPaletteOpen || isHelpDialogOpen || isSessionSwitcherOpen || isAboutDialogOpen;
+        const isChatActive = activeMainTab === 'chat';
+
+        if (hasOverlay || !isChatActive || favoriteModels.length === 0) {
+          return;
+        }
+
+        e.preventDefault();
+
+        const { currentProviderId, currentModelId, setProvider, setModel } = useConfigStore.getState();
+        const len = favoriteModels.length;
+        const currentIdx = favoriteModels.findIndex(
+          (f) => f.providerID === currentProviderId && f.modelID === currentModelId,
+        );
+        const delta = eventMatchesShortcut(e, combo('cycle_favorite_model_forward')) ? 1 : -1;
+        const next = favoriteModels[(currentIdx + delta + len) % len];
+
+        setProvider(next.providerID);
+        setModel(next.modelID);
+        addRecentModel(next.providerID, next.modelID);
+        return;
+      }
+
+      if (eventMatchesShortcut(e, combo('expand_input'))) {
+        if (isMobile) {
+          return;
+        }
+        e.preventDefault();
+        toggleExpandedInput();
+        return;
+      }
+
       if (e.key === 'Escape') {
         const target = e.target as Element | null;
         const isInsideDialog = Boolean(target?.closest('[role="dialog"]'));
@@ -371,15 +427,18 @@ export const useKeyboardShortcuts = () => {
     toggleCommandPalette,
     toggleHelpDialog,
     toggleSidebar,
+    toggleNavRail,
     toggleRightSidebar,
     setRightSidebarOpen,
     setRightSidebarTab,
     toggleBottomTerminal,
     setBottomTerminalExpanded,
+    isMobile,
     setSessionSwitcherOpen,
     setActiveMainTab,
     setSettingsDialogOpen,
     setModelSelectorOpen,
+    toggleExpandedInput,
     setThemeMode,
     working,
     armAbortPrompt,

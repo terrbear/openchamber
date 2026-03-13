@@ -56,6 +56,9 @@ export interface SessionContextUsage {
 // Background trim is derived automatically as Math.round(limit * 0.6).
 export const DEFAULT_MESSAGE_LIMIT = 200;
 
+/** Timeout after which a session stuck in 'busy' or 'retry' with no SSE events is force-reset to idle. */
+export const STUCK_SESSION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
 export const MEMORY_CONSTANTS = {
     MAX_SESSIONS: 3,
     BACKGROUND_STREAMING_BUFFER: 120,
@@ -119,6 +122,7 @@ export type NewSessionDraftState = {
     initialPrompt?: string;
     /** Synthetic context parts to include with the initial message */
     syntheticParts?: SyntheticContextPart[];
+    targetFolderId?: string;
 };
 
 // Voice state types
@@ -143,6 +147,7 @@ export interface PausedSessionInfo {
 export interface SessionStore {
 
     sessions: Session[];
+    archivedSessions: Session[];
     sessionsByDirectory: Map<string, Session[]>;
     currentSessionId: string | null;
     lastLoadedDirectory: string | null;
@@ -221,7 +226,7 @@ export interface SessionStore {
     setSessionAgentEditMode: (sessionId: string, agentName: string | undefined, mode: EditPermissionMode, defaultMode?: EditPermissionMode) => void;
     loadSessions: () => Promise<void>;
 
-    openNewSessionDraft: (options?: { directoryOverride?: string | null; parentID?: string | null; title?: string; initialPrompt?: string; syntheticParts?: SyntheticContextPart[] }) => void;
+    openNewSessionDraft: (options?: { directoryOverride?: string | null; parentID?: string | null; title?: string; initialPrompt?: string; syntheticParts?: SyntheticContextPart[]; targetFolderId?: string }) => void;
     closeNewSessionDraft: () => void;
 
     createSession: (title?: string, directoryOverride?: string | null, parentID?: string | null) => Promise<Session | null>;
@@ -229,6 +234,8 @@ export interface SessionStore {
 
     deleteSession: (id: string, options?: { archiveWorktree?: boolean; deleteRemoteBranch?: boolean; deleteLocalBranch?: boolean; remoteName?: string }) => Promise<boolean>;
     deleteSessions: (ids: string[], options?: { archiveWorktree?: boolean; deleteRemoteBranch?: boolean; deleteLocalBranch?: boolean; remoteName?: string; silent?: boolean }) => Promise<{ deletedIds: string[]; failedIds: string[] }>;
+    archiveSession: (id: string) => Promise<boolean>;
+    archiveSessions: (ids: string[], options?: { silent?: boolean }) => Promise<{ archivedIds: string[]; failedIds: string[] }>;
     updateSessionTitle: (id: string, title: string) => Promise<void>;
     shareSession: (id: string) => Promise<Session | null>;
     unshareSession: (id: string) => Promise<Session | null>;

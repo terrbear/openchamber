@@ -452,24 +452,6 @@ const handleLocalApiRequest = async (url: URL, init?: RequestInit) => {
     return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }
 
-  if (pathname.startsWith('/api/fs/search')) {
-    const directory = url.searchParams.get('directory') || '';
-    const query = url.searchParams.get('q') || '';
-    const limitParam = url.searchParams.get('limit');
-    const limit = limitParam ? Number(limitParam) : undefined;
-    const resolvedLimit = Number.isFinite(limit) ? limit : undefined;
-    const includeHidden = url.searchParams.get('includeHidden') === 'true';
-    const respectGitignore = url.searchParams.get('respectGitignore') !== 'false';
-    const data = await sendBridgeMessage('api:fs:search', {
-      directory,
-      query,
-      limit: resolvedLimit,
-      includeHidden,
-      respectGitignore,
-    });
-    return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
-  }
-
   if (pathname.startsWith('/api/fs/mkdir')) {
     const body = init?.body ? JSON.parse(init.body as string) : {};
     const data = await sendBridgeMessage('api:fs:mkdir', { path: body.path });
@@ -483,6 +465,27 @@ const handleLocalApiRequest = async (url: URL, init?: RequestInit) => {
 
   if (pathname.startsWith('/api/vscode/pick-files')) {
     const data = await sendBridgeMessage('api:files/pick');
+    return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }
+
+  if (pathname.startsWith('/api/vscode/drop-files') && method === 'POST') {
+    const body = init?.body ? JSON.parse(init.body as string) : {};
+    const uris = Array.isArray((body as { uris?: unknown[] }).uris)
+      ? (body as { uris: unknown[] }).uris.filter((value): value is string => typeof value === 'string')
+      : [];
+    const data = await sendBridgeMessage('api:files/drop', { uris });
+    return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }
+
+  if (pathname.startsWith('/api/vscode/save-image') && method === 'POST') {
+    const body = init?.body ? JSON.parse(init.body as string) : {};
+    const fileName = typeof (body as { fileName?: unknown }).fileName === 'string'
+      ? (body as { fileName: string }).fileName
+      : undefined;
+    const dataUrl = typeof (body as { dataUrl?: unknown }).dataUrl === 'string'
+      ? (body as { dataUrl: string }).dataUrl
+      : undefined;
+    const data = await sendBridgeMessage('api:files/save-image', { fileName, dataUrl });
     return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }
 
@@ -549,6 +552,74 @@ const handleLocalApiRequest = async (url: URL, init?: RequestInit) => {
     const directory = queryDirectory || headerDirectory;
     try {
       const data = await sendBridgeMessage('api:config/commands', { method: verb, name, body, directory });
+      return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return new Response(JSON.stringify({ error: message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+  }
+
+  if (pathname === '/api/config/mcp') {
+    const verb = ((init?.method || 'GET') as string).toUpperCase();
+    const body = init?.body ? JSON.parse(init.body as string) : {};
+    const queryDirectory = url.searchParams.get('directory') || undefined;
+    const headerDirectory = (() => {
+      const headers = init?.headers;
+      if (!headers) return undefined;
+      if (headers instanceof Headers) {
+        return headers.get('x-opencode-directory') || undefined;
+      }
+      if (Array.isArray(headers)) {
+        const found = headers.find(([key]) => key.toLowerCase() === 'x-opencode-directory');
+        return found?.[1] || undefined;
+      }
+      if (typeof headers === 'object') {
+        for (const [key, value] of Object.entries(headers)) {
+          if (key.toLowerCase() === 'x-opencode-directory' && typeof value === 'string') {
+            return value;
+          }
+        }
+      }
+      return undefined;
+    })();
+    const directory = queryDirectory || headerDirectory;
+    try {
+      const data = await sendBridgeMessage('api:config/mcp', { method: verb, body, directory });
+      return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return new Response(JSON.stringify({ error: message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+  }
+
+  if (pathname.startsWith('/api/config/mcp/')) {
+    const encodedName = pathname.slice('/api/config/mcp/'.length);
+    const name = decodeURIComponent(encodedName);
+    const verb = ((init?.method || 'GET') as string).toUpperCase();
+    const body = init?.body ? JSON.parse(init.body as string) : {};
+    const queryDirectory = url.searchParams.get('directory') || undefined;
+    const headerDirectory = (() => {
+      const headers = init?.headers;
+      if (!headers) return undefined;
+      if (headers instanceof Headers) {
+        return headers.get('x-opencode-directory') || undefined;
+      }
+      if (Array.isArray(headers)) {
+        const found = headers.find(([key]) => key.toLowerCase() === 'x-opencode-directory');
+        return found?.[1] || undefined;
+      }
+      if (typeof headers === 'object') {
+        for (const [key, value] of Object.entries(headers)) {
+          if (key.toLowerCase() === 'x-opencode-directory' && typeof value === 'string') {
+            return value;
+          }
+        }
+      }
+      return undefined;
+    })();
+    const directory = queryDirectory || headerDirectory;
+    try {
+      const data = await sendBridgeMessage('api:config/mcp', { method: verb, name, body, directory });
       return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

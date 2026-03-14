@@ -772,12 +772,28 @@ function createApp(cwd) {
             }
           };
 
+          let flushTimer = null;
           claudeProc.stdout.on('data', (chunk) => {
             resetTimeout();
+            clearTimeout(flushTimer);
             stdoutBuf += chunk.toString('utf8');
             const lines = stdoutBuf.split('\n');
             stdoutBuf = lines.pop() ?? '';
             for (const line of lines) processLine(line);
+            // If there's a partial buffer remaining, flush it after a short
+            // delay.  Claude's stream-json output occasionally omits the
+            // trailing newline on the final event of a turn, leaving the
+            // `result` (or last `assistant`) line stuck in the buffer until
+            // the next write — which only happens when the user sends a new
+            // message, making it look like output was "held".
+            if (stdoutBuf.trim()) {
+              flushTimer = setTimeout(() => {
+                if (stdoutBuf.trim()) {
+                  processLine(stdoutBuf.trim());
+                  stdoutBuf = '';
+                }
+              }, 200);
+            }
           });
 
           claudeProc.stderr.on('data', (chunk) => {
@@ -788,6 +804,7 @@ function createApp(cwd) {
 
           claudeProc.on('error', (err) => {
             clearTimeout(timeoutHandle);
+            clearTimeout(flushTimer);
             if (runningProcesses.get(id) === claudeProc) {
               runningProcesses.delete(id);
             }
@@ -799,6 +816,7 @@ function createApp(cwd) {
           claudeProc.on('close', (code) => {
             console.log(`[claudecode-adapter] process closed with code=${code}, assistantText.length=${assistantText.length}`);
             clearTimeout(timeoutHandle);
+            clearTimeout(flushTimer);
             // Remove from running processes tracking
             if (runningProcesses.get(id) === claudeProc) {
               runningProcesses.delete(id);

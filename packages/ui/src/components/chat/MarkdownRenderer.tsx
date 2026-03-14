@@ -1495,6 +1495,7 @@ export const SimpleMarkdownRenderer: React.FC<{
   content,
   className,
   variant = 'assistant',
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- linkSafety is hardcoded off on Streamdown
   disableLinkSafety,
   stripFrontmatter = false,
   onShowPopup,

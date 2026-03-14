@@ -515,6 +515,7 @@ export const NotificationSettings: React.FC = () => {
     }
   };
 
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- wired up in a future PR
   const handleTestNotification = () => {
     if (!nativeNotificationsEnabled) {
       toast.error('Notifications are disabled', {

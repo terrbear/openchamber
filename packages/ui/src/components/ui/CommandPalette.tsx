@@ -12,7 +12,6 @@ import {
 import { useUIStore } from '@/stores/useUIStore';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
-import { useConfigStore } from '@/stores/useConfigStore';
 import { useProjectsStore } from '@/stores/useProjectsStore';
 import { useThemeSystem } from '@/contexts/useThemeSystem';
 import { useDeviceInfo } from '@/lib/device';
@@ -49,7 +48,6 @@ export const CommandPalette: React.FC = () => {
     getSessionsByDirectory,
   } = useSessionStore();
 
-  const settingsAutoCreateWorktree = useConfigStore((state) => state.settingsAutoCreateWorktree);
 
   const { projects, activeProjectId, setActiveProject } = useProjectsStore();
 

@@ -25,7 +25,7 @@ import { ruby } from '@codemirror/legacy-modes/mode/ruby';
 import { properties } from '@codemirror/legacy-modes/mode/properties';
 import { erlang } from '@codemirror/legacy-modes/mode/erlang';
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any -- legacy-modes may resolve to a different @codemirror/language version
+/* eslint-disable @typescript-eslint/no-explicit-any -- legacy-modes may resolve to a different @codemirror/language version */
 const shellLanguage = StreamLanguage.define(shell as any);
 const tomlLanguage = StreamLanguage.define(toml as any);
 const diffLanguage = StreamLanguage.define(diff as any);
@@ -35,6 +35,7 @@ const propertiesLanguage = StreamLanguage.define(properties as any);
 const elixirSupport = elixir();
 const elixirLanguage = elixirSupport.language;
 const erlangLanguage = StreamLanguage.define(erlang as any);
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 function codeBlockLanguageResolver(info: string): Language | LanguageDescription | null {
   const normalized = info.trim().toLowerCase();
@@ -104,6 +105,7 @@ function codeBlockLanguageResolver(info: string): Language | LanguageDescription
     case 'leex':
       return html().language;
     default:
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- codemirror type mismatch
       return LanguageDescription.matchLanguageName(languages as any, normalized, true);
   }
 }
@@ -115,6 +117,7 @@ const matchLanguageDescriptionForFile = (filePath: string): LanguageDescription 
   if (!filename) {
     return null;
   }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- codemirror type mismatch
   return LanguageDescription.matchFilename(languages as any, filename);
 };
 
@@ -183,6 +186,7 @@ export function languageByExtension(filePath: string): Extension | null {
     case 'mkd':
       return [
         markdown({
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any -- codemirror type mismatch
           codeLanguages: codeBlockLanguageResolver as any,
         }),
         markdownHighlight(),

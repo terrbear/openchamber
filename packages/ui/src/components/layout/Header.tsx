@@ -15,7 +15,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { SortableTabsStrip, type SortableTabsStripItem } from '@/components/ui/sortable-tabs-strip';
 
-import { RiArrowLeftSLine, RiChat4Line, RiCheckLine, RiCloseLine, RiCommandLine, RiFileTextLine, RiFolder6Line, RiFolderAddLine, RiGitBranchLine, RiGithubFill, RiLayoutLeftLine, RiLayoutRightLine, RiMore2Fill, RiNotification3Line, RiPencilLine, RiPlayListAddLine, RiRefreshLine, RiServerLine, RiSettings3Line, RiStackLine, RiTerminalBoxLine, RiTimerLine, type RemixiconComponentType } from '@remixicon/react';
+import { RiArrowLeftSLine, RiChat4Line, RiCheckLine, RiCloseLine, RiCommandLine, RiFileTextLine, RiFolder6Line, RiGithubFill, RiLayoutLeftLine, RiLayoutRightLine, RiNotification3Line, RiPlayListAddLine, RiRefreshLine, RiServerLine, RiSettings3Line, RiStackLine, RiTerminalBoxLine, RiTimerLine, type RemixiconComponentType } from '@remixicon/react';
 import { DiffIcon } from '@/components/icons/DiffIcon';
 import { useUIStore, type MainTab } from '@/stores/useUIStore';
 import { useConfigStore } from '@/stores/useConfigStore';
@@ -61,10 +61,6 @@ import { isDesktopShell, isVSCodeRuntime } from '@/lib/desktop';
 import { desktopHostsGet, locationMatchesHost, redactSensitiveUrl } from '@/lib/desktopHosts';
 import { NotificationCenter } from '@/components/notification/NotificationCenter';
 import { useNotificationCenterStore, getUnreadCount } from '@/stores/useNotificationCenterStore';
-import { ProjectEditDialog } from '@/components/layout/ProjectEditDialog';
-import { GridLoader } from '@/components/ui/grid-loader';
-import { PROJECT_ICON_MAP, PROJECT_COLOR_MAP } from '@/lib/projectMeta';
-import { useDiffFileCount } from '@/components/views';
 
 
 const isSameContextUsage = (
@@ -216,7 +212,6 @@ export const Header: React.FC<HeaderProps> = ({
   const homeDirectory = useDirectoryStore((state) => state.homeDirectory);
 
   const { isMobile } = useDeviceInfo();
-  const diffFileCount = useDiffFileCount();
   const githubAuthStatus = useGitHubAuthStore((state) => state.status);
   const setGitHubAuthStatus = useGitHubAuthStore((state) => state.setStatus);
   const unreadNotificationCount = useNotificationCenterStore((state) => getUnreadCount(state));

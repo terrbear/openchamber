@@ -56,3 +56,9 @@ Thumbs.db
 data/
 workspaces/
 *.pid
+
+# Local docs artifacts
+docs/felix*
+docs/prd*
+prd.json
+progress.txt

@@ -3,6 +3,7 @@ import path from 'path';
 import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import http from 'http';
+import https from 'https';
 import net from 'net';
 import { WebSocketServer } from 'ws';
 import { fileURLToPath } from 'url';
@@ -7186,7 +7187,25 @@ async function main(options = {}) {
   const serverStartedAt = new Date().toISOString();
   app.set('trust proxy', true);
   expressApp = app;
-  server = http.createServer(app);
+
+  // Use HTTPS when TLS certificates are available (e.g. from mkcert).
+  // Looks in ~/.config/openchamber/certs/ or OPENCHAMBER_TLS_CERT / OPENCHAMBER_TLS_KEY env vars.
+  const tlsCertPath = process.env.OPENCHAMBER_TLS_CERT || path.join(os.homedir(), '.config', 'openchamber', 'certs', 'cert.pem');
+  const tlsKeyPath = process.env.OPENCHAMBER_TLS_KEY || path.join(os.homedir(), '.config', 'openchamber', 'certs', 'key.pem');
+  let useTls = false;
+  try {
+    if (fs.existsSync(tlsCertPath) && fs.existsSync(tlsKeyPath)) {
+      const tlsOpts = { cert: fs.readFileSync(tlsCertPath), key: fs.readFileSync(tlsKeyPath) };
+      server = https.createServer(tlsOpts, app);
+      useTls = true;
+      console.log(`TLS enabled (cert: ${tlsCertPath})`);
+    }
+  } catch (err) {
+    console.warn(`TLS certificate found but failed to load: ${err.message}`);
+  }
+  if (!useTls) {
+    server = http.createServer(app);
+  }
 
   app.get('/health', (req, res) => {
     res.json({
@@ -14299,9 +14318,11 @@ async function main(options = {}) {
       const displayHost = (bindHost === '0.0.0.0' || bindHost === '::' || bindHost === '[::]')
         ? 'localhost'
         : (bindHost.includes(':') ? `[${bindHost}]` : bindHost);
-      console.log(`OpenChamber server listening on ${bindHost}:${activePort}`);
-      console.log(`Health check: http://${displayHost}:${activePort}/health`);
-      console.log(`Web interface: http://${displayHost}:${activePort}`);
+      const proto = useTls ? 'https' : 'http';
+      console.log(`OpenChamber server listening on ${bindHost}:${activePort}${useTls ? ' (TLS)' : ''}`);
+      console.log(`Health check: ${proto}://${displayHost}:${activePort}/health`);
+      console.log(`Web interface: ${proto}://${displayHost}:${activePort}`);
+
 
       if (startupTunnelRequest) {
         const startupModeLabel = startupTunnelRequest.mode === TUNNEL_MODE_QUICK

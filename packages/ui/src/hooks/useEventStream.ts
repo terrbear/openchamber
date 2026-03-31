@@ -11,6 +11,8 @@ import type { Part, Session, Message } from '@opencode-ai/sdk/v2';
 import type { PermissionRequest } from '@/types/permission';
 import type { QuestionRequest } from '@/types/question';
 import { useProjectsStore } from '@/stores/useProjectsStore';
+import { useNotificationBadgeStore } from '@/stores/useNotificationBadgeStore';
+import { useNotificationCenterStore } from '@/stores/useNotificationCenterStore';
 import { streamDebugEnabled } from '@/stores/utils/streamDebug';
 import { handleTodoUpdatedEvent } from '@/stores/useTodoStore';
 import { useMcpStore } from '@/stores/useMcpStore';
@@ -1112,6 +1114,23 @@ export const useEventStream = (options?: { enabled?: boolean }) => {
                       : undefined,
               }, 'sse:session.status');
               updateSessionActivityPhase(sessionId, 'busy', 'sse:session.status', { syncStatus: false });
+
+              // Add 'stuck' notification to notification center (US-002)
+              const sessions = useSessionStore.getState().sessions;
+              const session = sessions.find(s => s.id === sessionId);
+              if (session) {
+                const sessionDirectory = resolveSessionDirectoryForStatus(sessionId);
+                if (sessionDirectory) {
+                  const sessionTitle = session.title || session.slug || 'Session';
+                  useNotificationCenterStore.getState().addNotification({
+                    sessionId: sessionId,
+                    projectPath: sessionDirectory,
+                    kind: 'stuck',
+                    title: sessionTitle,
+                    body: 'Session is retrying',
+                  });
+                }
+              }
             } else {
               updateSessionStatus(sessionId, { type: 'idle' }, 'sse:session.status');
               updateSessionActivityPhase(sessionId, 'idle', 'sse:session.status', { syncStatus: false });
@@ -1154,6 +1173,23 @@ export const useEventStream = (options?: { enabled?: boolean }) => {
                 next: typeof metadata.next === 'number' ? metadata.next : undefined,
               }, 'sse:openchamber:session-status');
               updateSessionActivityPhase(sessionId, 'busy', 'sse:openchamber:session-status', { syncStatus: false });
+
+              // Add 'stuck' notification to notification center (US-002)
+              const sessions2 = useSessionStore.getState().sessions;
+              const session2 = sessions2.find(s => s.id === sessionId);
+              if (session2) {
+                const sessionDirectory = resolveSessionDirectoryForStatus(sessionId);
+                if (sessionDirectory) {
+                  const sessionTitle = session2.title || session2.slug || 'Session';
+                  useNotificationCenterStore.getState().addNotification({
+                    sessionId: sessionId,
+                    projectPath: sessionDirectory,
+                    kind: 'stuck',
+                    title: sessionTitle,
+                    body: 'Session is retrying',
+                  });
+                }
+              }
             } else {
               updateSessionStatus(sessionId, { type: 'idle' }, 'sse:openchamber:session-status');
               updateSessionActivityPhase(sessionId, 'idle', 'sse:openchamber:session-status', { syncStatus: false });
@@ -1630,7 +1666,6 @@ export const useEventStream = (options?: { enabled?: boolean }) => {
                   description: agentCandidate === 'plan'
                     ? 'Edits restricted to plan file'
                     : 'You can now edit files',
-                  duration: 5000,
                 });
               });
             }
@@ -2112,10 +2147,44 @@ export const useEventStream = (options?: { enabled?: boolean }) => {
 
       case 'openchamber:notification': {
         serverNotificationEventSeenRef.current = true;
+
+        // Badge the project rail icon for non-active projects
+        const notifProjectPath = typeof (props as { projectPath?: unknown }).projectPath === 'string'
+          ? (props as { projectPath: string }).projectPath
+          : '';
+        const notifKind = typeof (props as { kind?: unknown }).kind === 'string'
+          ? (props as { kind: string }).kind as 'ready' | 'error' | 'question' | 'permission'
+          : undefined;
+        if (notifProjectPath) {
+          const { projects, activeProjectId } = useProjectsStore.getState();
+          const activeProject = projects.find((p) => p.id === activeProjectId);
+          const normalizedActive = activeProject?.path?.replace(/\/+$/, '') ?? '';
+          const normalizedNotif = notifProjectPath.replace(/\/+$/, '');
+          if (normalizedNotif !== normalizedActive) {
+            useNotificationBadgeStore.getState().increment(normalizedNotif, notifKind);
+          }
+        }
+
         const title = typeof (props as { title?: unknown }).title === 'string' ? (props as { title: string }).title : '';
         const body = typeof (props as { body?: unknown }).body === 'string' ? (props as { body: string }).body : '';
         const tag = typeof (props as { tag?: unknown }).tag === 'string' ? (props as { tag: string }).tag : undefined;
         const requireHidden = Boolean((props as { requireHidden?: unknown }).requireHidden);
+
+        // Add to notification center (US-002)
+        const sessionID = typeof (props as { sessionID?: unknown }).sessionID === 'string' ? (props as { sessionID: string }).sessionID : '';
+        if (title && body && notifProjectPath && sessionID && notifKind) {
+          // Map 'ready' -> 'completed', 'error' -> 'error' for notification center
+          const centerKind = notifKind === 'ready' ? 'completed' : notifKind === 'error' ? 'error' : null;
+          if (centerKind) {
+            useNotificationCenterStore.getState().addNotification({
+              sessionId: sessionID,
+              projectPath: notifProjectPath,
+              kind: centerKind,
+              title,
+              body,
+            });
+          }
+        }
 
         // When the sidecar stdout notification channel is active (production desktop builds),
         // skip this SSE notification to avoid duplicating the native notification already
@@ -2165,6 +2234,7 @@ export const useEventStream = (options?: { enabled?: boolean }) => {
     bootstrapState,
     effectiveDirectory,
     updateSessionStatus,
+    resolveSessionDirectoryForStatus,
     updateSessionActivityPhase,
     repairSessionDerivedState,
     dispatchRuntimeNotification,

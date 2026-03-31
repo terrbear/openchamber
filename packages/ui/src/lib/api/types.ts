@@ -143,6 +143,8 @@ export interface GitFileDiffResponse {
   original: string;
   modified: string;
   path: string;
+  /** When true, original/modified were truncated server-side because the file exceeded the size limit. */
+  truncated?: boolean;
   isBinary?: boolean;
 }
 
@@ -499,6 +501,13 @@ export interface FilesAPI {
   execCommands?(commands: string[], cwd: string): Promise<{ success: boolean; results: CommandExecResult[] }>;
 }
 
+export interface Connection {
+  id: string;
+  label: string;
+  baseUrl: string;
+  type: 'local' | 'remote';
+}
+
 export interface ProjectEntry {
   id: string;
   path: string;
@@ -514,6 +523,8 @@ export interface ProjectEntry {
   addedAt?: number;
   lastOpenedAt?: number;
   sidebarCollapsed?: boolean;
+  group?: string;
+  connectionId?: string;
 }
 
 export interface SettingsPayload {
@@ -527,6 +538,8 @@ export interface SettingsPayload {
   opencodeBinary?: string;
   projects?: ProjectEntry[];
   activeProjectId?: string;
+  connections?: Connection[];
+  activeConnectionId?: string;
   approvedDirectories?: string[];
   securityScopedBookmarks?: string[];
   pinnedDirectories?: string[];

@@ -9,6 +9,8 @@ import { GitHubSettings } from './GitHubSettings';
 import { VoiceSettings } from './VoiceSettings';
 import { TunnelSettings } from './TunnelSettings';
 import { OpenCodeCliSettings } from './OpenCodeCliSettings';
+import { ConnectionsSettings } from './ConnectionsSettings';
+import { ProjectTodos } from './ProjectTodos';
 import { KeyboardShortcutsSettings } from './KeyboardShortcutsSettings';
 import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
 import { useDeviceInfo } from '@/lib/device';
@@ -65,6 +67,10 @@ export const OpenChamberPage: React.FC<OpenChamberPageProps> = ({ section }) => 
                 return <ChatSectionContent />;
             case 'sessions':
                 return <SessionsSectionContent />;
+            case 'connections':
+                return <ConnectionsSectionContent />;
+            case 'todos':
+                return <TodosSectionContent />;
             case 'shortcuts':
                 return <ShortcutsSectionContent />;
             case 'git':
@@ -165,6 +171,16 @@ const VoiceSectionContent: React.FC = () => {
         return null;
     }
     return <VoiceSettings />;
+};
+
+// Connections section: Manage local and remote OpenCode endpoints
+const ConnectionsSectionContent: React.FC = () => {
+    return <ConnectionsSettings />;
+};
+
+// Todos section: Per-project todo list
+const TodosSectionContent: React.FC = () => {
+    return <ProjectTodos />;
 };
 
 const TunnelSectionContent: React.FC = () => {

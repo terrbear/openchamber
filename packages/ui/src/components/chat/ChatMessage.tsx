@@ -1082,6 +1082,7 @@ const ChatMessage: React.FC<ChatMessageProps> = ({
                                     modelName={headerModelName}
                                     variant={headerVariant}
                                     isDarkTheme={isDarkTheme}
+                                    createdAt={messageCreatedAt ?? undefined}
                                 />
                             )}
 

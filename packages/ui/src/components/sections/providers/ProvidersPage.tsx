@@ -164,6 +164,8 @@ export const ProvidersPage: React.FC = () => {
   const [providerDropdownOpen, setProviderDropdownOpen] = React.useState(false);
   const [providerSources, setProviderSources] = React.useState<Record<string, ProviderSources>>({});
   const [showAuthPanel, setShowAuthPanel] = React.useState(false);
+  const [claudeCodePermissionMode, setClaudeCodePermissionMode] = React.useState<string>('acceptEdits');
+  const [claudeCodePermissionLoading, setClaudeCodePermissionLoading] = React.useState(false);
 
   React.useEffect(() => {
     if (!selectedProviderId && providers.length > 0) {
@@ -320,8 +322,50 @@ export const ProvidersPage: React.FC = () => {
     };
   }, [selectedProviderId]);
 
+  // Load Claude Code permission mode when its provider is selected
+  React.useEffect(() => {
+    if (selectedProviderId !== 'claudecode') return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response = await fetch('/api/config/settings', {
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+        });
+        if (!response.ok) return;
+        const data = await response.json();
+        if (!cancelled && typeof data.claudeCodePermissionMode === 'string') {
+          setClaudeCodePermissionMode(data.claudeCodePermissionMode);
+        }
+      } catch {
+        // ignore
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [selectedProviderId]);
+
   const selectedProvider = providers.find((provider) => provider.id === selectedProviderId);
   const selectedSources = selectedProviderId ? providerSources[selectedProviderId] : undefined;
+
+  const handlePermissionModeChange = async (mode: string) => {
+    setClaudeCodePermissionMode(mode);
+    setClaudeCodePermissionLoading(true);
+    try {
+      const response = await fetch('/api/config/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ claudeCodePermissionMode: mode }),
+      });
+      if (!response.ok) {
+        throw new Error('Failed to save permission mode');
+      }
+      toast.success('Permission mode updated');
+    } catch {
+      toast.error('Failed to save permission mode');
+    } finally {
+      setClaudeCodePermissionLoading(false);
+    }
+  };
 
   const handleSaveApiKey = async (providerId: string) => {
     const apiKey = apiKeyInputs[providerId]?.trim() ?? '';
@@ -778,6 +822,7 @@ export const ProvidersPage: React.FC = () => {
     );
   }
 
+  const isClaudeCode = selectedProvider.id === 'claudecode';
   const providerModels = Array.isArray(selectedProvider.models) ? selectedProvider.models : [];
   const providerAuthMethods = authMethodsByProvider[selectedProvider.id] ?? [];
   const oauthAuthMethods = providerAuthMethods.filter((method) => normalizeAuthType(method) === 'oauth');
@@ -807,188 +852,269 @@ export const ProvidersPage: React.FC = () => {
           </div>
         </div>
 
-        {/* Authentication */}
-        <div className="mb-8">
-          <div className="mb-1 px-1 flex items-center justify-between gap-2">
-            <h3 className="typography-ui-header font-medium text-foreground">Authentication</h3>
-            <Button
-              variant="outline"
-              size="xs"
-              className="!font-normal"
-              onClick={() => setShowAuthPanel((prev) => !prev)}
-            >
-              {showAuthPanel ? 'Hide' : 'Reconnect'}
-            </Button>
-          </div>
-
-          <section className="px-2 pb-2 pt-0">
-            {!showAuthPanel ? (
+        {/* Status / Authentication */}
+        {isClaudeCode ? (
+          <>
+          <div className="mb-8">
+            <div className="mb-1 px-1">
+              <h3 className="typography-ui-header font-medium text-foreground">Status</h3>
+            </div>
+            <section className="px-2 pb-2 pt-0">
               <div className="flex items-center gap-1.5 py-1.5">
                 <RiCheckLine className="w-4 h-4 text-[var(--status-success)] shrink-0" />
-                <span className="typography-ui-label text-foreground">Connected</span>
-                <span className="typography-meta text-muted-foreground ml-1">· Use Reconnect to update credentials</span>
+                <span className="typography-ui-label text-foreground">Available</span>
+                <span className="typography-meta text-muted-foreground ml-1">· Claude Code CLI detected</span>
               </div>
-            ) : authLoading ? (
-              <div className="py-1.5 typography-meta text-muted-foreground">Loading authentication methods...</div>
-            ) : (
-              <div className="space-y-4">
-                <div className="py-1.5">
-                  <label className="typography-ui-label text-foreground flex items-center gap-1.5">
-                    API Key
-                    <Tooltip delayDuration={1000}>
-                      <TooltipTrigger asChild>
-                        <RiInformationLine className="h-3.5 w-3.5 text-muted-foreground/60 cursor-help" />
-                      </TooltipTrigger>
-                      <TooltipContent sideOffset={8} className="max-w-xs">
-                        Keys are sent directly to OpenCode and never stored by OpenChamber.
-                      </TooltipContent>
-                    </Tooltip>
-                  </label>
-                  <div className="flex flex-col sm:flex-row sm:items-center gap-2 mt-1.5">
-                    <Input
-                      type="password"
-                      value={apiKeyInputs[selectedProvider.id] ?? ''}
-                      onChange={(event) =>
-                        setApiKeyInputs((prev) => ({
-                          ...prev,
-                          [selectedProvider.id]: event.target.value,
-                        }))
-                      }
-                      placeholder="sk-..."
-                      className="flex-1 font-mono text-xs"
-                    />
-                    <Button
-                      size="xs"
-                      className="!font-normal shrink-0"
-                      onClick={() => handleSaveApiKey(selectedProvider.id)}
-                      disabled={authBusyKey === `api:${selectedProvider.id}`}
-                    >
-                      {authBusyKey === `api:${selectedProvider.id}` ? 'Saving...' : 'Save Key'}
-                    </Button>
+              <p className="typography-meta text-muted-foreground mt-1">
+                Claude Code uses its own authentication. No API key configuration is needed.
+              </p>
+            </section>
+          </div>
+
+          {/* Permission Mode */}
+          <div className="mb-8">
+            <div className="mb-1 px-1">
+              <h3 className="typography-ui-header font-medium text-foreground">Permission Mode</h3>
+            </div>
+            <section className="px-2 pb-2 pt-0">
+              <p className="typography-meta text-muted-foreground mb-2">
+                Controls how much autonomy Claude Code has when executing tools. Changes apply to new subprocess spawns.
+              </p>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    className={cn(
+                      'flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 typography-ui-label',
+                      'border-border bg-background text-foreground hover:bg-muted/50',
+                      'focus:outline-none focus:ring-1 focus:ring-ring',
+                      claudeCodePermissionLoading && 'opacity-50 pointer-events-none'
+                    )}
+                    disabled={claudeCodePermissionLoading}
+                  >
+                    <span>
+                      {claudeCodePermissionMode === 'default' && 'Default'}
+                      {claudeCodePermissionMode === 'acceptEdits' && 'Accept Edits'}
+                      {claudeCodePermissionMode === 'bypassPermissions' && 'Bypass Permissions'}
+                    </span>
+                    <RiArrowDownSLine className="h-3.5 w-3.5 text-muted-foreground" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="min-w-[200px]">
+                  <DropdownMenuItem
+                    onSelect={() => handlePermissionModeChange('default')}
+                  >
+                    <div className="flex items-center gap-2">
+                      {claudeCodePermissionMode === 'default' && <RiCheckLine className="h-3.5 w-3.5" />}
+                      <span className={claudeCodePermissionMode !== 'default' ? 'ml-5.5' : ''}>Default</span>
+                    </div>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => handlePermissionModeChange('acceptEdits')}
+                  >
+                    <div className="flex items-center gap-2">
+                      {claudeCodePermissionMode === 'acceptEdits' && <RiCheckLine className="h-3.5 w-3.5" />}
+                      <span className={claudeCodePermissionMode !== 'acceptEdits' ? 'ml-5.5' : ''}>Accept Edits</span>
+                    </div>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => handlePermissionModeChange('bypassPermissions')}
+                  >
+                    <div className="flex items-center gap-2">
+                      {claudeCodePermissionMode === 'bypassPermissions' && <RiCheckLine className="h-3.5 w-3.5" />}
+                      <span className={claudeCodePermissionMode !== 'bypassPermissions' ? 'ml-5.5' : ''}>Bypass Permissions</span>
+                    </div>
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </section>
+          </div>
+          </>
+        ) : (
+          <>
+            {/* Authentication */}
+            <div className="mb-8">
+              <div className="mb-1 px-1 flex items-center justify-between gap-2">
+                <h3 className="typography-ui-header font-medium text-foreground">Authentication</h3>
+                <ButtonSmall
+                  variant="outline"
+                  size="xs"
+                  className="!font-normal"
+                  onClick={() => setShowAuthPanel((prev) => !prev)}
+                >
+                  {showAuthPanel ? 'Hide' : 'Reconnect'}
+                </ButtonSmall>
+              </div>
+
+              <section className="px-2 pb-2 pt-0">
+                {!showAuthPanel ? (
+                  <div className="flex items-center gap-1.5 py-1.5">
+                    <RiCheckLine className="w-4 h-4 text-[var(--status-success)] shrink-0" />
+                    <span className="typography-ui-label text-foreground">Connected</span>
+                    <span className="typography-meta text-muted-foreground ml-1">· Use Reconnect to update credentials</span>
                   </div>
-                </div>
+                ) : authLoading ? (
+                  <div className="py-1.5 typography-meta text-muted-foreground">Loading authentication methods...</div>
+                ) : (
+                  <div className="space-y-4">
+                    <div className="py-1.5">
+                      <label className="typography-ui-label text-foreground flex items-center gap-1.5">
+                        API Key
+                        <Tooltip delayDuration={1000}>
+                          <TooltipTrigger asChild>
+                            <RiInformationLine className="h-3.5 w-3.5 text-muted-foreground/60 cursor-help" />
+                          </TooltipTrigger>
+                          <TooltipContent sideOffset={8} className="max-w-xs">
+                            Keys are sent directly to OpenCode and never stored by OpenChamber.
+                          </TooltipContent>
+                        </Tooltip>
+                      </label>
+                      <div className="flex flex-col sm:flex-row sm:items-center gap-2 mt-1.5">
+                        <Input
+                          type="password"
+                          value={apiKeyInputs[selectedProvider.id] ?? ''}
+                          onChange={(event) =>
+                            setApiKeyInputs((prev) => ({
+                              ...prev,
+                              [selectedProvider.id]: event.target.value,
+                            }))
+                          }
+                          placeholder="sk-..."
+                          className="flex-1 font-mono text-xs"
+                        />
+                        <ButtonSmall
+                          size="xs"
+                          className="!font-normal shrink-0"
+                          onClick={() => handleSaveApiKey(selectedProvider.id)}
+                          disabled={authBusyKey === `api:${selectedProvider.id}`}
+                        >
+                          {authBusyKey === `api:${selectedProvider.id}` ? 'Saving...' : 'Save Key'}
+                        </ButtonSmall>
+                      </div>
+                    </div>
 
-                {oauthAuthMethods.length > 0 && (
-                  <div className="space-y-4 border-t border-[var(--surface-subtle)] pt-2">
-                    {oauthAuthMethods.map((method, index) => {
-                      const methodLabel = method.label || method.name || `OAuth method ${index + 1}`;
-                      const codeKey = `${selectedProvider.id}:${index}`;
-                      const isPending =
-                        pendingOAuth?.providerId === selectedProvider.id && pendingOAuth?.methodIndex === index;
+                    {oauthAuthMethods.length > 0 && (
+                      <div className="space-y-4 border-t border-[var(--surface-subtle)] pt-2">
+                        {oauthAuthMethods.map((method, index) => {
+                          const methodLabel = method.label || method.name || `OAuth method ${index + 1}`;
+                          const codeKey = `${selectedProvider.id}:${index}`;
+                          const isPending =
+                            pendingOAuth?.providerId === selectedProvider.id && pendingOAuth?.methodIndex === index;
 
-                      return (
-                        <div key={`${selectedProvider.id}-${methodLabel}`} className="space-y-3">
-                          <div className="flex items-center justify-between gap-2">
-                            <div>
-                              <div className="typography-ui-label text-foreground">{methodLabel}</div>
-                              {(method.description || method.help) && (
-                                <div className="typography-meta text-muted-foreground">
-                                  {String(method.description || method.help)}
+                          return (
+                            <div key={`${selectedProvider.id}-${methodLabel}`} className="space-y-3">
+                              <div className="flex items-center justify-between gap-2">
+                                <div>
+                                  <div className="typography-ui-label text-foreground">{methodLabel}</div>
+                                  {(method.description || method.help) && (
+                                    <div className="typography-meta text-muted-foreground">
+                                      {String(method.description || method.help)}
+                                    </div>
+                                  )}
+                                </div>
+                                <ButtonSmall
+                                  variant="outline"
+                                  size="xs"
+                                  className="!font-normal"
+                                  onClick={() => handleOAuthStart(selectedProvider.id, index)}
+                                  disabled={authBusyKey === `oauth:${selectedProvider.id}:${index}`}
+                                >
+                                  Connect
+                                </ButtonSmall>
+                              </div>
+
+                              {oauthDetails[codeKey]?.instructions && (
+                                <p className="typography-meta text-[var(--primary-base)] bg-[var(--primary-base)]/10 px-2 py-1.5 rounded">
+                                  {oauthDetails[codeKey]?.instructions}
+                                </p>
+                              )}
+
+                              {oauthDetails[codeKey]?.userCode && (
+                                <div className="flex items-center gap-2 mt-2">
+                                  <Input value={oauthDetails[codeKey]?.userCode} readOnly className="font-mono text-center tracking-widest" />
+                                  <ButtonSmall variant="outline" size="xs" className="!font-normal" onClick={() => handleCopyOAuthCode(oauthDetails[codeKey]?.userCode ?? '')}>Copy Code</ButtonSmall>
+                                </div>
+                              )}
+
+                              {oauthDetails[codeKey]?.url && (
+                                <div className="flex items-center gap-2 mt-2">
+                                  <Input value={oauthDetails[codeKey]?.url} readOnly className="text-xs text-muted-foreground" />
+                                  <div className="flex gap-1 shrink-0">
+                                    <ButtonSmall variant="outline" size="xs" className="!font-normal" onClick={() => window.open(oauthDetails[codeKey]?.url, '_blank', 'noopener,noreferrer')}>Open</ButtonSmall>
+                                    <ButtonSmall variant="outline" size="xs" className="!font-normal" onClick={() => handleCopyOAuthLink(oauthDetails[codeKey]?.url ?? '')}>Copy</ButtonSmall>
+                                  </div>
+                                </div>
+                              )}
+
+                              {isPending && (
+                                <div className="flex items-center gap-2 mt-2">
+                                  <Input
+                                    value={oauthCodes[codeKey] ?? ''}
+                                    onChange={(event) =>
+                                      setOauthCodes((prev) => ({
+                                        ...prev,
+                                        [codeKey]: event.target.value,
+                                      }))
+                                    }
+                                    placeholder="Paste authorization code"
+                                    className="font-mono text-xs"
+                                  />
+                                  <ButtonSmall
+                                    size="xs"
+                                    className="!font-normal"
+                                    onClick={() => handleOAuthComplete(selectedProvider.id, index)}
+                                    disabled={authBusyKey === `oauth-complete:${selectedProvider.id}:${index}`}
+                                  >
+                                    {authBusyKey === `oauth-complete:${selectedProvider.id}:${index}` ? 'Saving...' : 'Complete'}
+                                  </ButtonSmall>
                                 </div>
                               )}
                             </div>
-                            <Button
-                              variant="outline"
-                              size="xs"
-                              className="!font-normal"
-                              onClick={() => handleOAuthStart(selectedProvider.id, index)}
-                              disabled={authBusyKey === `oauth:${selectedProvider.id}:${index}`}
-                            >
-                              Connect
-                            </Button>
-                          </div>
-
-                          {oauthDetails[codeKey]?.instructions && (
-                            <p className="typography-meta text-[var(--primary-base)] bg-[var(--primary-base)]/10 px-2 py-1.5 rounded">
-                              {oauthDetails[codeKey]?.instructions}
-                            </p>
-                          )}
-
-                          {oauthDetails[codeKey]?.userCode && (
-                            <div className="flex items-center gap-2 mt-2">
-                              <Input value={oauthDetails[codeKey]?.userCode} readOnly className="font-mono text-center tracking-widest" />
-                              <Button variant="outline" size="xs" className="!font-normal" onClick={() => handleCopyOAuthCode(oauthDetails[codeKey]?.userCode ?? '')}>Copy Code</Button>
-                            </div>
-                          )}
-
-                          {oauthDetails[codeKey]?.url && (
-                            <div className="flex items-center gap-2 mt-2">
-                              <Input value={oauthDetails[codeKey]?.url} readOnly className="text-xs text-muted-foreground" />
-                              <div className="flex gap-1 shrink-0">
-                                <Button variant="outline" size="xs" className="!font-normal" onClick={() => openExternalUrl(oauthDetails[codeKey]?.url ?? '')}>Open</Button>
-                                <Button variant="outline" size="xs" className="!font-normal" onClick={() => handleCopyOAuthLink(oauthDetails[codeKey]?.url ?? '')}>Copy</Button>
-                              </div>
-                            </div>
-                          )}
-
-                          {isPending && (
-                            <div className="flex items-center gap-2 mt-2">
-                              <Input
-                                value={oauthCodes[codeKey] ?? ''}
-                                onChange={(event) =>
-                                  setOauthCodes((prev) => ({
-                                    ...prev,
-                                    [codeKey]: event.target.value,
-                                  }))
-                                }
-                                placeholder="Paste authorization code"
-                                className="font-mono text-xs"
-                              />
-                              <Button
-                                size="xs"
-                                className="!font-normal"
-                                onClick={() => handleOAuthComplete(selectedProvider.id, index)}
-                                disabled={authBusyKey === `oauth-complete:${selectedProvider.id}:${index}`}
-                              >
-                                {authBusyKey === `oauth-complete:${selectedProvider.id}:${index}` ? 'Saving...' : 'Complete'}
-                              </Button>
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
                 )}
-              </div>
-            )}
-          </section>
-        </div>
-
-        {/* Connection Details */}
-        <div className="mb-8">
-          <div className="mb-1 px-1">
-            <h3 className="typography-ui-header font-medium text-foreground">Connection Details</h3>
-          </div>
-
-          <section className="px-2 pb-2 pt-0">
-            <div className="flex flex-col gap-2 py-1.5 sm:flex-row sm:items-center sm:justify-between sm:gap-8">
-              <div className="flex min-w-0 flex-col">
-                {selectedSources && (selectedSources.auth.exists || selectedSources.user.exists || selectedSources.project.exists || selectedSources.custom?.exists) ? (
-                  <span className="typography-meta text-muted-foreground">
-                    Configured in: {[
-                      selectedSources.auth.exists ? 'auth credentials' : null,
-                      selectedSources.user.exists ? 'user config' : null,
-                      selectedSources.project.exists ? 'project config' : null,
-                      selectedSources.custom?.exists ? 'custom config' : null,
-                    ].filter(Boolean).join(', ')}
-                  </span>
-                ) : (
-                  <span className="typography-meta text-muted-foreground">No active configuration source</span>
-                )}
-              </div>
-
-              <Button
-                variant="ghost"
-                size="xs"
-                className="!font-normal text-[var(--status-error)] hover:text-[var(--status-error)]"
-                onClick={() => handleDisconnectProvider(selectedProvider.id)}
-                disabled={authBusyKey === `disconnect:${selectedProvider.id}`}
-              >
-                {authBusyKey === `disconnect:${selectedProvider.id}` ? 'Disconnecting...' : 'Disconnect'}
-              </Button>
+              </section>
             </div>
-          </section>
-        </div>
+
+            {/* Connection Details */}
+            <div className="mb-8">
+              <div className="mb-1 px-1">
+                <h3 className="typography-ui-header font-medium text-foreground">Connection Details</h3>
+              </div>
+
+              <section className="px-2 pb-2 pt-0">
+                <div className="flex flex-col gap-2 py-1.5 sm:flex-row sm:items-center sm:justify-between sm:gap-8">
+                  <div className="flex min-w-0 flex-col">
+                    {selectedSources && (selectedSources.auth.exists || selectedSources.user.exists || selectedSources.project.exists || selectedSources.custom?.exists) ? (
+                      <span className="typography-meta text-muted-foreground">
+                        Configured in: {[
+                          selectedSources.auth.exists ? 'auth credentials' : null,
+                          selectedSources.user.exists ? 'user config' : null,
+                          selectedSources.project.exists ? 'project config' : null,
+                          selectedSources.custom?.exists ? 'custom config' : null,
+                        ].filter(Boolean).join(', ')}
+                      </span>
+                    ) : (
+                      <span className="typography-meta text-muted-foreground">No active configuration source</span>
+                    )}
+                  </div>
+
+                  <ButtonSmall
+                    variant="ghost"
+                    size="xs"
+                    className="!font-normal text-[var(--status-error)] hover:text-[var(--status-error)]"
+                    onClick={() => handleDisconnectProvider(selectedProvider.id)}
+                    disabled={authBusyKey === `disconnect:${selectedProvider.id}`}
+                  >
+                    {authBusyKey === `disconnect:${selectedProvider.id}` ? 'Disconnecting...' : 'Disconnect'}
+                  </ButtonSmall>
+                </div>
+              </section>
+            </div>
+          </>
+        )}
 
         {/* Models */}
         <div className="mb-8">

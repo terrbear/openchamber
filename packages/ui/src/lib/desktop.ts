@@ -1,4 +1,5 @@
-import type { ProjectEntry } from '@/lib/api/types';
+import type { ProjectEntry, Connection } from '@/lib/api/types';
+import type { ProjectTodoItem } from '@/stores/useProjectTodosStore';
 
 export type AssistantNotificationPayload = {
   title?: string;
@@ -52,6 +53,8 @@ export type DesktopSettings = {
   opencodeBinary?: string;
   projects?: ProjectEntry[];
   activeProjectId?: string;
+  connections?: Connection[];
+  activeConnectionId?: string;
   approvedDirectories?: string[];
   securityScopedBookmarks?: string[];
   pinnedDirectories?: string[];
@@ -146,6 +149,12 @@ export type DesktopSettings = {
   skillCatalogs?: SkillCatalogConfig[];
   // Opt-in to send anonymous usage reports for update checks (default: true)
   reportUsage?: boolean;
+
+  // Per-project todo items (separate from per-session AI todos)
+  projectTodos?: Record<string, ProjectTodoItem[]>;
+
+  // Per-project scratch pad text
+  scratchPads?: Record<string, string>;
 };
 
 type TauriGlobal = {

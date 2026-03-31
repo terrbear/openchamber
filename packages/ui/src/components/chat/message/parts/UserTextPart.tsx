@@ -24,7 +24,7 @@ const normalizeUserMessageRenderingMode = (mode: unknown): 'markdown' | 'plain' 
 };
 
 const UserTextPart: React.FC<UserTextPartProps> = ({ part, messageId, agentMention }) => {
-    const CLAMP_LINES = 2;
+    const CLAMP_LINES = 5;
     const partWithText = part as PartWithText;
     const rawText = partWithText.text;
     const textContent = typeof rawText === 'string' ? rawText : partWithText.content || partWithText.value || '';
@@ -102,7 +102,7 @@ const UserTextPart: React.FC<UserTextPartProps> = ({ part, messageId, agentMenti
         if (!agentMention?.token || !textContent.includes(agentMention.token)) {
             return textContent;
         }
-        
+
         const mentionHtml = `<a href="${buildMentionUrl(agentMention.name)}" class="text-primary hover:underline" target="_blank" rel="noopener noreferrer">${agentMention.token}</a>`;
         return textContent.replace(agentMention.token, mentionHtml);
     }, [agentMention, textContent]);
@@ -142,7 +142,7 @@ const UserTextPart: React.FC<UserTextPartProps> = ({ part, messageId, agentMenti
                 className={cn(
                     "break-words font-sans typography-markdown",
                     normalizedRenderingMode === 'plain' && 'whitespace-pre-wrap',
-                    !isExpanded && "line-clamp-2",
+                    !isExpanded && "line-clamp-5",
                     isTruncated && !isExpanded && "cursor-pointer"
                 )}
                 ref={textRef}

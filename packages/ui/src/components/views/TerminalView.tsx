@@ -16,6 +16,8 @@ import { Button } from '@/components/ui/button';
 import { useDeviceInfo } from '@/lib/device';
 import { useRuntimeAPIs } from '@/hooks/useRuntimeAPIs';
 import { primeTerminalInputTransport } from '@/lib/terminalApi';
+import { useConnectionsStore } from '@/stores/useConnectionsStore';
+import { getRemoteTerminalAPI } from '@/lib/remoteTerminalApi';
 
 type Modifier = 'ctrl' | 'cmd';
 type MobileKey =
@@ -82,6 +84,14 @@ const getSequenceForKey = (key: MobileKey, modifier: Modifier | null): string | 
 
 export const TerminalView: React.FC = () => {
     const { terminal, runtime } = useRuntimeAPIs();
+    const activeConnectionId = useConnectionsStore((state) => state.activeConnectionId);
+    const isRemoteConnection = activeConnectionId !== 'local';
+    const terminalApi = React.useMemo(() => {
+        if (isRemoteConnection) {
+            return getRemoteTerminalAPI(activeConnectionId) ?? terminal;
+        }
+        return terminal;
+    }, [isRemoteConnection, activeConnectionId, terminal]);
     const { currentTheme } = useThemeSystem();
     const { monoFont } = useFontPreferences();
     const terminalFontSize = useUIStore(state => state.terminalFontSize);
@@ -188,12 +198,12 @@ export const TerminalView: React.FC = () => {
     const [hasOpenedTerminalViewport, setHasOpenedTerminalViewport] = React.useState(isTerminalVisible);
 
     React.useEffect(() => {
-        if (!isTerminalVisible || runtime.platform === 'vscode') {
+        if (!isTerminalVisible || runtime.platform === 'vscode' || isRemoteConnection) {
             return;
         }
 
         primeTerminalInputTransport();
-    }, [isTerminalVisible, runtime.platform]);
+    }, [isTerminalVisible, runtime.platform, isRemoteConnection]);
 
     React.useEffect(() => {
         if (isTerminalVisible) {
@@ -259,7 +269,7 @@ export const TerminalView: React.FC = () => {
             // Mark active before connect so early events aren't dropped.
             activeTerminalIdRef.current = terminalId;
 
-            const subscription = terminal.connect(
+            const subscription = terminalApi.connect(
                 terminalId,
                 {
                     onEvent: (event: TerminalStreamEvent) => {
@@ -278,7 +288,7 @@ export const TerminalView: React.FC = () => {
                                 // until the first output arrives. Nudge with a newline once.
                                 if (nudgeOnConnectTerminalIdRef.current === terminalId) {
                                     nudgeOnConnectTerminalIdRef.current = null;
-                                    void terminal.sendInput(terminalId, '\r').catch(() => {
+                                    void terminalApi.sendInput(terminalId, '\r').catch(() => {
                                         // ignore
                                     });
                                 }
@@ -348,7 +358,7 @@ export const TerminalView: React.FC = () => {
                 activeTerminalIdRef.current = null;
             };
         },
-        [appendToBuffer, disconnectStream, focusTerminalWhenWindowActive, setConnecting, setTabSessionId, terminal]
+        [appendToBuffer, disconnectStream, focusTerminalWhenWindowActive, setConnecting, setTabSessionId, terminalApi]
     );
 
     React.useEffect(() => {
@@ -411,7 +421,7 @@ export const TerminalView: React.FC = () => {
                 setConnecting(directory, tabId, true);
                 try {
                     const size = lastViewportSizeRef.current;
-                    const session = await terminal.createSession({
+                    const session = await terminalApi.createSession({
                         cwd: directory,
                         cols: size?.cols,
                         rows: size?.rows,
@@ -424,7 +434,7 @@ export const TerminalView: React.FC = () => {
 
                     if (!stillActive) {
                         try {
-                            await terminal.close(session.sessionId);
+                            await terminalApi.close(session.sessionId);
                         } catch { /* ignored */ }
                         return;
                     }
@@ -484,7 +494,7 @@ export const TerminalView: React.FC = () => {
         setTabSessionId,
         startStream,
         disconnectStream,
-        terminal,
+        terminalApi,
     ]);
 
     React.useEffect(() => {
@@ -600,7 +610,7 @@ export const TerminalView: React.FC = () => {
             const terminalId = terminalIdRef.current;
             if (!terminalId) return;
 
-            void terminal.sendInput(terminalId, payload).catch((error) => {
+            void terminalApi.sendInput(terminalId, payload).catch((error) => {
                 setConnectionError(error instanceof Error ? error.message : 'Failed to send input');
             });
 
@@ -609,7 +619,7 @@ export const TerminalView: React.FC = () => {
                 terminalControllerRef.current?.focus();
             }
         },
-        [activeModifier, setActiveModifier, terminal]
+        [activeModifier, setActiveModifier, terminalApi]
     );
 
     const handleViewportResize = React.useCallback(
@@ -620,11 +630,11 @@ export const TerminalView: React.FC = () => {
             }
             const terminalId = terminalIdRef.current;
             if (!terminalId) return;
-            void terminal.resize({ sessionId: terminalId, cols, rows }).catch(() => {
+            void terminalApi.resize({ sessionId: terminalId, cols, rows }).catch(() => {
 
             });
         },
-        [terminal]
+        [terminalApi]
     );
 
     const handleModifierToggle = React.useCallback(

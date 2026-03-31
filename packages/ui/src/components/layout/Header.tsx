@@ -16,7 +16,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { SortableTabsStrip, type SortableTabsStripItem } from '@/components/ui/sortable-tabs-strip';
 
-import { RiArrowLeftSLine, RiChat4Line, RiChatNewLine, RiCheckLine, RiCloseLine, RiCommandLine, RiFileTextLine, RiFolder6Line, RiGitBranchLine, RiGithubFill, RiLayoutLeftLine, RiLayoutRightLine, RiPlayListAddLine, RiRefreshLine, RiServerLine, RiStackLine, RiTerminalBoxLine, RiTimerLine, type RemixiconComponentType } from '@remixicon/react';
+import { RiArrowLeftSLine, RiChat4Line, RiChatNewLine, RiCheckLine, RiCloseLine, RiCommandLine, RiFileTextLine, RiFolder6Line, RiGitBranchLine, RiGithubFill, RiLayoutLeftLine, RiLayoutRightLine, RiNotification3Line, RiPlayListAddLine, RiRefreshLine, RiServerLine, RiSettings3Line, RiStackLine, RiTerminalBoxLine, RiTimerLine, type RemixiconComponentType } from '@remixicon/react';
 import { DiffIcon } from '@/components/icons/DiffIcon';
 import { useUIStore, type MainTab } from '@/stores/useUIStore';
 import { useConfigStore } from '@/stores/useConfigStore';
@@ -63,6 +63,8 @@ import { ProjectActionsButton } from '@/components/layout/ProjectActionsButton';
 import { isDesktopShell, isVSCodeRuntime } from '@/lib/desktop';
 import { desktopHostsGet, locationMatchesHost, redactSensitiveUrl } from '@/lib/desktopHosts';
 import { resolveSessionDiffStats } from '@/components/session/sidebar/utils';
+import { NotificationCenter } from '@/components/notification/NotificationCenter';
+import { useNotificationCenterStore, getUnreadCount } from '@/stores/useNotificationCenterStore';
 
 
 const isSameContextUsage = (
@@ -284,6 +286,7 @@ export const Header: React.FC<HeaderProps> = ({
   const { isMobile } = useDeviceInfo();
   const githubAuthStatus = useGitHubAuthStore((state) => state.status);
   const setGitHubAuthStatus = useGitHubAuthStore((state) => state.setStatus);
+  const unreadNotificationCount = useNotificationCenterStore((state) => getUnreadCount(state));
 
   const headerRef = React.useRef<HTMLElement | null>(null);
 
@@ -371,6 +374,7 @@ export const Header: React.FC<HeaderProps> = ({
   const [isUsageRefreshSpinning, setIsUsageRefreshSpinning] = React.useState(false);
   const [currentInstanceLabel, setCurrentInstanceLabel] = React.useState('Local');
   const compactCurrentInstanceLabel = React.useMemo(() => formatCompactHeaderLabel(currentInstanceLabel), [currentInstanceLabel]);
+  const [isNotificationCenterOpen, setIsNotificationCenterOpen] = React.useState(false);
   const [desktopServicesTab, setDesktopServicesTab] = React.useState<'instance' | 'usage' | 'mcp'>(
     isDesktopApp ? 'instance' : 'usage'
   );
@@ -1653,6 +1657,37 @@ export const Header: React.FC<HeaderProps> = ({
           <p>Right sidebar ({shortcutLabel('toggle_right_sidebar')})</p>
         </TooltipContent>
       </Tooltip>
+      <DropdownMenu
+        open={isNotificationCenterOpen}
+        onOpenChange={setIsNotificationCenterOpen}
+      >
+        <Tooltip delayDuration={500}>
+          <TooltipTrigger asChild>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                aria-label="Notifications"
+                className={cn(desktopHeaderIconButtonClass, 'relative')}
+              >
+                <RiNotification3Line className="h-5 w-5" />
+                {unreadNotificationCount > 0 && (
+                  <span
+                    className="absolute top-1.5 right-1.5 h-2 w-2 rounded-full"
+                    style={{ backgroundColor: 'var(--status-info)' }}
+                    aria-label={`${unreadNotificationCount} unread notifications`}
+                  />
+                )}
+              </button>
+            </DropdownMenuTrigger>
+          </TooltipTrigger>
+          <TooltipContent>
+            <p>Notifications</p>
+          </TooltipContent>
+        </Tooltip>
+        <DropdownMenuContent align="end" className="p-0">
+          <NotificationCenter />
+        </DropdownMenuContent>
+      </DropdownMenu>
       {renderDesktopGitHubControl()}
     </>
   );
@@ -2153,6 +2188,22 @@ export const Header: React.FC<HeaderProps> = ({
                 </div>
               </DropdownMenuContent>
             </DropdownMenu>
+
+            <Tooltip delayDuration={500}>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  onClick={() => useUIStore.getState().setSettingsDialogOpen(true)}
+                  aria-label="Open settings"
+                  className={cn(mobileHeaderIconButtonClass, 'relative')}
+                >
+                  <RiSettings3Line className="h-5 w-5" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>
+                <p>{`Settings (${shortcutLabel('open_settings')})`}</p>
+              </TooltipContent>
+            </Tooltip>
 
             {onToggleRightDrawer ? (
               <Tooltip delayDuration={500}>

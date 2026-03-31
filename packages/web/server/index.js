@@ -1,8 +1,10 @@
 import express from 'express';
+
 import path from 'path';
 import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import http from 'http';
+import https from 'https';
 import net from 'net';
 import { WebSocketServer } from 'ws';
 import { fileURLToPath } from 'url';
@@ -89,6 +91,9 @@ const FILE_SEARCH_EXCLUDED_DIRS = new Set([
 
 // Lock to prevent race conditions in persistSettings
 let persistSettingsLock = Promise.resolve();
+
+// Per-session locks for transcript writes to prevent race conditions
+const transcriptLocks = new Map();
 
 const normalizeDirectoryPath = (value) => {
   if (typeof value !== 'string') {
@@ -1262,6 +1267,7 @@ const OPENCHAMBER_DATA_DIR = process.env.OPENCHAMBER_DATA_DIR
   : path.join(os.homedir(), '.config', 'openchamber');
 const SETTINGS_FILE_PATH = path.join(OPENCHAMBER_DATA_DIR, 'settings.json');
 const PUSH_SUBSCRIPTIONS_FILE_PATH = path.join(OPENCHAMBER_DATA_DIR, 'push-subscriptions.json');
+const TRANSCRIPTS_DIR = path.join(OPENCHAMBER_DATA_DIR, 'transcripts');
 const CLOUDFLARE_MANAGED_REMOTE_TUNNELS_FILE_PATH = path.join(OPENCHAMBER_DATA_DIR, 'cloudflare-managed-remote-tunnels.json');
 const CLOUDFLARE_LEGACY_NAMED_TUNNELS_FILE_PATH = path.join(OPENCHAMBER_DATA_DIR, 'cloudflare-named-tunnels.json');
 const CLOUDFLARE_MANAGED_REMOTE_TUNNELS_VERSION = 1;
@@ -1955,8 +1961,66 @@ const sanitizeProjects = (input) => {
     if (typeof candidate.sidebarCollapsed === 'boolean') {
       project.sidebarCollapsed = candidate.sidebarCollapsed;
     }
+    if (typeof candidate.badge === 'string' && candidate.badge.trim().length > 0) {
+      project.badge = candidate.badge.trim();
+    }
+    if (typeof candidate.group === 'string' && candidate.group.trim().length > 0) {
+      project.group = candidate.group.trim();
+    }
 
     result.push(project);
+  }
+
+  return result;
+};
+
+const sanitizeConnections = (input) => {
+  if (!Array.isArray(input)) {
+    return undefined;
+  }
+
+  const result = [];
+  const seenIds = new Set();
+
+  for (const entry of input) {
+    if (!entry || typeof entry !== 'object') continue;
+
+    const candidate = entry;
+    const id = typeof candidate.id === 'string' ? candidate.id.trim() : '';
+    const label = typeof candidate.label === 'string' ? candidate.label.trim() : '';
+    const baseUrl = typeof candidate.baseUrl === 'string' ? candidate.baseUrl.trim() : '';
+    const type = candidate.type === 'local' || candidate.type === 'remote' ? candidate.type : null;
+
+    if (!id || !label || !baseUrl || !type) continue;
+    if (seenIds.has(id)) continue;
+
+    // Validate URL format for remote connections
+    // Local connections can use relative paths like '/api'
+    if (type === 'remote') {
+      try {
+        new URL(baseUrl);
+      } catch {
+        continue; // Skip invalid URLs
+      }
+    } else if (type === 'local') {
+      // For local connections, allow relative paths starting with '/'
+      if (!baseUrl.startsWith('/')) {
+        try {
+          new URL(baseUrl);
+        } catch {
+          continue; // Skip invalid URLs
+        }
+      }
+    }
+
+    seenIds.add(id);
+
+    result.push({
+      id,
+      label,
+      baseUrl,
+      type,
+    });
   }
 
   return result;
@@ -2039,6 +2103,27 @@ const sanitizeSettingsUpdate = (payload) => {
   }
   if (typeof candidate.activeProjectId === 'string' && candidate.activeProjectId.length > 0) {
     result.activeProjectId = candidate.activeProjectId;
+  }
+
+  if (Array.isArray(candidate.connections)) {
+    const connections = sanitizeConnections(candidate.connections);
+    if (connections) {
+      result.connections = connections;
+    }
+  }
+  if (typeof candidate.activeConnectionId === 'string' && candidate.activeConnectionId.length > 0) {
+    // If connections were updated in this payload, validate the activeConnectionId
+    // If connections weren't in this payload, we can't validate - accept as-is
+    if (result.connections) {
+      // Connections were just updated, validate against the new list
+      if (result.connections.some(c => c.id === candidate.activeConnectionId)) {
+        result.activeConnectionId = candidate.activeConnectionId;
+      }
+      // Otherwise, silently skip the invalid activeConnectionId
+    } else {
+      // Connections weren't updated, can't validate, accept the value
+      result.activeConnectionId = candidate.activeConnectionId;
+    }
   }
 
   if (Array.isArray(candidate.approvedDirectories)) {
@@ -2223,6 +2308,12 @@ const sanitizeSettingsUpdate = (payload) => {
   if (typeof candidate.zenModel === 'string') {
     const trimmed = candidate.zenModel.trim();
     result.zenModel = trimmed.length > 0 ? trimmed : undefined;
+  }
+  if (typeof candidate.claudeCodePermissionMode === 'string') {
+    const mode = candidate.claudeCodePermissionMode.trim();
+    if (mode === 'default' || mode === 'acceptEdits' || mode === 'bypassPermissions') {
+      result.claudeCodePermissionMode = mode;
+    }
   }
   if (typeof candidate.gitProviderId === 'string') {
     const trimmed = candidate.gitProviderId.trim();
@@ -2451,6 +2542,46 @@ const sanitizeSettingsUpdate = (payload) => {
   // Usage reporting opt-out (default: true/enabled)
   if (typeof candidate.reportUsage === 'boolean') {
     result.reportUsage = candidate.reportUsage;
+  }
+
+  // Scratch pads - per-project scratch pad content
+  if (candidate.scratchPads && typeof candidate.scratchPads === 'object') {
+    const sanitized = {};
+    for (const [projectId, content] of Object.entries(candidate.scratchPads)) {
+      if (typeof projectId === 'string' && typeof content === 'string' && content.length > 0) {
+        sanitized[projectId] = content;
+      }
+    }
+    if (Object.keys(sanitized).length > 0) {
+      result.scratchPads = sanitized;
+    }
+  }
+
+  // Project todos - per-project todo items (separate from per-session AI todos)
+  if (candidate.projectTodos && typeof candidate.projectTodos === 'object') {
+    const sanitized = {};
+    for (const [projectId, todos] of Object.entries(candidate.projectTodos)) {
+      if (typeof projectId === 'string' && Array.isArray(todos)) {
+        const validTodos = todos
+          .filter((t) => t && typeof t === 'object')
+          .map((t) => ({
+            id: typeof t.id === 'string' ? t.id : '',
+            content: typeof t.content === 'string' ? t.content : '',
+            status: (t.status === 'pending' || t.status === 'in_progress' || t.status === 'done') ? t.status : 'pending',
+            priority: (t.priority === 'high' || t.priority === 'medium' || t.priority === 'low') ? t.priority : 'medium',
+            createdAt: typeof t.createdAt === 'number' && Number.isFinite(t.createdAt) ? t.createdAt : Date.now(),
+            updatedAt: typeof t.updatedAt === 'number' && Number.isFinite(t.updatedAt) ? t.updatedAt : Date.now(),
+          }))
+          .filter((t) => t.id && t.content);
+
+        if (validTodos.length > 0) {
+          sanitized[projectId] = validTodos;
+        }
+      }
+    }
+    if (Object.keys(sanitized).length > 0) {
+      result.projectTodos = sanitized;
+    }
   }
 
   return result;
@@ -3260,7 +3391,9 @@ const sessionAttentionStates = new Map(); // sessionId -> {
 //   lastUserMessageAt: number | null,
 //   lastStatusChangeAt: number,
 //   viewedByClients: Set<clientId>,
-//   status: 'idle' | 'busy' | 'retry'
+//   status: 'idle' | 'busy' | 'retry',
+//   notificationKind: 'ready' | 'error' | 'question' | 'permission' | null,
+//   projectPath: string | null
 // }
 const SESSION_ATTENTION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -3637,6 +3770,8 @@ const tunnelAuthController = createTunnelAuth();
 let runtimeManagedRemoteTunnelToken = '';
 let runtimeManagedRemoteTunnelHostname = '';
 let terminalInputWsServer = null;
+let claudeCodeAdapterInstance = null;
+let claudeCodeAdapterPort = null;
 const userProvidedOpenCodePassword =
   typeof hmrState.userProvidedOpenCodePassword === 'string' && hmrState.userProvidedOpenCodePassword.length > 0
     ? hmrState.userProvidedOpenCodePassword
@@ -3806,6 +3941,9 @@ const ENV_CONFIGURED_OPENCODE_HOSTNAME = (() => {
 const ENV_SKIP_OPENCODE_START = process.env.OPENCODE_SKIP_START === 'true' ||
                                     process.env.OPENCHAMBER_SKIP_OPENCODE_START === 'true';
 const ENV_DESKTOP_NOTIFY = process.env.OPENCHAMBER_DESKTOP_NOTIFY === 'true';
+const ENV_BACKEND = process.env.OPENCHAMBER_BACKEND || 'opencode';
+const ENV_CLAUDECODE_BINARY = (process.env.CLAUDECODE_BINARY || '').trim() || 'claude';
+const ENV_CLAUDECODE_PERMISSION_MODE = (process.env.CLAUDECODE_PERMISSION_MODE || '').trim() || 'default';
 const ENV_CONFIGURED_OPENCODE_WSL_DISTRO =
   typeof process.env.OPENCODE_WSL_DISTRO === 'string' && process.env.OPENCODE_WSL_DISTRO.trim().length > 0
     ? process.env.OPENCODE_WSL_DISTRO.trim()
@@ -4065,6 +4203,7 @@ let resolvedOpencodeBinarySource = null;
 let resolvedNodeBinary = null;
 let resolvedBunBinary = null;
 let resolvedGitBinary = null;
+let resolvedClaudeBinary = null;
 let useWslForOpencode = false;
 let resolvedWslBinary = null;
 let resolvedWslOpencodePath = null;
@@ -4182,6 +4321,52 @@ function searchPathFor(binaryName) {
   }
   return null;
 }
+
+/**
+ * Resolve the Claude Code CLI binary path.
+ * Checks CLAUDECODE_BINARY env var first, then searches PATH for 'claude'.
+ * Returns the resolved path or null if not found.
+ */
+function resolveClaudeCodeCliPath() {
+  const envBinary = (process.env.CLAUDECODE_BINARY || '').trim();
+  if (envBinary) {
+    if (path.isAbsolute(envBinary) || envBinary.includes(path.sep)) {
+      const resolved = path.isAbsolute(envBinary) ? envBinary : path.resolve(envBinary);
+      if (isExecutable(resolved)) {
+        return resolved;
+      }
+      console.warn(`[openchamber] CLAUDECODE_BINARY="${envBinary}" is not executable, falling back to PATH lookup`);
+    } else {
+      // Bare name like "claude" — search PATH for it
+      const found = searchPathFor(envBinary);
+      if (found) {
+        return found;
+      }
+      console.warn(`[openchamber] CLAUDECODE_BINARY="${envBinary}" not found on PATH, falling back to default lookup`);
+    }
+  }
+
+  return searchPathFor('claude');
+}
+
+/**
+ * Detect the Claude Code CLI binary synchronously.
+ * Stores the result in resolvedClaudeBinary for use by the adapter and middleware.
+ */
+function detectClaudeCodeCli() {
+  try {
+    const resolved = resolveClaudeCodeCliPath();
+    if (resolved) {
+      resolvedClaudeBinary = resolved;
+      console.log(`[openchamber] Claude Code CLI detected: ${resolved}`);
+    } else {
+      console.debug('[openchamber] Claude Code CLI not found, Claude Code provider will not be available');
+    }
+  } catch (error) {
+    console.debug(`[openchamber] Claude Code CLI detection failed: ${error.message}`);
+  }
+}
+
 
 function isWslExecutableValue(value) {
   if (typeof value !== 'string') return false;
@@ -5225,6 +5410,148 @@ function broadcastUiNotification(payload) {
   }
 }
 
+/**
+ * Capture finalized message to transcript file.
+ * Only captures user messages and finalized assistant messages (finish === 'stop').
+ * Writes to ~/.config/openchamber/transcripts/<sessionId>.jsonl
+ */
+async function captureTranscript(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return;
+  }
+
+  // Only process message.created and message.updated events
+  if (payload.type !== 'message.created' && payload.type !== 'message.updated') {
+    return;
+  }
+
+  const info = payload.properties?.info;
+  if (!info || typeof info !== 'object') {
+    return;
+  }
+
+  const sessionId = info.sessionID ?? info.sessionId;
+  const role = info.role;
+  const messageId = info.id;
+
+  if (!sessionId || !role || !messageId) {
+    return;
+  }
+
+  // Add path traversal protection
+  const sanitizedSessionId = sessionId.replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!sanitizedSessionId || sanitizedSessionId !== sessionId) {
+    console.warn('[Transcript] Invalid sessionId format, skipping:', sessionId);
+    return;
+  }
+
+  // Only capture user messages and finalized assistant messages
+  if (role === 'user') {
+    // User messages are finalized immediately
+  } else if (role === 'assistant' && info.finish === 'stop') {
+    // Assistant messages are only captured when complete
+  } else {
+    return; // Skip partial streaming updates
+  }
+
+  try {
+    // Extract text content from the message
+    let content = '';
+    let parts = info.parts || payload.properties?.parts || [];
+    
+    // Assistant message.updated events don't include parts inline
+    // Fetch from API to get the complete message
+    if (role === 'assistant' && Array.isArray(parts) && parts.length === 0) {
+      try {
+        const url = buildOpenCodeUrl(`/session/${encodeURIComponent(sessionId)}/message/${encodeURIComponent(messageId)}`, '');
+        const response = await fetch(url, {
+          method: 'GET',
+          headers: { Accept: 'application/json', ...getOpenCodeAuthHeaders() },
+          signal: AbortSignal.timeout(3000),
+        });
+        
+        if (response.ok) {
+          const message = await response.json().catch(() => null);
+          if (message && Array.isArray(message.parts)) {
+            parts = message.parts;
+          }
+        }
+      } catch (err) {
+        console.warn('[Transcript] Failed to fetch assistant message parts:', err?.message);
+        return; // Skip this message if we can't get the content
+      }
+    }
+    
+    if (Array.isArray(parts)) {
+      const textParts = [];
+      for (const part of parts) {
+        if (!part || typeof part !== 'object') continue;
+        
+        const partType = part.type;
+        if (partType === 'text') {
+          const text = part.text || part.content;
+          if (typeof text === 'string' && text.length > 0) {
+            textParts.push(text);
+          }
+        } else if (partType === 'file') {
+          // Record filename only, not content
+          const filename = part.name || part.filename || part.path;
+          if (typeof filename === 'string' && filename.length > 0) {
+            textParts.push(`[file: ${filename}]`);
+          }
+        } else if (partType === 'tool') {
+          // Record tool call ID reference, not output
+          const toolName = part.name || part.tool;
+          const toolCallId = part.id || part.toolCallId;
+          if (toolName && toolCallId) {
+            textParts.push(`[tool: ${toolName} (${toolCallId})]`);
+          } else if (toolName) {
+            textParts.push(`[tool: ${toolName}]`);
+          }
+        }
+      }
+      content = textParts.join('\n').trim();
+    }
+
+    // Skip if no content to record
+    if (!content) {
+      return;
+    }
+
+    // Create transcript entry
+    const entry = {
+      timestamp: Date.now(),
+      role: role,
+      content: content,
+    };
+
+    // Ensure transcripts directory exists
+    await fsPromises.mkdir(TRANSCRIPTS_DIR, { recursive: true });
+
+    // Append to session transcript file with per-session write lock
+    const transcriptPath = path.join(TRANSCRIPTS_DIR, `${sanitizedSessionId}.jsonl`);
+    const line = JSON.stringify(entry) + '\n';
+    
+    // Get or create lock for this session
+    const getLock = (sessionId) => {
+      if (!transcriptLocks.has(sessionId)) {
+        transcriptLocks.set(sessionId, Promise.resolve());
+      }
+      return transcriptLocks.get(sessionId);
+    };
+
+    const lock = getLock(sanitizedSessionId);
+    const nextLock = lock.then(async () => {
+      await fsPromises.appendFile(transcriptPath, line, 'utf8');
+    });
+    transcriptLocks.set(sanitizedSessionId, nextLock);
+    await nextLock;
+  } catch (err) {
+    // Silent failure - transcript capture should not disrupt the SSE stream
+    console.warn('[Transcript] Failed to capture message:', err?.message || err);
+  }
+}
+
 function isStreamingAssistantPart(properties) {
   if (!properties || typeof properties !== 'object') {
     return false;
@@ -5383,6 +5710,14 @@ const maybeSendPushForTrigger = async (payload) => {
 
   const sessionId = extractSessionIdFromPayload(payload);
 
+  // Extract project directory from the payload so UI can badge the correct project rail icon.
+  const notificationProjectPath = (() => {
+    const infoPath = payload.properties?.info?.path;
+    if (typeof infoPath?.root === 'string' && infoPath.root.length > 0) return infoPath.root.replace(/\/+$/, '');
+    if (typeof infoPath?.cwd === 'string' && infoPath.cwd.length > 0) return infoPath.cwd.replace(/\/+$/, '');
+    return '';
+  })();
+
   const formatMode = (raw) => {
     const value = typeof raw === 'string' ? raw.trim() : '';
     const normalized = value.length > 0 ? value : 'agent';
@@ -5491,6 +5826,7 @@ const maybeSendPushForTrigger = async (payload) => {
           tag: `ready-${sessionId}`,
           kind: 'ready',
           sessionId,
+          projectPath: notificationProjectPath,
           requireHidden: settings.notificationMode !== 'always',
         };
         emitDesktopNotification(notificationPayload);
@@ -5553,6 +5889,7 @@ const maybeSendPushForTrigger = async (payload) => {
           tag: `error-${sessionId}`,
           kind: 'error',
           sessionId,
+          projectPath: notificationProjectPath,
           requireHidden: settings.notificationMode !== 'always',
         };
         emitDesktopNotification(notificationPayload);
@@ -5635,6 +5972,7 @@ const maybeSendPushForTrigger = async (payload) => {
           body,
           tag: `question-${sessionId}`,
           sessionId,
+          projectPath: notificationProjectPath,
           requireHidden: settings.notificationMode !== 'always',
         });
 
@@ -5644,6 +5982,7 @@ const maybeSendPushForTrigger = async (payload) => {
           body,
           tag: `question-${sessionId}`,
           sessionId,
+          projectPath: notificationProjectPath,
           requireHidden: settings.notificationMode !== 'always',
         });
       }
@@ -5727,6 +6066,17 @@ const maybeSendPushForTrigger = async (payload) => {
           body,
           tag: requestKey ? `permission-${requestKey}` : `permission-${sessionId}`,
           sessionId,
+          projectPath: notificationProjectPath,
+          requireHidden: settings.notificationMode !== 'always',
+        });
+
+        broadcastUiNotification({
+          kind: 'permission',
+          title,
+          body,
+          tag: requestKey ? `permission-${requestKey}` : `permission-${sessionId}`,
+          sessionId,
+          projectPath: notificationProjectPath,
           requireHidden: settings.notificationMode !== 'always',
         });
 
@@ -5765,6 +6115,104 @@ const maybeSendPushForTrigger = async (payload) => {
 
 function writeSseEvent(res, payload) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+/**
+ * Connect to the Claude Code adapter's /event SSE endpoint and forward events
+ * to the client response. Reconnects on drop with exponential backoff.
+ * Returns a cleanup function that stops the connection loop.
+ */
+function connectAdapterSse(res, abortSignal) {
+  // In legacy claudecode mode, openCodePort === claudeCodeAdapterPort and the
+  // upstream OpenCode connection already carries all adapter events — skip.
+  // NOTE: Do NOT bail when claudeCodeAdapterPort is null — the adapter may start
+  // after the SSE connection is established (hybrid mode startup order). The run()
+  // loop below handles null port with a wait-and-retry.
+  if (claudeCodeAdapterPort && claudeCodeAdapterPort === openCodePort) return () => {};
+
+  let stopped = false;
+  let currentReader = null;
+
+  const stop = () => {
+    stopped = true;
+    if (currentReader) {
+      try { currentReader.cancel(); } catch { /* ignore */ }
+    }
+  };
+
+  // Stop when the parent signal aborts (client disconnect)
+  const onAbort = () => stop();
+  abortSignal.addEventListener('abort', onAbort, { once: true });
+
+  const run = async () => {
+    let attempt = 0;
+    while (!stopped && !abortSignal.aborted) {
+      const port = claudeCodeAdapterPort;
+      if (!port) {
+        // Adapter went away, wait and retry
+        await new Promise((r) => setTimeout(r, 5000));
+        continue;
+      }
+      attempt += 1;
+      try {
+        const adapterUrl = `http://127.0.0.1:${port}/event`;
+        const adapterResponse = await fetch(adapterUrl, {
+          headers: { Accept: 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' },
+          signal: abortSignal,
+        });
+        if (!adapterResponse.ok || !adapterResponse.body) {
+          throw new Error(`adapter SSE bad status ${adapterResponse.status}`);
+        }
+        console.log('[AdapterSSE] connected to Claude Code adapter event stream');
+        attempt = 0; // reset backoff on successful connect
+
+        const decoder = new TextDecoder();
+        const reader = adapterResponse.body.getReader();
+        currentReader = reader;
+        let buffer = '';
+
+        while (!stopped && !abortSignal.aborted) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+
+          let separatorIndex = buffer.indexOf('\n\n');
+          while (separatorIndex !== -1) {
+            const block = buffer.slice(0, separatorIndex);
+            buffer = buffer.slice(separatorIndex + 2);
+            separatorIndex = buffer.indexOf('\n\n');
+            if (block && !res.writableEnded) {
+              try {
+                res.write(`${block}\n\n`);
+              } catch { /* client gone */ }
+              // Run the notification pipeline on adapter events too
+              const adapterPayload = parseSseDataPayload(block);
+              if (adapterPayload) {
+                maybeCacheSessionInfoFromEvent(adapterPayload);
+                void maybeSendPushForTrigger(adapterPayload);
+              }
+            }
+          }
+        }
+        currentReader = null;
+      } catch (error) {
+        currentReader = null;
+        if (stopped || abortSignal.aborted) return;
+        console.warn('[AdapterSSE] disconnected from Claude Code adapter:', error?.message || error);
+      }
+
+      if (stopped || abortSignal.aborted) return;
+      const backoffMs = Math.min(1000 * Math.pow(2, Math.min(attempt, 4)), 16000);
+      await new Promise((r) => setTimeout(r, backoffMs));
+    }
+  };
+
+  void run();
+
+  return () => {
+    stop();
+    abortSignal.removeEventListener('abort', onAbort);
+  };
 }
 
 function extractApiPrefixFromUrl() {
@@ -6589,7 +7037,8 @@ function setupProxy(app) {
       req.path.startsWith('/config/settings') ||
       req.path.startsWith('/config/skills') ||
       req.path === '/config/reload' ||
-      req.path === '/health'
+      req.path === '/health' ||
+      req.path === '/share'
     ) {
       return next();
     }
@@ -6630,8 +7079,13 @@ function setupProxy(app) {
     let idleTimer = null;
     let heartbeatTimer = null;
     let endedBy = 'upstream-end';
+    let stopAdapterSse = null;
+
+    // Register this SSE client for UI notification broadcasts
+    uiNotificationClients.add(res);
 
     const cleanup = () => {
+      uiNotificationClients.delete(res);
       if (connectTimer) {
         clearTimeout(connectTimer);
         connectTimer = null;
@@ -6716,6 +7170,9 @@ function setupProxy(app) {
         }
       }, 30 * 1000);
 
+      // Merge Claude Code adapter events into this SSE stream
+      stopAdapterSse = connectAdapterSse(res, controller.signal);
+
       const reader = upstreamResponse.body.getReader();
       try {
         while (true) {
@@ -6739,12 +7196,16 @@ function setupProxy(app) {
         }
       }
 
+      stopAdapterSse();
       cleanup();
       if (!res.writableEnded) {
         res.end();
       }
       console.log(`SSE forward ${upstreamPath} closed (${endedBy}) in ${Date.now() - startedAt}ms`);
     } catch (error) {
+      if (stopAdapterSse) {
+        stopAdapterSse();
+      }
       cleanup();
       const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
       if (!res.headersSent) {
@@ -6879,7 +7340,7 @@ function setupProxy(app) {
       if (!res.headersSent) {
         const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
         res.status(isTimeout ? 504 : 503).json({
-          error: isTimeout ? 'OpenCode request timed out' : 'OpenCode service unavailable',
+          error: isTimeout ? 'OpenCode request timed out' : 'OpenCode request failed',
         });
       }
     }
@@ -6927,12 +7388,97 @@ function setupProxy(app) {
     }
   });
 
+  // Intercept GET /config/providers to inject Claude Code provider when adapter is running
+  app.get('/api/config/providers', async (req, res) => {
+    try {
+      const queryString = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
+      const upstreamUrl = buildOpenCodeUrl(`/config/providers${queryString}`, '');
+      const authHeaders = getOpenCodeAuthHeaders();
+
+      const upstreamResponse = await fetch(upstreamUrl, {
+        method: 'GET',
+        headers: {
+          accept: 'application/json',
+          ...(authHeaders.Authorization ? { Authorization: authHeaders.Authorization } : {}),
+        },
+        signal: AbortSignal.timeout(10000),
+      });
+
+      const contentType = upstreamResponse.headers.get('content-type') || 'application/json';
+      if (!upstreamResponse.ok) {
+        const body = await upstreamResponse.text().catch(() => '');
+        res.setHeader('content-type', contentType);
+        return res.status(upstreamResponse.status).send(body);
+      }
+
+      const data = await upstreamResponse.json();
+
+      if (claudeCodeAdapterPort != null) {
+        const providers = Array.isArray(data.providers) ? data.providers : [];
+        providers.push({
+          id: 'claudecode',
+          name: 'Claude Code',
+          source: 'custom',
+          env: [],
+          options: {},
+          models: {
+            default: {
+              id: 'default',
+              providerID: 'claudecode',
+              api: { id: 'claudecode', url: '', npm: '' },
+              name: 'Default (Claude Code manages model selection)',
+              capabilities: {
+                temperature: false,
+                reasoning: false,
+                attachment: true,
+                toolcall: true,
+                input: { text: true, audio: false, image: true, video: false, pdf: true },
+                output: { text: true, audio: false, image: false, video: false, pdf: false },
+                interleaved: false,
+              },
+              cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+              limit: { context: 200000, output: 16384 },
+              status: 'active',
+              options: {},
+              headers: {},
+              release_date: '2025-01-01',
+            },
+          },
+        });
+        data.providers = providers;
+      }
+
+      res.json(data);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'Provider list fetch timed out' : 'Provider list fetch failed',
+        });
+      }
+    }
+  });
+
   app.use('/api', async (req, res, next) => {
     if (isSseApiPath(req.path)) {
       return next();
     }
 
-    if (req.method === 'POST' && /\/session\/[^/]+\/message$/.test(req.path || '')) {
+    // Let dedicated route handlers below decide whether to forward to the
+    // Claude Code adapter or OpenCode.
+    if (req.method === 'POST' && /^\/session\/[^/]+\/prompt_async$/.test(req.path)) {
+      return next();
+    }
+    if (req.method === 'GET' && /^\/session\/[^/]+\/message$/.test(req.path)) {
+      return next();
+    }
+    // Question reply/reject routes have dedicated handlers that try the Claude Code
+    // adapter first before falling through to OpenCode.
+    if (req.method === 'POST' && /^\/question\/[^/]+\/(reply|reject)$/.test(req.path)) {
+      return next();
+    }
+    // Question list and permission list merge from both backends.
+    if (req.method === 'GET' && (req.path === '/question' || req.path === '/permission')) {
       return next();
     }
 
@@ -7008,6 +7554,349 @@ function setupProxy(app) {
 
     return forwardGenericApiRequest(req, res);
   });
+
+  // Route POST /api/session/:id/prompt_async to Claude Code adapter when providerID is 'claudecode',
+  // otherwise forward to OpenCode directly (we cannot call next() because express.raw() consumes the body stream).
+  app.post('/api/session/:id/prompt_async', express.raw({ type: '*/*', limit: '10mb' }), async (req, res) => {
+    const rawBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(typeof req.body === 'string' ? req.body : '');
+    let body;
+    try {
+      body = rawBuffer.length > 0 ? JSON.parse(rawBuffer.toString('utf8')) : {};
+    } catch {
+      // JSON parsing failed — forward raw payload to OpenCode and let it handle the error
+      body = {};
+    }
+
+    const providerID = body.model?.providerID;
+    const sessionId = req.params.id;
+
+    if (providerID !== 'claudecode' || claudeCodeAdapterPort == null) {
+      // Not a Claude Code request or adapter not running — forward to OpenCode directly
+      // (we cannot use next() because express.raw() already consumed the body stream)
+      try {
+        const upstreamPath = req.originalUrl.replace(/^\/api/, '');
+        const targetUrl = buildOpenCodeUrl(upstreamPath, '');
+        const authHeaders = getOpenCodeAuthHeaders();
+
+        const headers = {
+          ...(typeof req.headers['content-type'] === 'string' ? { 'content-type': req.headers['content-type'] } : { 'content-type': 'application/json' }),
+          ...(typeof req.headers.accept === 'string' ? { accept: req.headers.accept } : {}),
+          ...(authHeaders.Authorization ? { Authorization: authHeaders.Authorization } : {}),
+        };
+
+        const upstreamResponse = await fetch(targetUrl, {
+          method: 'POST',
+          headers,
+          body: rawBuffer,
+          signal: AbortSignal.timeout(LONG_REQUEST_TIMEOUT_MS),
+        });
+
+        const upstreamBody = Buffer.from(await upstreamResponse.arrayBuffer());
+
+        if (upstreamResponse.headers.has('content-type')) {
+          res.setHeader('content-type', upstreamResponse.headers.get('content-type'));
+        }
+
+        res.status(upstreamResponse.status).send(upstreamBody);
+      } catch (error) {
+        if (!res.headersSent) {
+          const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+          res.status(isTimeout ? 504 : 503).json({
+            error: isTimeout ? 'OpenCode prompt_async forward timed out' : 'OpenCode prompt_async forward failed',
+          });
+        }
+      }
+      return;
+    }
+
+    // Forward to Claude Code adapter, preserving query params (e.g. ?directory=...)
+    const adapterBase = `http://127.0.0.1:${claudeCodeAdapterPort}/session/${encodeURIComponent(sessionId)}/prompt_async`;
+    const origQuery = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
+    const adapterUrl = adapterBase + origQuery;
+    console.log(`[ClaudeCode] Forwarding prompt_async for session ${sessionId} to adapter at port ${claudeCodeAdapterPort}, url=${adapterUrl}`);
+
+    try {
+      const adapterHeaders = { 'content-type': 'application/json' };
+      const dirHeader = req.headers['x-opencode-directory'];
+      if (dirHeader) adapterHeaders['x-opencode-directory'] = dirHeader;
+      const upstreamResponse = await fetch(adapterUrl, {
+        method: 'POST',
+        headers: adapterHeaders,
+        body: rawBuffer,
+        signal: AbortSignal.timeout(LONG_REQUEST_TIMEOUT_MS),
+      });
+
+      const responseBody = await upstreamResponse.text();
+      const contentType = upstreamResponse.headers.get('content-type') || 'application/json';
+      res.setHeader('content-type', contentType);
+      res.status(upstreamResponse.status).send(responseBody);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'Claude Code adapter request timed out' : 'Claude Code adapter unavailable',
+        });
+      }
+    }
+  });
+
+  // GET /api/session/:id/message — check both OpenCode and Claude Code adapter,
+  // preferring whichever has messages (the adapter stores messages for Claude Code sessions).
+  app.get('/api/session/:id/message', async (req, res) => {
+    const sessionId = req.params.id;
+    const queryString = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
+
+    // Fetch from OpenCode
+    let openCodeMessages = [];
+    try {
+      const upstreamPath = `/session/${encodeURIComponent(sessionId)}/message${queryString}`;
+      const targetUrl = buildOpenCodeUrl(upstreamPath, '');
+      const authHeaders = getOpenCodeAuthHeaders();
+      const ocResponse = await fetch(targetUrl, {
+        method: 'GET',
+        headers: { accept: 'application/json', ...authHeaders },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (ocResponse.ok) {
+        const data = await ocResponse.json();
+        openCodeMessages = Array.isArray(data) ? data : [];
+      }
+    } catch {
+      // OpenCode may be unreachable — continue to adapter fallback
+    }
+
+    // If OpenCode returned messages, use those
+    if (openCodeMessages.length > 0 || claudeCodeAdapterPort == null) {
+      return res.json(openCodeMessages);
+    }
+
+    // Try Claude Code adapter
+    try {
+      const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/session/${encodeURIComponent(sessionId)}/message`;
+      const adapterResponse = await fetch(adapterUrl, {
+        method: 'GET',
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (adapterResponse.ok) {
+        const data = await adapterResponse.json();
+        return res.json(Array.isArray(data) ? data : []);
+      }
+    } catch {
+      // adapter unreachable
+    }
+
+    res.json(openCodeMessages);
+  });
+
+  // Merge GET /api/question from both OpenCode and Claude Code adapter
+  app.get('/api/question', async (req, res) => {
+    const queryString = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
+    const authHeaders = getOpenCodeAuthHeaders();
+
+    // Fetch from OpenCode
+    let openCodeQuestions = [];
+    try {
+      const openCodeUrl = buildOpenCodeUrl(`/question${queryString}`, '');
+      const ocResponse = await fetch(openCodeUrl, {
+        method: 'GET',
+        headers: { accept: 'application/json', ...authHeaders },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (ocResponse.ok) {
+        const data = await ocResponse.json();
+        openCodeQuestions = Array.isArray(data) ? data : [];
+      }
+    } catch (err) {
+      console.warn('[ClaudeCode] Failed to fetch questions from OpenCode:', err?.message || err);
+    }
+
+    // Fetch from Claude Code adapter (if running and not same as OpenCode)
+    let adapterQuestions = [];
+    if (claudeCodeAdapterPort != null && claudeCodeAdapterPort !== openCodePort) {
+      try {
+        const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/question`;
+        const adapterResponse = await fetch(adapterUrl, {
+          method: 'GET',
+          headers: { accept: 'application/json' },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (adapterResponse.ok) {
+          const data = await adapterResponse.json();
+          adapterQuestions = Array.isArray(data) ? data : [];
+        }
+      } catch (err) {
+        console.warn('[ClaudeCode] Failed to fetch questions from adapter:', err?.message || err);
+      }
+    }
+
+    res.json([...openCodeQuestions, ...adapterQuestions]);
+  });
+
+  // Route POST /api/question/:requestID/reply — try adapter first, then OpenCode
+  app.post('/api/question/:requestID/reply', express.raw({ type: '*/*', limit: '1mb' }), async (req, res) => {
+    const { requestID } = req.params;
+    const rawBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(typeof req.body === 'string' ? req.body : '');
+    let body;
+    try {
+      body = rawBuffer.length > 0 ? JSON.parse(rawBuffer.toString('utf8')) : {};
+    } catch {
+      body = {};
+    }
+
+    // Try Claude Code adapter first (if running and not same as OpenCode)
+    if (claudeCodeAdapterPort != null && claudeCodeAdapterPort !== openCodePort) {
+      try {
+        const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/question/reply`;
+        const adapterResponse = await fetch(adapterUrl, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ requestID, ...body }),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (adapterResponse.ok) {
+          const data = await adapterResponse.text();
+          res.setHeader('content-type', adapterResponse.headers.get('content-type') || 'application/json');
+          return res.status(200).send(data);
+        }
+        // 404 means adapter doesn't own this question — fall through to OpenCode
+        if (adapterResponse.status !== 404) {
+          const data = await adapterResponse.text();
+          res.setHeader('content-type', adapterResponse.headers.get('content-type') || 'application/json');
+          return res.status(adapterResponse.status).send(data);
+        }
+      } catch (err) {
+        console.warn('[ClaudeCode] Failed to forward question reply to adapter:', err?.message || err);
+      }
+    }
+
+    // Forward to OpenCode
+    try {
+      const upstreamUrl = buildOpenCodeUrl(`/question/${encodeURIComponent(requestID)}/reply`, '');
+      const authHeaders = getOpenCodeAuthHeaders();
+      const upstreamResponse = await fetch(upstreamUrl, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...authHeaders,
+        },
+        body: rawBuffer,
+        signal: AbortSignal.timeout(10000),
+      });
+      const upstreamBody = await upstreamResponse.text();
+      res.setHeader('content-type', upstreamResponse.headers.get('content-type') || 'application/json');
+      res.status(upstreamResponse.status).send(upstreamBody);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'Question reply forward timed out' : 'Question reply forward failed',
+        });
+      }
+    }
+  });
+
+  // Route POST /api/question/:requestID/reject — try adapter first, then OpenCode
+  app.post('/api/question/:requestID/reject', express.raw({ type: '*/*', limit: '1mb' }), async (req, res) => {
+    const { requestID } = req.params;
+    const rawBuffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(typeof req.body === 'string' ? req.body : '');
+
+    // Try Claude Code adapter first (if running and not same as OpenCode)
+    if (claudeCodeAdapterPort != null && claudeCodeAdapterPort !== openCodePort) {
+      try {
+        const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/question/reject`;
+        const adapterResponse = await fetch(adapterUrl, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ requestID }),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (adapterResponse.ok) {
+          const data = await adapterResponse.text();
+          res.setHeader('content-type', adapterResponse.headers.get('content-type') || 'application/json');
+          return res.status(200).send(data);
+        }
+        // 404 means adapter doesn't own this question — fall through to OpenCode
+        if (adapterResponse.status !== 404) {
+          const data = await adapterResponse.text();
+          res.setHeader('content-type', adapterResponse.headers.get('content-type') || 'application/json');
+          return res.status(adapterResponse.status).send(data);
+        }
+      } catch (err) {
+        console.warn('[ClaudeCode] Failed to forward question reject to adapter:', err?.message || err);
+      }
+    }
+
+    // Forward to OpenCode
+    try {
+      const upstreamUrl = buildOpenCodeUrl(`/question/${encodeURIComponent(requestID)}/reject`, '');
+      const authHeaders = getOpenCodeAuthHeaders();
+      const upstreamResponse = await fetch(upstreamUrl, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...authHeaders,
+        },
+        body: rawBuffer,
+        signal: AbortSignal.timeout(10000),
+      });
+      const upstreamBody = await upstreamResponse.text();
+      res.setHeader('content-type', upstreamResponse.headers.get('content-type') || 'application/json');
+      res.status(upstreamResponse.status).send(upstreamBody);
+    } catch (error) {
+      if (!res.headersSent) {
+        const isTimeout = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+        res.status(isTimeout ? 504 : 503).json({
+          error: isTimeout ? 'Question reject forward timed out' : 'Question reject forward failed',
+        });
+      }
+    }
+  });
+
+  // Merge GET /api/permission from both OpenCode and Claude Code adapter
+  app.get('/api/permission', async (req, res) => {
+    const queryString = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?')) : '';
+    const authHeaders = getOpenCodeAuthHeaders();
+
+    // Fetch from OpenCode
+    let openCodePermissions = [];
+    try {
+      const openCodeUrl = buildOpenCodeUrl(`/permission${queryString}`, '');
+      const ocResponse = await fetch(openCodeUrl, {
+        method: 'GET',
+        headers: { accept: 'application/json', ...authHeaders },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (ocResponse.ok) {
+        const data = await ocResponse.json();
+        openCodePermissions = Array.isArray(data) ? data : [];
+      }
+    } catch (err) {
+      console.warn('[ClaudeCode] Failed to fetch permissions from OpenCode:', err?.message || err);
+    }
+
+    // Fetch from Claude Code adapter (if running and not same as OpenCode)
+    let adapterPermissions = [];
+    if (claudeCodeAdapterPort != null && claudeCodeAdapterPort !== openCodePort) {
+      try {
+        const adapterUrl = `http://127.0.0.1:${claudeCodeAdapterPort}/permission`;
+        const adapterResponse = await fetch(adapterUrl, {
+          method: 'GET',
+          headers: { accept: 'application/json' },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (adapterResponse.ok) {
+          const data = await adapterResponse.json();
+          adapterPermissions = Array.isArray(data) ? data : [];
+        }
+      } catch (err) {
+        console.warn('[ClaudeCode] Failed to fetch permissions from adapter:', err?.message || err);
+      }
+    }
+
+    res.json([...openCodePermissions, ...adapterPermissions]);
+  });
+
 }
 
 function startHealthMonitoring() {
@@ -7062,6 +7951,18 @@ async function gracefulShutdown(options = {}) {
     }
   }
 
+  // Stop Claude Code adapter if running
+  if (claudeCodeAdapterInstance) {
+    console.log('Stopping Claude Code adapter...');
+    try {
+      await claudeCodeAdapterInstance.stop();
+    } catch (error) {
+      console.warn('Error stopping Claude Code adapter:', error);
+    }
+    claudeCodeAdapterInstance = null;
+    claudeCodeAdapterPort = null;
+  }
+
   // Only stop OpenCode if we started it ourselves (not when using external server)
   if (!ENV_SKIP_OPENCODE_START && !isExternalOpenCode) {
     const portToKill = openCodePort;
@@ -7076,7 +7977,9 @@ async function gracefulShutdown(options = {}) {
       openCodeProcess = null;
     }
 
-    killProcessOnPort(portToKill);
+    if (ENV_BACKEND !== 'claudecode') {
+      killProcessOnPort(portToKill);
+    }
   } else {
     console.log('Skipping OpenCode shutdown (external server)');
   }
@@ -7186,12 +8089,30 @@ async function main(options = {}) {
   const serverStartedAt = new Date().toISOString();
   app.set('trust proxy', true);
   expressApp = app;
-  server = http.createServer(app);
+  // Use HTTPS when TLS certificates are available (e.g. from mkcert).
+  // Looks in ~/.config/openchamber/certs/ or OPENCHAMBER_TLS_CERT / OPENCHAMBER_TLS_KEY env vars.
+  const tlsCertPath = process.env.OPENCHAMBER_TLS_CERT || path.join(os.homedir(), '.config', 'openchamber', 'certs', 'cert.pem');
+  const tlsKeyPath = process.env.OPENCHAMBER_TLS_KEY || path.join(os.homedir(), '.config', 'openchamber', 'certs', 'key.pem');
+  let useTls = false;
+  try {
+    if (fs.existsSync(tlsCertPath) && fs.existsSync(tlsKeyPath)) {
+      const tlsOpts = { cert: fs.readFileSync(tlsCertPath), key: fs.readFileSync(tlsKeyPath) };
+      server = https.createServer(tlsOpts, app);
+      useTls = true;
+      console.log(`TLS enabled (cert: ${tlsCertPath})`);
+    }
+  } catch (err) {
+    console.warn(`TLS certificate found but failed to load: ${err.message}`);
+  }
+  if (!useTls) {
+    server = http.createServer(app);
+  }
 
   app.get('/health', (req, res) => {
     res.json({
       status: 'ok',
       timestamp: new Date().toISOString(),
+      backend: ENV_BACKEND,
       openCodePort: openCodePort,
       openCodeRunning: Boolean(openCodePort && isOpenCodeReady && !isRestartingOpenCode),
       openCodeSecureConnection: isOpenCodeConnectionSecure(),
@@ -7209,6 +8130,8 @@ async function main(options = {}) {
       opencodeWslDistro: resolvedWslDistro || null,
       nodeBinaryResolved: resolvedNodeBinary || null,
       bunBinaryResolved: resolvedBunBinary || null,
+      claudeCodeAvailable: claudeCodeAdapterPort != null,
+      claudeCodeAdapterPort: claudeCodeAdapterPort,
     });
   });
 
@@ -7244,6 +8167,7 @@ async function main(options = {}) {
       req.path.startsWith('/api/push') ||
       req.path.startsWith('/api/voice') ||
       req.path.startsWith('/api/tts') ||
+      req.path.startsWith('/api/share') ||
       req.path.startsWith('/api/openchamber/tunnel')
     ) {
 
@@ -7689,6 +8613,25 @@ async function main(options = {}) {
   // New authoritative session status endpoints
   // Server maintains the source of truth, clients only query
 
+  // POST /api/share - Proxy share requests to external share service
+  app.post('/api/share', async (req, res) => {
+    try {
+      const response = await fetch('http://3.83.43.50:4243/share', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(req.body),
+      });
+      if (!response.ok) {
+        return res.status(response.status).json({ error: `Share service returned ${response.status}` });
+      }
+      const data = await response.json();
+      res.json(data);
+    } catch (error) {
+      console.error('Share proxy error:', error);
+      res.status(502).json({ error: 'Failed to reach share service' });
+    }
+  });
+
   // GET /api/sessions/snapshot - Combined status + attention snapshot
   app.get('/api/sessions/snapshot', (_req, res) => {
     res.json({
@@ -7792,6 +8735,147 @@ async function main(options = {}) {
       sessionId,
       messageSent: true
     });
+  });
+
+  // GET /api/transcripts/search - Search across all transcript files
+  app.get('/api/transcripts/search', async (req, res) => {
+    try {
+      const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+      if (!query) {
+        return res.status(400).json({ error: 'Query parameter "q" is required and cannot be empty' });
+      }
+
+      const rawLimit = Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit;
+      const rawOffset = Array.isArray(req.query.offset) ? req.query.offset[0] : req.query.offset;
+
+      const limit = Math.min(
+        Math.max(1, parseInt(rawLimit, 10) || 50),
+        200
+      );
+      const offset = Math.max(0, parseInt(rawOffset, 10) || 0);
+
+      let transcriptFiles = [];
+      try {
+        const entries = await fsPromises.readdir(TRANSCRIPTS_DIR, { withFileTypes: true });
+        transcriptFiles = entries
+          .filter((entry) => entry.isFile() && entry.name.endsWith('.jsonl'))
+          .map((entry) => entry.name);
+      } catch (error) {
+        if (error && typeof error === 'object' && error.code === 'ENOENT') {
+          return res.json({ results: [], total: 0, hasMore: false });
+        }
+        throw error;
+      }
+
+      const allMatches = [];
+      // SECURITY: Using .includes() not regex — no ReDoS risk. If switching to regex, escape query first.
+      const queryLower = query.toLowerCase();
+      const MAX_TRANSCRIPT_FILE_BYTES = 10 * 1024 * 1024;
+      const MAX_TOTAL_MATCHES = 1000;
+
+      for (const filename of transcriptFiles) {
+        if (req.destroyed) {
+          console.log('[Transcript Search] Request aborted, stopping search');
+          return;
+        }
+
+        if (allMatches.length >= MAX_TOTAL_MATCHES) {
+          break;
+        }
+
+        const sessionId = filename.replace(/\.jsonl$/, '');
+
+        if (!sessionId || sessionId.includes('..') || sessionId.includes('/')) {
+          console.warn(`[Transcript Search] Invalid session ID from filename: ${filename}`);
+          continue;
+        }
+
+        const transcriptPath = path.join(TRANSCRIPTS_DIR, filename);
+
+        try {
+          const stat = await fsPromises.stat(transcriptPath);
+          if (stat.size > MAX_TRANSCRIPT_FILE_BYTES) {
+            console.warn(`[Transcript Search] Skipping large file ${filename}: ${stat.size} bytes`);
+            continue;
+          }
+
+          const content = await fsPromises.readFile(transcriptPath, 'utf8');
+          const lines = content.split('\n').filter((line) => line.trim().length > 0);
+
+          for (let lineNumber = 0; lineNumber < lines.length; lineNumber++) {
+            try {
+              const entry = JSON.parse(lines[lineNumber]);
+              const entryContent = typeof entry.content === 'string' ? entry.content : '';
+
+              if (entryContent.toLowerCase().includes(queryLower)) {
+                const matchIndex = entryContent.toLowerCase().indexOf(queryLower);
+
+                let snippet = entryContent;
+                const maxSnippetLength = 200;
+
+                if (entryContent.length > maxSnippetLength) {
+                  const halfSnippet = Math.floor(maxSnippetLength / 2);
+                  let snippetStart = Math.max(0, matchIndex - halfSnippet);
+                  let snippetEnd = snippetStart + maxSnippetLength;
+
+                  if (snippetEnd > entryContent.length) {
+                    snippetEnd = entryContent.length;
+                    snippetStart = Math.max(0, snippetEnd - maxSnippetLength);
+                  }
+
+                  snippet = entryContent.slice(snippetStart, snippetEnd);
+
+                  if (snippetStart > 0) snippet = '...' + snippet;
+                  if (snippetEnd < entryContent.length) snippet = snippet + '...';
+                }
+
+                const escapedQuery = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const highlightRegex = new RegExp(escapedQuery, 'i');
+                snippet = snippet.replace(highlightRegex, '**$&**');
+
+                allMatches.push({
+                  sessionId,
+                  timestamp: typeof entry.timestamp === 'number' ? entry.timestamp : 0,
+                  role: typeof entry.role === 'string' ? entry.role : 'unknown',
+                  snippet,
+                  lineNumber: lineNumber + 1
+                });
+
+                if (allMatches.length >= MAX_TOTAL_MATCHES) {
+                  break;
+                }
+              }
+            } catch (parseError) {
+              continue;
+            }
+          }
+
+          if (allMatches.length >= MAX_TOTAL_MATCHES) {
+            break;
+          }
+        } catch (readError) {
+          console.warn(`[Transcript Search] Failed to read ${filename}:`, readError?.message || readError);
+          continue;
+        }
+      }
+
+      allMatches.sort((a, b) => b.timestamp - a.timestamp);
+
+      const total = allMatches.length;
+      const paginatedResults = allMatches.slice(offset, offset + limit);
+      const hasMore = offset + limit < total;
+
+      res.json({
+        results: paginatedResults,
+        total,
+        hasMore
+      });
+    } catch (error) {
+      console.error('Failed to search transcripts:', error);
+      res.status(500).json({
+        error: error instanceof Error ? error.message : 'Failed to search transcripts'
+      });
+    }
   });
 
   app.get('/api/openchamber/update-check', async (req, res) => {
@@ -8726,6 +9810,9 @@ async function main(options = {}) {
       writeSseEvent(res, { type: 'openchamber:heartbeat', timestamp: Date.now() });
     }, 15000);
 
+    // Merge Claude Code adapter events into this SSE stream
+    const stopAdapterSse = connectAdapterSse(res, controller.signal);
+
     const decoder = new TextDecoder();
     const reader = upstream.body.getReader();
     let buffer = '';
@@ -8739,6 +9826,13 @@ async function main(options = {}) {
 `);
       // Cache session titles from session.updated/session.created events (global stream)
       maybeCacheSessionInfoFromEvent(payload);
+      // Capture transcript entries for finalized messages
+      if (payload) {
+        // Fire-and-forget: intentionally not awaited to avoid blocking SSE stream
+        captureTranscript(payload).catch(() => {
+          // Silent failure - transcript capture should not disrupt the stream
+        });
+      }
 
       // Keep server-authoritative session state fresh even if the
       // background watcher is disconnected.
@@ -8792,6 +9886,7 @@ async function main(options = {}) {
         console.warn('SSE proxy stream error:', error);
       }
     } finally {
+      stopAdapterSse();
       clearInterval(heartbeatInterval);
       cleanupClient();
       cleanup();
@@ -8869,6 +9964,9 @@ async function main(options = {}) {
       writeSseEvent(res, { type: 'openchamber:heartbeat', timestamp: Date.now() });
     }, 15000);
 
+    // Merge Claude Code adapter events into this SSE stream
+    const stopAdapterSse = connectAdapterSse(res, controller.signal);
+
     const decoder = new TextDecoder();
     const reader = upstream.body.getReader();
     let buffer = '';
@@ -8882,6 +9980,13 @@ async function main(options = {}) {
 `);
       // Cache session titles from session.updated/session.created events (per-session stream)
       maybeCacheSessionInfoFromEvent(payload);
+      // Capture transcript entries for finalized messages
+      if (payload) {
+        // Fire-and-forget: intentionally not awaited to avoid blocking SSE stream
+        captureTranscript(payload).catch(() => {
+          // Silent failure - transcript capture should not disrupt the stream
+        });
+      }
 
       if (payload && payload.type === 'session.status') {
         const update = extractSessionStatusUpdate(payload);
@@ -8933,6 +10038,7 @@ async function main(options = {}) {
         console.warn('SSE proxy stream error:', error);
       }
     } finally {
+      stopAdapterSse();
       clearInterval(heartbeatInterval);
       cleanup();
       try {
@@ -9016,6 +10122,17 @@ async function main(options = {}) {
     try {
       const updated = await persistSettings(req.body ?? {});
       console.log(`[API:PUT /api/config/settings] Success, returning ${updated.projects?.length || 0} projects`);
+
+      // Update Claude Code adapter permission mode at runtime if it changed
+      if (typeof req.body?.claudeCodePermissionMode === 'string' && claudeCodeAdapterInstance) {
+        try {
+          const { setPermissionMode } = await import('./lib/claudecode/adapter.js');
+          setPermissionMode(req.body.claudeCodePermissionMode);
+        } catch {
+          // non-fatal
+        }
+      }
+
       res.json(updated);
     } catch (error) {
       console.error(`[API:PUT /api/config/settings] Failed to save settings:`, error);
@@ -12108,6 +13225,7 @@ async function main(options = {}) {
         original: result.original,
         modified: result.modified,
         path: result.path,
+        truncated: result.truncated || false,
         isBinary: Boolean(result.isBinary),
       });
     } catch (error) {
@@ -14013,9 +15131,71 @@ async function main(options = {}) {
     res.json({ success: true, killedCount });
   });
 
-  setupProxy(app);
-  scheduleOpenCodeApiDetection();
-  void bootstrapOpenCodeAtStartup();
+  // Detect Claude Code CLI availability (runs before backend init)
+  detectClaudeCodeCli();
+
+  // Read persisted permission mode; fall back to env var, then default
+  let claudeCodePermissionMode = ENV_CLAUDECODE_PERMISSION_MODE;
+  try {
+    const startupSettings = await readSettingsFromDisk();
+    if (typeof startupSettings.claudeCodePermissionMode === 'string') {
+      const mode = startupSettings.claudeCodePermissionMode.trim();
+      if (mode === 'default' || mode === 'acceptEdits' || mode === 'bypassPermissions') {
+        claudeCodePermissionMode = mode;
+      }
+    }
+  } catch {
+    // non-fatal, use env var default
+  }
+
+  if (ENV_BACKEND === 'claudecode') {
+    try {
+      const binary = resolvedClaudeBinary || ENV_CLAUDECODE_BINARY;
+      console.log(`[openchamber] Starting with Claude Code backend (binary: ${binary})`);
+      const { startClaudeCodeAdapter } = await import('./lib/claudecode/adapter.js');
+      claudeCodeAdapterInstance = await startClaudeCodeAdapter({
+        port: 0,
+        claudeBinary: binary,
+        cwd: process.cwd(),
+        permissionMode: claudeCodePermissionMode,
+      });
+      console.log(`[openchamber] Claude Code adapter listening on port ${claudeCodeAdapterInstance.port}`);
+      setOpenCodePort(claudeCodeAdapterInstance.port);
+      claudeCodeAdapterPort = claudeCodeAdapterInstance.port;
+      isOpenCodeReady = true;
+      isExternalOpenCode = false;
+      lastOpenCodeError = null;
+      openCodeNotReadySince = 0;
+      setupProxy(app);
+    } catch (error) {
+      console.error(`Failed to start Claude Code adapter: ${error.message}`);
+      console.log('Continuing without Claude Code integration...');
+      lastOpenCodeError = error.message;
+      setupProxy(app);
+    }
+  } else {
+    setupProxy(app);
+    scheduleOpenCodeApiDetection();
+    void bootstrapOpenCodeAtStartup().then(async () => {
+      // Start Claude Code adapter in hybrid mode if CLI was detected
+      if (resolvedClaudeBinary) {
+        try {
+          const { startClaudeCodeAdapter } = await import('./lib/claudecode/adapter.js');
+          claudeCodeAdapterInstance = await startClaudeCodeAdapter({
+            port: 0,
+            claudeBinary: resolvedClaudeBinary,
+            cwd: process.cwd(),
+            permissionMode: claudeCodePermissionMode,
+          });
+          claudeCodeAdapterPort = claudeCodeAdapterInstance.port;
+          console.log(`[openchamber] Claude Code adapter (hybrid) listening on port ${claudeCodeAdapterPort}`);
+        } catch (adapterError) {
+          console.warn(`[openchamber] Failed to start Claude Code adapter: ${adapterError.message}`);
+          claudeCodeAdapterPort = null;
+        }
+      }
+    });
+  }
 
   const distPath = (() => {
     const env = typeof process.env.OPENCHAMBER_DIST_DIR === 'string' ? process.env.OPENCHAMBER_DIST_DIR.trim() : '';
@@ -14296,12 +15476,13 @@ async function main(options = {}) {
         // ignore
       }
 
+      const proto = useTls ? 'https' : 'http';
       const displayHost = (bindHost === '0.0.0.0' || bindHost === '::' || bindHost === '[::]')
         ? 'localhost'
         : (bindHost.includes(':') ? `[${bindHost}]` : bindHost);
-      console.log(`OpenChamber server listening on ${bindHost}:${activePort}`);
-      console.log(`Health check: http://${displayHost}:${activePort}/health`);
-      console.log(`Web interface: http://${displayHost}:${activePort}`);
+      console.log(`OpenChamber server listening on ${bindHost}:${activePort}${useTls ? ' (TLS)' : ''}`);
+      console.log(`Health check: ${proto}://${displayHost}:${activePort}/health`);
+      console.log(`Web interface: ${proto}://${displayHost}:${activePort}`);
 
       if (startupTunnelRequest) {
         const startupModeLabel = startupTunnelRequest.mode === TUNNEL_MODE_QUICK

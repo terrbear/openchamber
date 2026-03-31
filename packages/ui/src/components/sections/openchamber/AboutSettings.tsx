@@ -11,13 +11,33 @@ const GITHUB_URL = 'https://github.com/btriapitsyn/openchamber';
 
 const MIN_CHECKING_DURATION = 800; // ms
 
+const formatBackendLabel = (backend: string): string => {
+  if (backend === 'claudecode') return 'Claude Code';
+  if (backend === 'opencode') return 'OpenCode';
+  return backend;
+};
+
 export const AboutSettings: React.FC = () => {
   const [updateDialogOpen, setUpdateDialogOpen] = React.useState(false);
   const [showChecking, setShowChecking] = React.useState(false);
+  const [activeBackend, setActiveBackend] = React.useState<string | null>(null);
   const updateStore = useUpdateStore();
   const { isMobile } = useDeviceInfo();
 
   const currentVersion = updateStore.info?.currentVersion || 'unknown';
+
+  React.useEffect(() => {
+    let cancelled = false;
+    fetch('/health')
+      .then((res) => res.json())
+      .then((data) => {
+        if (!cancelled && typeof data?.backend === 'string') {
+          setActiveBackend(data.backend);
+        }
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
 
   // Track if we initiated a check to show toast on completion
   const didInitiateCheck = React.useRef(false);
@@ -145,7 +165,7 @@ export const AboutSettings: React.FC = () => {
             <span className="typography-ui-label text-foreground">Version</span>
             <span className="typography-meta text-muted-foreground font-mono">{currentVersion}</span>
           </div>
-          
+
           <div className="flex items-center gap-3">
             {updateStore.checking && (
               <div className="flex items-center gap-2 text-muted-foreground">
@@ -177,10 +197,17 @@ export const AboutSettings: React.FC = () => {
             </Button>
           </div>
         </div>
-        
+
         {updateStore.error && (
           <div className="px-3 py-2 border-b border-[var(--surface-subtle)]">
             <p className="typography-meta text-[var(--status-error)]">{updateStore.error}</p>
+          </div>
+        )}
+
+        {activeBackend !== null && (
+          <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--surface-subtle)]">
+            <span className="typography-ui-label text-foreground">Backend</span>
+            <span className="typography-meta text-muted-foreground">{formatBackendLabel(activeBackend)}</span>
           </div>
         )}
 

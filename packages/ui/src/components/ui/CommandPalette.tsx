@@ -12,9 +12,11 @@ import {
 import { useUIStore } from '@/stores/useUIStore';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
+import { useProjectsStore } from '@/stores/useProjectsStore';
 import { useThemeSystem } from '@/contexts/useThemeSystem';
 import { useDeviceInfo } from '@/lib/device';
 import { RiAddLine, RiChatAi3Line, RiCheckLine, RiCodeLine, RiComputerLine, RiGitBranchLine, RiLayoutLeftLine, RiLayoutRightLine, RiMoonLine, RiQuestionLine, RiSettings3Line, RiSunLine, RiTerminalBoxLine, RiTimeLine } from '@remixicon/react';
+import { RiFolderLine } from '@remixicon/react';
 import { createWorktreeSession } from '@/lib/worktreeSessionCreator';
 import { formatShortcutForDisplay, getEffectiveShortcutCombo } from '@/lib/shortcuts';
 import { isDesktopShell, isVSCodeRuntime, isWebRuntime } from '@/lib/desktop';
@@ -45,6 +47,9 @@ export const CommandPalette: React.FC = () => {
     setCurrentSession,
     getSessionsByDirectory,
   } = useSessionStore();
+
+
+  const { projects, activeProjectId, setActiveProject } = useProjectsStore();
 
   const { currentDirectory } = useDirectoryStore();
   const { themeMode, setThemeMode } = useThemeSystem();
@@ -172,6 +177,11 @@ export const CommandPalette: React.FC = () => {
     handleClose();
   };
 
+  const handleSelectProject = (projectId: string) => {
+    setActiveProject(projectId);
+    handleClose();
+  };
+
   const directorySessions = getSessionsByDirectory(currentDirectory ?? '');
   const currentSessions = React.useMemo(() => {
     return directorySessions.slice(0, 5);
@@ -276,6 +286,32 @@ export const CommandPalette: React.FC = () => {
             </CommandItem>
           ))}
         </CommandGroup>
+
+        {projects.length >= 2 && (
+          <>
+            <CommandSeparator />
+            <CommandGroup heading="Projects">
+              {projects.map((project) => {
+                const label = project.label || project.path.split('/').filter(Boolean).pop() || project.path;
+                const isActive = project.id === activeProjectId;
+                
+                return (
+                  <CommandItem
+                    key={project.id}
+                    onSelect={() => handleSelectProject(project.id)}
+                  >
+                    <RiFolderLine className="mr-2 h-4 w-4" />
+                    <span>{label}</span>
+                    <span className="ml-auto text-xs text-[var(--color-muted-foreground)] truncate max-w-[200px]">
+                      {project.path}
+                    </span>
+                    {isActive && <RiCheckLine className="ml-2 h-4 w-4 flex-shrink-0" />}
+                  </CommandItem>
+                );
+              })}
+            </CommandGroup>
+          </>
+        )}
 
         <CommandSeparator />
 

@@ -30,8 +30,9 @@ interface DirectoryGitState {
   branches: GitBranch | null;
   log: GitLogResponse | null;
   identity: GitIdentitySummary | null;
-  diffCache: Map<string, { original: string; modified: string; fetchedAt: number; isBinary?: boolean }>;
+  diffCache: Map<string, { original: string; modified: string; truncated?: boolean; isBinary?: boolean; fetchedAt: number }>;
   lastRepoCheckAt: number;
+
   lastStatusFetch: number;
   lastStatusChange: number;
   lastLogFetch: number;
@@ -63,8 +64,8 @@ interface GitStore {
   fetchIdentity: (directory: string, git: GitAPI) => Promise<void>;
   fetchAll: (directory: string, git: GitAPI, options?: { force?: boolean; silentIfCached?: boolean }) => Promise<void>;
 
-  getDiff: (directory: string, filePath: string) => { original: string; modified: string; fetchedAt: number; isBinary?: boolean } | null;
-  setDiff: (directory: string, filePath: string, diff: { original: string; modified: string; isBinary?: boolean }) => void;
+  getDiff: (directory: string, filePath: string) => { original: string; modified: string; truncated?: boolean; isBinary?: boolean; fetchedAt: number } | null;
+  setDiff: (directory: string, filePath: string, diff: { original: string; modified: string; truncated?: boolean; isBinary?: boolean }) => void;
   clearDiffCache: (directory: string) => void;
   fetchAllDiffs: (directory: string, git: GitAPI) => Promise<void>;
   prefetchDiffs: (directory: string, git: GitAPI, filePaths: string[], options?: { maxFiles?: number }) => Promise<void>;
@@ -82,6 +83,7 @@ interface GitFileDiffResponse {
   original: string;
   modified: string;
   path: string;
+  truncated?: boolean;
   isBinary?: boolean;
 }
 
@@ -133,10 +135,10 @@ const createEmptyDirectoryState = (): DirectoryGitState => ({
 
 // LRU eviction helper for diff cache
 const evictDiffCacheIfNeeded = (
-  diffCache: Map<string, { original: string; modified: string; fetchedAt: number; isBinary?: boolean }>,
+  diffCache: Map<string, { original: string; modified: string; truncated?: boolean; isBinary?: boolean; fetchedAt: number }>,
   maxEntries: number = DIFF_CACHE_MAX_ENTRIES,
   maxTotalSize: number = DIFF_CACHE_MAX_TOTAL_SIZE_BYTES
-): Map<string, { original: string; modified: string; fetchedAt: number; isBinary?: boolean }> => {
+): Map<string, { original: string; modified: string; truncated?: boolean; isBinary?: boolean; fetchedAt: number }> => {
   // Calculate total size
   let totalSize = 0;
   for (const entry of diffCache.values()) {
@@ -152,7 +154,7 @@ const evictDiffCacheIfNeeded = (
   const entries = Array.from(diffCache.entries())
     .sort((a, b) => a[1].fetchedAt - b[1].fetchedAt);
 
-  const newCache = new Map<string, { original: string; modified: string; fetchedAt: number; isBinary?: boolean }>();
+  const newCache = new Map<string, { original: string; modified: string; truncated?: boolean; isBinary?: boolean; fetchedAt: number }>();
   let newTotalSize = 0;
 
   // Keep entries from newest to oldest until limits are reached
@@ -614,7 +616,7 @@ export const useGitStore = create<GitStore>()(
         limitedFilePaths.forEach((path) => inFlight.add(path));
 
         let nextIndex = 0;
-        const results: Array<{ path: string; diff: { original: string; modified: string; isBinary?: boolean } }> = [];
+        const results: Array<{ path: string; diff: { original: string; modified: string; truncated?: boolean; isBinary?: boolean } }> = [];
 
         const takeNext = () => {
           const current = nextIndex;
@@ -630,7 +632,7 @@ export const useGitStore = create<GitStore>()(
           const response = await Promise.race([fetchPromise, timeoutPromise]);
           return {
             path: filePath,
-            diff: { original: response.original ?? '', modified: response.modified ?? '', isBinary: response.isBinary },
+            diff: { original: response.original ?? '', modified: response.modified ?? '', truncated: response.truncated, isBinary: response.isBinary },
           };
         };
 

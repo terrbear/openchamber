@@ -671,6 +671,24 @@ function parseArgs(argv = process.argv.slice(2)) {
         options.host = value.trim();
         break;
       }
+      case 'backend': {
+        const { value: backendValue, nextIndex: backendNextIndex } = consumeValue(i, inlineValue);
+        i = backendNextIndex;
+        if (backendValue === 'opencode' || backendValue === 'claudecode') {
+          options.backend = backendValue;
+        } else if (backendValue !== undefined) {
+          throw new TunnelCliError(`--backend must be 'opencode' or 'claudecode', got '${backendValue}'`, EXIT_CODE.USAGE_ERROR);
+        } else {
+          throw new TunnelCliError("--backend requires a value ('opencode' or 'claudecode')", EXIT_CODE.USAGE_ERROR);
+        }
+        break;
+      }
+      case 'claude-binary': {
+        const { value: claudeBinaryValue, nextIndex: claudeBinaryNextIndex } = consumeValue(i, inlineValue);
+        i = claudeBinaryNextIndex;
+        options.claudeBinary = typeof claudeBinaryValue === 'string' ? claudeBinaryValue : undefined;
+        break;
+      }
       case 'ui-password': {
         const { value, nextIndex } = consumeValue(i, inlineValue);
         i = nextIndex;
@@ -863,6 +881,8 @@ OPTIONS:
   --ui-password           Protect browser UI with single password
   --foreground            Run server in foreground (use with systemd/process managers)
   --no-daemon             Alias for --foreground
+  --backend               Backend to use: opencode (default) or claudecode
+  --claude-binary         Path to the claude CLI binary (claudecode backend only)
   -h, --help              Show help
   -v, --version           Show version
 
@@ -874,6 +894,7 @@ ENVIRONMENT:
   OPENCODE_PORT               Port of external OpenCode server to connect to
   OPENCODE_SKIP_START          Skip starting OpenCode, use external server
   OPENCHAMBER_OPENCODE_HOSTNAME  Bind hostname for managed OpenCode server (default: 127.0.0.1)
+  CLAUDECODE_BINARY           Path to the claude CLI binary (claudecode backend)
 
 EXAMPLES:
   openchamber                    # Start in daemon mode on default port 3000 (or free port)
@@ -1647,6 +1668,90 @@ async function checkOpenCodeCLI(onNotice) {
   );
 }
 
+async function checkClaudeCodeCLI(claudeBinaryFlag) {
+  // Check explicit --claude-binary flag first
+  if (claudeBinaryFlag) {
+    const override = resolveExplicitBinary(claudeBinaryFlag);
+    if (override) {
+      process.env.CLAUDECODE_BINARY = override;
+      return override;
+    }
+    console.warn(`Warning: --claude-binary="${claudeBinaryFlag}" is not an executable file. Falling back to env/PATH lookup.`);
+  }
+
+  // Check CLAUDECODE_BINARY env var
+  if (process.env.CLAUDECODE_BINARY) {
+    const override = resolveExplicitBinary(process.env.CLAUDECODE_BINARY);
+    if (override) {
+      process.env.CLAUDECODE_BINARY = override;
+      return override;
+    }
+    console.warn(`Warning: CLAUDECODE_BINARY="${process.env.CLAUDECODE_BINARY}" is not an executable file. Falling back to PATH lookup.`);
+  }
+
+  const resolvedFromPath = searchPathFor('claude');
+  if (resolvedFromPath) {
+    process.env.CLAUDECODE_BINARY = resolvedFromPath;
+    return resolvedFromPath;
+  }
+
+  if (process.platform !== 'win32') {
+    const shellCandidates = [];
+    if (process.env.SHELL) {
+      shellCandidates.push(process.env.SHELL);
+    }
+    shellCandidates.push('/bin/bash', '/bin/zsh', '/bin/sh');
+
+    for (const shellPath of shellCandidates) {
+      if (!shellPath || !isExecutable(shellPath)) {
+        continue;
+      }
+      try {
+        const result = spawnSync(shellPath, ['-lic', 'command -v claude'], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        if (result.status === 0) {
+          const candidate = result.stdout.trim().split(/\s+/).pop();
+          if (candidate && isExecutable(candidate)) {
+            const dir = path.dirname(candidate);
+            const currentPath = process.env.PATH || '';
+            const segments = currentPath.split(path.delimiter).filter(Boolean);
+            if (!segments.includes(dir)) {
+              segments.unshift(dir);
+              process.env.PATH = segments.join(path.delimiter);
+            }
+            process.env.CLAUDECODE_BINARY = candidate;
+            return candidate;
+          }
+        }
+      } catch (error) {
+
+      }
+    }
+  } else {
+    try {
+      const result = spawnSync('where', ['claude'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      if (result.status === 0) {
+        const candidate = result.stdout.split(/\r?\n/).map((line) => line.trim()).find((line) => line.length > 0);
+        if (candidate && isExecutable(candidate)) {
+          process.env.CLAUDECODE_BINARY = candidate;
+          return candidate;
+        }
+      }
+    } catch (error) {
+
+    }
+  }
+
+  console.error('Error: Unable to locate the claude CLI. Specify its path with --claude-binary or CLAUDECODE_BINARY.');
+  console.error(`Current PATH: ${process.env.PATH || '<empty>'}`);
+  process.exit(1);
+}
+
 async function isPortAvailable(port) {
   if (!Number.isFinite(port) || port <= 0) {
     return false;
@@ -1753,6 +1858,8 @@ function writeInstanceOptions(instanceFilePath, options, onNotice) {
       launchMode: options.launchMode === 'foreground' ? 'foreground' : 'daemon',
       uiPassword: typeof options.uiPassword === 'string' ? options.uiPassword : undefined,
       hasUiPassword: typeof options.uiPassword === 'string',
+      backend: options.backend || 'opencode',
+      claudeBinary: options.claudeBinary || undefined,
       startedAt: Number.isFinite(options.startedAt) ? options.startedAt : Date.now(),
     };
     fs.writeFileSync(instanceFilePath, JSON.stringify(toStore, null, 2), { mode: 0o600 });
@@ -2891,6 +2998,8 @@ const commands = {
         OPENCHAMBER_PORT: String(targetPort),
         OPENCODE_BINARY: opencodeBinary,
         ...(effectiveHost ? { OPENCHAMBER_HOST: effectiveHost } : {}),
+        OPENCHAMBER_BACKEND: options.backend || 'opencode',
+        ...(options.claudeBinary ? { CLAUDECODE_BINARY: options.claudeBinary } : {}),
         ...(effectiveUiPassword ? { OPENCHAMBER_UI_PASSWORD: effectiveUiPassword } : {}),
         ...(process.env.OPENCODE_SKIP_START ? { OPENCHAMBER_SKIP_OPENCODE_START: process.env.OPENCODE_SKIP_START } : {}),
       },

@@ -1,8 +1,10 @@
 import React from 'react';
+import { RiInformationLine, RiQuestionLine, RiSettings3Line } from '@remixicon/react';
 import { cn } from '@/lib/utils';
 import { ErrorBoundary } from '../ui/ErrorBoundary';
 import { useUIStore } from '@/stores/useUIStore';
 import { isDesktopShell } from '@/lib/desktop';
+import { Tooltip, TooltipContent, TooltipTrigger } from '../ui/tooltip';
 
 export const SIDEBAR_CONTENT_WIDTH = 250;
 const SIDEBAR_MIN_WIDTH = 250;
@@ -16,7 +18,7 @@ interface SidebarProps {
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({ isOpen, isMobile, children, className }) => {
-    const { sidebarWidth, setSidebarWidth } = useUIStore();
+    const { sidebarWidth, setSidebarWidth, setSettingsDialogOpen, setAboutDialogOpen, toggleHelpDialog } = useUIStore();
     const isDesktopApp = React.useMemo(() => isDesktopShell(), []);
     const [isResizing, setIsResizing] = React.useState(false);
     const startXRef = React.useRef(0);
@@ -160,6 +162,59 @@ export const Sidebar: React.FC<SidebarProps> = ({ isOpen, isMobile, children, cl
             >
                 <div className="flex-1 overflow-hidden">
                     <ErrorBoundary>{children}</ErrorBoundary>
+                </div>
+                <div className="flex-shrink-0 border-t border-border h-12 px-2 bg-sidebar">
+                    <div className="flex h-full items-center justify-between gap-2">
+                        <button
+                            onClick={() => setSettingsDialogOpen(true)}
+                            className={cn(
+                                'flex h-8 items-center gap-2 rounded-md px-2',
+                                'text-sm font-semibold text-sidebar-foreground/90',
+                                'hover:text-sidebar-foreground hover:bg-interactive-hover',
+                                'transition-all duration-200'
+                            )}
+                        >
+                            <RiSettings3Line className="h-4 w-4" />
+                            <span>Settings</span>
+                        </button>
+                        <div className="flex items-center gap-1">
+                            {!isDesktopApp && (
+                                <Tooltip>
+                                    <TooltipTrigger asChild>
+                                        <button
+                                            onClick={() => setAboutDialogOpen(true)}
+                                            className={cn(
+                                                'flex h-8 w-8 items-center justify-center rounded-md',
+                                                'text-sidebar-foreground/70',
+                                                'hover:text-sidebar-foreground hover:bg-interactive-hover',
+                                                'transition-all duration-200'
+                                            )}
+                                        >
+                                            <RiInformationLine className="h-4 w-4" />
+                                        </button>
+                                    </TooltipTrigger>
+                                    <TooltipContent side="top">About OpenChamber</TooltipContent>
+                                </Tooltip>
+                            )}
+                            <Tooltip>
+                                <TooltipTrigger asChild>
+                                    <button
+                                        onClick={toggleHelpDialog}
+                                        className={cn(
+                                            'flex h-8 w-8 items-center justify-center rounded-md',
+                                            'text-sidebar-foreground/70',
+                                            'hover:text-sidebar-foreground hover:bg-interactive-hover',
+                                            'transition-all duration-200'
+                                        )}
+                                        aria-label="Keyboard shortcuts"
+                                    >
+                                        <RiQuestionLine className="h-4 w-4" />
+                                    </button>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">Keyboard shortcuts</TooltipContent>
+                            </Tooltip>
+                        </div>
+                    </div>
                 </div>
             </div>
         </aside>

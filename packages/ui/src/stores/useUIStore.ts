@@ -504,6 +504,7 @@ interface UIStore {
   autoDeleteEnabled: boolean;
   autoDeleteAfterDays: number;
   autoDeleteLastRunAt: number | null;
+  autoArchiveLastRunAt: number | null;
   messageLimit: number;
   fontSize: number;
   terminalFontSize: number;
@@ -593,6 +594,7 @@ interface UIStore {
   setPendingFileNavigation: (navigation: PendingFileNavigation | null) => void;
   setPendingFileFocusPath: (path: string | null) => void;
   navigateToDiff: (filePath: string) => void;
+  navigateToFile: (filePath: string) => void;
   consumePendingDiffFile: () => string | null;
   setIsMobile: (isMobile: boolean) => void;
   toggleCommandPalette: () => void;
@@ -618,6 +620,7 @@ interface UIStore {
   setAutoDeleteEnabled: (value: boolean) => void;
   setAutoDeleteAfterDays: (days: number) => void;
   setAutoDeleteLastRunAt: (timestamp: number | null) => void;
+  setAutoArchiveLastRunAt: (timestamp: number | null) => void;
   setMessageLimit: (value: number) => void;
   setFontSize: (size: number) => void;
   setTerminalFontSize: (size: number) => void;
@@ -731,6 +734,7 @@ export const useUIStore = create<UIStore>()(
         autoDeleteEnabled: false,
         autoDeleteAfterDays: 30,
         autoDeleteLastRunAt: null,
+        autoArchiveLastRunAt: null,
         messageLimit: 200,
         fontSize: 100,
         terminalFontSize: 13,
@@ -1205,6 +1209,28 @@ export const useUIStore = create<UIStore>()(
           set({ pendingDiffFile: filePath, activeMainTab: 'diff' });
         },
 
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        navigateToFile: (_filePath) => {
+          const guard = get().mainTabGuard;
+          if (guard && !guard('files')) {
+            return;
+          }
+          const state = get();
+          const currentTab = state.activeMainTab;
+          const fullscreenTabs: MainTab[] = ['files', 'diff'];
+          const isEnteringFullscreen = !fullscreenTabs.includes(currentTab);
+
+          if (isEnteringFullscreen) {
+            set({
+              activeMainTab: 'files',
+              sidebarOpenBeforeFullscreenTab: state.isSidebarOpen,
+              isSidebarOpen: false,
+            });
+          } else {
+            set({ activeMainTab: 'files' });
+          }
+        },
+
         consumePendingDiffFile: () => {
           const { pendingDiffFile } = get();
           if (pendingDiffFile) {
@@ -1315,6 +1341,10 @@ export const useUIStore = create<UIStore>()(
 
         setAutoDeleteLastRunAt: (timestamp) => {
           set({ autoDeleteLastRunAt: timestamp });
+        },
+
+        setAutoArchiveLastRunAt: (timestamp) => {
+          set({ autoArchiveLastRunAt: timestamp });
         },
 
         setMessageLimit: (value) => {
@@ -1836,6 +1866,7 @@ export const useUIStore = create<UIStore>()(
           autoDeleteEnabled: state.autoDeleteEnabled,
           autoDeleteAfterDays: state.autoDeleteAfterDays,
           autoDeleteLastRunAt: state.autoDeleteLastRunAt,
+          autoArchiveLastRunAt: state.autoArchiveLastRunAt,
           messageLimit: state.messageLimit,
           fontSize: state.fontSize,
           terminalFontSize: state.terminalFontSize,

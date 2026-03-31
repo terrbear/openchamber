@@ -23,8 +23,6 @@ import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
 import { useWorkerPool } from '@/contexts/DiffWorkerProvider';
 import { ensurePierreThemeRegistered, getResolvedShikiTheme } from '@/lib/shiki/appThemeRegistry';
 import { getDefaultTheme } from '@/lib/theme/themes';
-
-import { useUIStore } from '@/stores/useUIStore';
 import { useDeviceInfo } from '@/lib/device';
 import { cn } from '@/lib/utils';
 
@@ -206,7 +204,6 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
   const lightTheme = themeContext?.availableThemes.find(t => t.metadata.id === themeContext.lightThemeId) ?? getDefaultTheme(false);
   const darkTheme = themeContext?.availableThemes.find(t => t.metadata.id === themeContext.darkThemeId) ?? getDefaultTheme(true);
 
-  useUIStore();
   const { isMobile } = useDeviceInfo();
 
   const diffCommentController = useInlineCommentController<SelectedLineRange>({
@@ -241,6 +238,7 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
 
   const selectionRef = useRef<SelectedLineRange | null>(null);
   const editingDraftIdRef = useRef<string | null>(null);
+
   // Use a ref to track if we're currently applying a selection programmatically
   // to avoid loop with onLineSelected callback
   const isApplyingSelectionRef = useRef(false);
@@ -260,12 +258,10 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
       return;
     }
 
-    const prevSelection = selectionRef.current;
-
     // Mobile tap-to-extend: if selection exists and new tap is on same side, extend range
-    if (isMobile && prevSelection && range && range.side === prevSelection.side) {
-      const start = Math.min(prevSelection.start, range.start);
-      const end = Math.max(prevSelection.end, range.end);
+    if (isMobile && selectionRef.current && range && range.side === selectionRef.current.side) {
+      const start = Math.min(selectionRef.current.start, range.start);
+      const end = Math.max(selectionRef.current.end, range.end);
       setSelection({ ...range, start, end });
     } else {
       setSelection(range);
@@ -439,6 +435,14 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
   }, [darkResolvedTheme, diffThemeKey, isDark, lightResolvedTheme]);
 
 
+  // Keep a stable callback ref for onLineSelected so that `options` doesn't
+  // change identity every time selection/editingDraftId changes.
+  const handleSelectionChangeRef = useRef(handleSelectionChange);
+  handleSelectionChangeRef.current = handleSelectionChange;
+  const stableOnLineSelected = useCallback((range: SelectedLineRange | null) => {
+    handleSelectionChangeRef.current(range);
+  }, []);
+
   const options = useMemo(() => ({
     theme: {
       dark: darkTheme.metadata.id,
@@ -457,10 +461,10 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
     disableFileHeader: true,
     enableLineSelection: true,
     enableHoverUtility: false,
-    onLineSelected: handleSelectionChange,
+    onLineSelected: stableOnLineSelected,
     unsafeCSS: WEBKIT_SCROLL_FIX_CSS,
     renderAnnotation,
-  }), [darkTheme.metadata.id, isDark, lightTheme.metadata.id, renderSideBySide, wrapLines, handleSelectionChange, renderAnnotation]);
+  }), [darkTheme.metadata.id, isDark, lightTheme.metadata.id, renderSideBySide, wrapLines, stableOnLineSelected, renderAnnotation]);
 
 
   const lineAnnotations = useMemo(() => {
@@ -477,6 +481,9 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
     lineAnnotationsRef.current = lineAnnotations;
   }, [lineAnnotations]);
 
+  // Imperative render (like upstream OpenCode): avoids `parseDiffFromFile` on main thread.
+  // IMPORTANT: This effect only depends on content/layout/theme changes — NOT annotations.
+  // Annotation updates are handled incrementally via setLineAnnotations() below.
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
@@ -542,6 +549,9 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
     };
   }, [diffThemeKey, fileName, language, modified, options, original, workerPool]);
 
+  // Incrementally update annotations without full re-render.
+  // This runs when selection/drafts change (frequently) and avoids tearing down
+  // the entire diff DOM just to add/remove a comment input.
   useEffect(() => {
     const instance = diffInstanceRef.current;
     if (!instance) return;

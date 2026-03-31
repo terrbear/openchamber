@@ -21,6 +21,7 @@ export const AboutDialog: React.FC<AboutDialogProps> = ({
   onOpenChange,
 }) => {
   const [version, setVersion] = React.useState<string | null>(null);
+  const [activeBackend, setActiveBackend] = React.useState<string | null>(null);
   const [isCopyingDiagnostics, setIsCopyingDiagnostics] = React.useState(false);
   const [copiedDiagnostics, setCopiedDiagnostics] = React.useState(false);
   const [diagnosticsReport, setDiagnosticsReport] = React.useState<string | null>(null);
@@ -78,6 +79,23 @@ export const AboutDialog: React.FC<AboutDialogProps> = ({
 
   React.useEffect(() => {
     if (!open) {
+      setActiveBackend(null);
+      return;
+    }
+    let cancelled = false;
+    fetch('/health')
+      .then((res) => res.json())
+      .then((data) => {
+        if (!cancelled && typeof data?.backend === 'string') {
+          setActiveBackend(data.backend);
+        }
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [open]);
+
+  React.useEffect(() => {
+    if (!open) {
       setDiagnosticsReport(null);
       setIsPreparingDiagnostics(false);
       return;
@@ -123,17 +141,30 @@ export const AboutDialog: React.FC<AboutDialogProps> = ({
           </div>
 
           <p className="typography-meta text-muted-foreground">
-            A fan-made interface for{' '}
-            <a
-              href="https://opencode.ai/"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="hover:text-foreground transition-colors"
-            >
-              OpenCode
-            </a>{' '}
-            agent
+            {activeBackend === 'claudecode' ? (
+              <>A fan-made interface for Claude Code agent</>
+            ) : activeBackend === 'opencode' ? (
+              <>
+                A fan-made interface for{' '}
+                <a
+                  href="https://opencode.ai/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="hover:text-foreground transition-colors"
+                >
+                  OpenCode
+                </a>{' '}
+                agent
+              </>
+            ) : (
+              <>A fan-made interface for your AI agent</>
+            )}
           </p>
+          {activeBackend !== null && (
+            <p className="typography-micro text-muted-foreground/70">
+              Backend: {activeBackend === 'claudecode' ? 'Claude Code' : activeBackend === 'opencode' ? 'OpenCode' : activeBackend}
+            </p>
+          )}
 
           <div className="flex flex-col items-center gap-2 pt-2">
             <button

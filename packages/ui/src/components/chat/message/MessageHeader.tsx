@@ -11,10 +11,17 @@ interface MessageHeaderProps {
     modelName: string | undefined;
     variant?: string;
     isDarkTheme: boolean;
+    createdAt?: number;
 }
 
-const MessageHeader: React.FC<MessageHeaderProps> = ({ isUser, providerID, agentName, modelName, variant, isDarkTheme }) => {
+const MessageHeader: React.FC<MessageHeaderProps> = ({ isUser, providerID, agentName, modelName, variant, isDarkTheme, createdAt }) => {
     const { src: logoSrc, onError: handleLogoError, hasLogo } = useProviderLogo(providerID);
+
+    const formattedTime = React.useMemo(() => {
+        if (!createdAt || createdAt === 0) return null;
+        const date = new Date(createdAt);
+        return date.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+    }, [createdAt]);
 
     return (
         <div className={cn('mb-2')}>
@@ -90,6 +97,11 @@ const MessageHeader: React.FC<MessageHeaderProps> = ({ isUser, providerID, agent
                             </div>
                         )}
                     </div>
+                    {formattedTime && (
+                        <div className="typography-micro" style={{ color: 'var(--chat-timestamp)' }}>
+                            {formattedTime}
+                        </div>
+                    )}
                 </div>
             </div>
         </div>

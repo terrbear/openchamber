@@ -13,6 +13,7 @@ import { useMenuActions } from '@/hooks/useMenuActions';
 import { useSessionStatusBootstrap } from '@/hooks/useSessionStatusBootstrap';
 import { useServerSessionStatus } from '@/hooks/useServerSessionStatus';
 import { useSessionAutoCleanup } from '@/hooks/useSessionAutoCleanup';
+import { useSessionAutoArchive } from '@/hooks/useSessionAutoArchive';
 import { useQueuedMessageAutoSend } from '@/hooks/useQueuedMessageAutoSend';
 import { useRouter } from '@/hooks/useRouter';
 import { usePushVisibilityBeacon } from '@/hooks/usePushVisibilityBeacon';
@@ -389,6 +390,7 @@ function App({ apis }: AppProps) {
 
   useSessionStatusBootstrap({ enabled: embeddedBackgroundWorkEnabled });
   useSessionAutoCleanup({ enabled: embeddedBackgroundWorkEnabled });
+  useSessionAutoArchive();
   useQueuedMessageAutoSend({ enabled: embeddedBackgroundWorkEnabled });
 
   React.useEffect(() => {

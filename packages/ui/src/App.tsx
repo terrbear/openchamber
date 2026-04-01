@@ -150,8 +150,8 @@ function SyncAppEffects({ apis, embeddedBackgroundWorkEnabled }: {
   const githubApi = embeddedBackgroundWorkEnabled ? apis.github : undefined;
   useGitHubPrBackgroundTracking(githubApi, apis.git);
   usePwaManifestSync();
-  useSessionAutoCleanup(embeddedBackgroundWorkEnabled);
-  useQueuedMessageAutoSend(embeddedBackgroundWorkEnabled);
+  useSessionAutoCleanup({ enabled: embeddedBackgroundWorkEnabled });
+  useQueuedMessageAutoSend({ enabled: embeddedBackgroundWorkEnabled });
   useKeyboardShortcuts();
 
   return <SyncOptimisticBridge />;
@@ -416,9 +416,7 @@ function App({ apis }: AppProps) {
   useMenuActions(handleToggleMemoryDebug);
 
   useSessionStatusBootstrap({ enabled: embeddedBackgroundWorkEnabled });
-  useSessionAutoCleanup({ enabled: embeddedBackgroundWorkEnabled });
   useSessionAutoArchive();
-  useQueuedMessageAutoSend({ enabled: embeddedBackgroundWorkEnabled });
 
   React.useEffect(() => {
     if (embeddedSessionChat) {

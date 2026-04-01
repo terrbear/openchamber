@@ -3,6 +3,7 @@ import path from 'path';
 import { spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import http from 'http';
+import https from 'https';
 import net from 'net';
 import { fileURLToPath } from 'url';
 import os from 'os';
@@ -823,7 +824,25 @@ async function main(options = {}) {
   const serverStartedAt = new Date().toISOString();
   app.set('trust proxy', true);
   expressApp = app;
-  server = http.createServer(app);
+
+  // Use HTTPS when TLS certificates are available (e.g. from mkcert).
+  // Looks in ~/.config/openchamber/certs/ or OPENCHAMBER_TLS_CERT / OPENCHAMBER_TLS_KEY env vars.
+  const tlsCertPath = process.env.OPENCHAMBER_TLS_CERT || path.join(os.homedir(), '.config', 'openchamber', 'certs', 'cert.pem');
+  const tlsKeyPath = process.env.OPENCHAMBER_TLS_KEY || path.join(os.homedir(), '.config', 'openchamber', 'certs', 'key.pem');
+  let useTls = false;
+  try {
+    if (fs.existsSync(tlsCertPath) && fs.existsSync(tlsKeyPath)) {
+      const tlsOpts = { cert: fs.readFileSync(tlsCertPath), key: fs.readFileSync(tlsKeyPath) };
+      server = https.createServer(tlsOpts, app);
+      useTls = true;
+      console.log(`TLS enabled (cert: ${tlsCertPath})`);
+    }
+  } catch (err) {
+    console.warn(`TLS certificate found but failed to load: ${err.message}`);
+  }
+  if (!useTls) {
+    server = http.createServer(app);
+  }
 
   const uiPassword = typeof options.uiPassword === 'string' ? options.uiPassword : null;
   const bootstrapResult = bootstrapRuntime.setupBaseRoutes(app, {

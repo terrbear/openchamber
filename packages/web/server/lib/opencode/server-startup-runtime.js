@@ -50,9 +50,10 @@ export const createServerStartupRuntime = (dependencies) => {
         const displayHost = (bindHost === '0.0.0.0' || bindHost === '::' || bindHost === '[::]')
           ? 'localhost'
           : (bindHost.includes(':') ? `[${bindHost}]` : bindHost);
+        const proto = typeof server.addContext === 'function' || server.constructor?.name === 'Server' && typeof server._sharedCreds !== 'undefined' ? 'https' : 'http';
         console.log(`OpenChamber server listening on ${bindHost}:${activePort}`);
-        console.log(`Health check: http://${displayHost}:${activePort}/health`);
-        console.log(`Web interface: http://${displayHost}:${activePort}`);
+        console.log(`Health check: ${proto}://${displayHost}:${activePort}/health`);
+        console.log(`Web interface: ${proto}://${displayHost}:${activePort}`);
 
         if (startupTunnelRequest) {
           const startupModeLabel = startupTunnelRequest.mode === TUNNEL_MODE_QUICK

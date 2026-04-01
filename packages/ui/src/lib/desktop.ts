@@ -97,6 +97,7 @@ export type DesktopSettings = {
   }>;  // Per-provider custom model groups configuration
   autoDeleteEnabled?: boolean;
   autoDeleteAfterDays?: number;
+  sessionRetentionAction?: 'archive' | 'delete';
   tunnelProvider?: string;
   tunnelMode?: 'quick' | 'managed-remote' | 'managed-local';
   tunnelBootstrapTtlMs?: number | null;
@@ -155,6 +156,9 @@ export type DesktopSettings = {
 
   // Per-project scratch pad text
   scratchPads?: Record<string, string>;
+
+  // macOS window vibrancy effect (default: true)
+  desktopVibrancy?: boolean;
 };
 
 type TauriGlobal = {
@@ -642,6 +646,21 @@ export const clearDesktopCache = async (): Promise<boolean> => {
     return true;
   } catch (error) {
     console.warn('Failed to clear cache', error);
+    return false;
+  }
+};
+
+export const desktopSetVibrancy = async (enabled: boolean): Promise<boolean> => {
+  if (!isTauriShell()) {
+    return false;
+  }
+
+  try {
+    const tauri = (window as unknown as { __TAURI__?: TauriGlobal }).__TAURI__;
+    await tauri?.core?.invoke?.('desktop_set_vibrancy', { enabled });
+    return true;
+  } catch (error) {
+    console.warn('Failed to set vibrancy', error);
     return false;
   }
 };

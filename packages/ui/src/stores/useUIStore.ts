@@ -12,6 +12,7 @@ export type MermaidRenderingMode = 'svg' | 'ascii';
 export type UserMessageRenderingMode = 'markdown' | 'plain';
 export type ChatRenderMode = 'sorted' | 'live';
 export type ActivityRenderMode = 'collapsed' | 'summary';
+export type SessionRetentionAction = 'archive' | 'delete';
 
 type ContextPanelTab = {
   id: string;
@@ -503,6 +504,7 @@ interface UIStore {
   showDeletionDialog: boolean;
   autoDeleteEnabled: boolean;
   autoDeleteAfterDays: number;
+  sessionRetentionAction: SessionRetentionAction;
   autoDeleteLastRunAt: number | null;
   autoArchiveLastRunAt: number | null;
   messageLimit: number;
@@ -619,6 +621,7 @@ interface UIStore {
   setShowDeletionDialog: (value: boolean) => void;
   setAutoDeleteEnabled: (value: boolean) => void;
   setAutoDeleteAfterDays: (days: number) => void;
+  setSessionRetentionAction: (value: SessionRetentionAction) => void;
   setAutoDeleteLastRunAt: (timestamp: number | null) => void;
   setAutoArchiveLastRunAt: (timestamp: number | null) => void;
   setMessageLimit: (value: number) => void;
@@ -733,6 +736,7 @@ export const useUIStore = create<UIStore>()(
         showDeletionDialog: true,
         autoDeleteEnabled: false,
         autoDeleteAfterDays: 30,
+        sessionRetentionAction: 'archive',
         autoDeleteLastRunAt: null,
         autoArchiveLastRunAt: null,
         messageLimit: 200,
@@ -1339,6 +1343,10 @@ export const useUIStore = create<UIStore>()(
           set({ autoDeleteAfterDays: clampedDays });
         },
 
+        setSessionRetentionAction: (value) => {
+          set({ sessionRetentionAction: value });
+        },
+
         setAutoDeleteLastRunAt: (timestamp) => {
           set({ autoDeleteLastRunAt: timestamp });
         },
@@ -1865,6 +1873,7 @@ export const useUIStore = create<UIStore>()(
           showDeletionDialog: state.showDeletionDialog,
           autoDeleteEnabled: state.autoDeleteEnabled,
           autoDeleteAfterDays: state.autoDeleteAfterDays,
+          sessionRetentionAction: state.sessionRetentionAction,
           autoDeleteLastRunAt: state.autoDeleteLastRunAt,
           autoArchiveLastRunAt: state.autoArchiveLastRunAt,
           messageLimit: state.messageLimit,

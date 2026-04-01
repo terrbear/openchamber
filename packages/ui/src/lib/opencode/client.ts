@@ -1,7 +1,6 @@
 import { createOpencodeClient, OpencodeClient } from "@opencode-ai/sdk/v2";
 import type { FilesAPI, RuntimeAPIs } from "../api/types";
 import { getDesktopHomeDirectory } from "../desktop";
-import { useConnectionsStore } from '@/stores/useConnectionsStore';
 import type {
   Session,
   Message,
@@ -12,22 +11,10 @@ import type {
   Agent,
   TextPartInput,
   FilePartInput,
-  Event,
 } from "@opencode-ai/sdk/v2";
 import type { PermissionRequest } from "@/types/permission";
 import type { QuestionRequest } from "@/types/question";
 import { waitForWorktreeBootstrap } from "@/lib/worktrees/worktreeBootstrap";
-type StreamEvent<TData> = {
-  data: TData;
-  event?: string;
-  id?: string;
-  retry?: number;
-};
-
-export type RoutedOpencodeEvent = {
-  directory: string;
-  payload: Event;
-};
 
 // Use relative path by default (works with both dev and nginx proxy server)
 // Can be overridden with VITE_OPENCODE_URL for absolute URLs in special deployments
@@ -148,29 +135,10 @@ class OpencodeService {
   private client: OpencodeClient;
   private baseUrl: string;
   private scopedClients: Map<string, OpencodeClient> = new Map();
-  private sseAbortControllers: Map<string, AbortController> = new Map();
   private currentDirectory: string | undefined = undefined;
   private directoryContextQueue: Promise<void> = Promise.resolve();
-
-  private globalSseAbortController: AbortController | null = null;
-  private globalSseTask: Promise<void> | null = null;
-  private globalSseIsConnected = false;
-  private globalSseListeners: Set<(event: RoutedOpencodeEvent) => void> = new Set();
-  private globalSseOpenListeners: Set<() => void> = new Set();
-  private globalSseErrorListeners: Set<(error: unknown) => void> = new Set();
-  private globalSseQueue: Array<RoutedOpencodeEvent | undefined> = [];
-  private globalSseBuffer: Array<RoutedOpencodeEvent | undefined> = [];
-  private globalSseCoalesced: Map<string, number> = new Map();
-  private globalSseStaleDeltas: Set<string> = new Set();
-  private globalSseFlushTimer: ReturnType<typeof setTimeout> | null = null;
-  private globalSseLastFlushAt = 0;
   private listDirectoryInFlight: Map<string, Promise<FilesystemEntry[]>> = new Map();
   private listDirectoryCache: Map<string, { entries: FilesystemEntry[]; expiresAt: number }> = new Map();
-
-  // Multi-connection support
-  private connectionClients: Map<string, OpencodeClient> = new Map();
-  private connectionBaseUrls: Map<string, string> = new Map();
-  private connectionSseAbortControllers: Map<string, AbortController> = new Map();
 
   constructor(baseUrl: string = DEFAULT_BASE_URL) {
     const desktopBase = resolveDesktopBaseUrl();
@@ -181,6 +149,16 @@ class OpencodeService {
 
   getBaseUrl(): string {
     return this.baseUrl;
+  }
+
+  /** Expose the raw SDK client for direct use (e.g., SyncProvider) */
+  getSdkClient(): OpencodeClient {
+    return this.client;
+  }
+
+  /** Get a scoped SDK client for a specific directory */
+  getScopedSdkClient(directory: string): OpencodeClient {
+    return this.getScopedApiClient(directory);
   }
 
   /**
@@ -197,271 +175,6 @@ class OpencodeService {
     const scoped = createOpencodeClient({ baseUrl: this.baseUrl, directory: normalized });
     this.scopedClients.set(key, scoped);
     return scoped;
-  }
-
-  /**
-   * Returns an SDK client for a specific connection.
-   * Creates and caches client instances per connection ID.
-   * The local connection ('local') uses the existing this.client instance.
-   * 
-   * @param connectionId - The connection ID
-   * @param baseUrl - Base URL for non-local, non-cached connections (required for new connections)
-   */
-  getClientForConnection(connectionId: string, baseUrl?: string): OpencodeClient {
-    // Local connection uses the default client
-    if (connectionId === 'local') {
-      return this.client;
-    }
-
-    // Check cache first
-    const existing = this.connectionClients.get(connectionId);
-    if (existing) {
-      return existing;
-    }
-
-    // SSR fallback
-    if (typeof window === 'undefined') {
-      return this.client;
-    }
-
-    // For new connections, baseUrl must be provided
-    if (!baseUrl) {
-      console.warn(`[OpencodeService] Base URL not provided for connection ${connectionId}, falling back to local`);
-      return this.client;
-    }
-
-    // Create new client with provided baseUrl
-    const absoluteBaseUrl = ensureAbsoluteBaseUrl(baseUrl);
-    const client = createOpencodeClient({ baseUrl: absoluteBaseUrl });
-    this.connectionClients.set(connectionId, client);
-    this.connectionBaseUrls.set(connectionId, absoluteBaseUrl);
-    
-    return client;
-  }
-
-  /**
-   * Returns the base URL for a connection. For local connections, returns the
-   * default base URL. For remote connections, returns the cached absolute URL.
-   */
-  getBaseUrlForConnection(connectionId: string): string {
-    if (!connectionId || connectionId === 'local') {
-      return this.baseUrl;
-    }
-    const cached = this.connectionBaseUrls.get(connectionId);
-    if (cached) {
-      return cached;
-    }
-    // Trigger client creation which also caches the base URL
-    this.resolveClient(connectionId);
-    return this.connectionBaseUrls.get(connectionId) ?? this.baseUrl;
-  }
-
-  /**
-   * Clean up cached resources for a removed connection.
-   * Should be called when a connection is removed from the store.
-   */
-  cleanupConnection(connectionId: string): void {
-    if (connectionId === 'local') {
-      return; // Never clean up local connection
-    }
-
-    // Abort and clean up SSE subscription
-    const sseController = this.connectionSseAbortControllers.get(connectionId);
-    if (sseController) {
-      sseController.abort();
-      this.connectionSseAbortControllers.delete(connectionId);
-    }
-
-    // Remove cached client and baseUrl
-    this.connectionClients.delete(connectionId);
-    this.connectionBaseUrls.delete(connectionId);
-  }
-
-  /**
-   * Resolves the appropriate SDK client for a given connectionId.
-   * When connectionId is omitted or 'local', returns this.client.
-   * When connectionId is provided and not 'local', looks up the connection from the store
-   * and returns a client for that connection's baseUrl.
-   * 
-   * @param connectionId - Optional connection ID to resolve
-   * @returns OpencodeClient instance for the connection
-   */
-  private resolveClient(connectionId?: string): OpencodeClient {
-    // Default to local client when no connectionId specified or when it's explicitly 'local'
-    if (!connectionId || connectionId === 'local') {
-      return this.client;
-    }
-
-    // Check if we already have a cached client for this connection
-    const cached = this.connectionClients.get(connectionId);
-    if (cached) {
-      return cached;
-    }
-
-    // SSR fallback
-    if (typeof window === 'undefined') {
-      return this.client;
-    }
-
-    // Look up the connection from the store to get its baseUrl
-    try {
-      const store = useConnectionsStore.getState();
-      const connection = store.connections.find(conn => conn.id === connectionId);
-      
-      if (!connection) {
-        console.warn(`[OpencodeService] Connection ${connectionId} not found, falling back to local`);
-        return this.client;
-      }
-
-      // Create and cache the client for this connection
-      return this.getClientForConnection(connectionId, connection.baseUrl);
-    } catch (error) {
-      console.warn(`[OpencodeService] Failed to resolve connection ${connectionId}:`, error);
-      return this.client;
-    }
-  }
-
-  /**
-   * Subscribe to SSE events from a specific connection.
-   * Creates an independent SSE loop for the connection with its own AbortController.
-   * The global SSE subscription (runGlobalSseLoop) handles only the local connection.
-   */
-  subscribeToConnectionEvents(
-    connectionId: string,
-    onEvent: (event: RoutedOpencodeEvent) => void,
-    onError?: (error: unknown) => void,
-    onOpen?: () => void
-  ): () => void {
-    // Local connection should use the global SSE subscription
-    if (connectionId === 'local') {
-      return this.subscribeToGlobalEvents(onEvent, onError, onOpen);
-    }
-
-    // Ensure client is cached before starting SSE
-    this.getClientForConnection(connectionId);
-    const baseUrl = this.connectionBaseUrls.get(connectionId);
-    
-    if (!baseUrl) {
-      console.warn(`[OpencodeService] Base URL not found for connection ${connectionId}`);
-      return () => {}; // no-op cleanup
-    }
-    
-    // Stop any existing SSE for this connection
-    const existingController = this.connectionSseAbortControllers.get(connectionId);
-    if (existingController) {
-      existingController.abort();
-    }
-
-    const abortController = new AbortController();
-    this.connectionSseAbortControllers.set(connectionId, abortController);
-
-    // Start SSE loop for this connection
-    const startSseLoop = async () => {
-      const globalEndpoint = `${baseUrl.replace(/\/+$/, '')}/global/event`;
-      let attempt = 0;
-      let lastEventId: string | undefined;
-
-      while (!abortController.signal.aborted) {
-        try {
-          const headers: Record<string, string> = {
-            Accept: 'text/event-stream',
-            'Cache-Control': 'no-cache',
-          };
-          if (lastEventId) {
-            headers['Last-Event-ID'] = lastEventId;
-          }
-
-          const response = await fetch(globalEndpoint, {
-            method: 'GET',
-            headers,
-            signal: abortController.signal,
-          });
-
-          if (!response.ok || !response.body) {
-            throw new Error(`SSE connect failed with status ${response.status}`);
-          }
-
-          attempt = 0;
-          if (!abortController.signal.aborted && onOpen) {
-            onOpen();
-          }
-
-          const reader = response.body.getReader();
-          const decoder = new TextDecoder();
-          let buffer = '';
-
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              if (abortController.signal.aborted) break;
-              if (!value || value.length === 0) continue;
-
-              buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-              const blocks = buffer.split('\n\n');
-              buffer = blocks.pop() ?? '';
-
-              for (const block of blocks) {
-                const parsed = this.parseSseBlock(block);
-                if (!parsed) continue;
-                if (parsed.id) {
-                  lastEventId = parsed.id;
-                }
-
-                const routed = this.normalizeRoutedSsePayload(parsed.data);
-                if (routed && !abortController.signal.aborted) {
-                  onEvent(routed);
-                }
-              }
-            }
-
-            const remaining = buffer.trim();
-            if (remaining && !abortController.signal.aborted) {
-              const parsed = this.parseSseBlock(remaining);
-              if (parsed?.id) {
-                lastEventId = parsed.id;
-              }
-              const routed = parsed ? this.normalizeRoutedSsePayload(parsed.data) : null;
-              if (routed) {
-                onEvent(routed);
-              }
-            }
-          } finally {
-            // Always release the reader, even on error/abort
-            try {
-              reader.releaseLock();
-            } catch {
-              // Already closed
-            }
-          }
-        } catch (error: unknown) {
-          if ((error as Error)?.name === 'AbortError' || abortController.signal.aborted) {
-            return;
-          }
-          console.error(`[OpencodeService] SSE error for connection ${connectionId}:`, error);
-          if (onError && !abortController.signal.aborted) {
-            onError(error);
-          }
-        }
-
-        if (abortController.signal.aborted) {
-          break;
-        }
-
-        attempt += 1;
-        const delay = Math.min(3000 * Math.pow(2, attempt), 30000);
-        await new Promise((resolve) => setTimeout(resolve, delay));
-      }
-    };
-
-    // Start the loop
-    void startSseLoop();
-
-    // Return cleanup function
-    return () => {
-      this.connectionSseAbortControllers.delete(connectionId);
-      abortController.abort();
-    };
   }
 
   private normalizeCandidatePath(path?: string | null): string | null {
@@ -653,28 +366,25 @@ class OpencodeService {
   }
 
   // Session Management
-  async listSessions(connectionId?: string): Promise<Session[]> {
-    const client = this.resolveClient(connectionId);
-    const response = await client.session.list(
+  async listSessions(): Promise<Session[]> {
+    const response = await this.client.session.list(
       this.currentDirectory ? { directory: this.currentDirectory } : undefined
     );
     return Array.isArray(response.data) ? response.data : [];
   }
 
-  async createSession(params?: { parentID?: string; title?: string; connectionId?: string }): Promise<Session> {
-    const { connectionId, ...sessionParams } = params ?? {};
-    const client = this.resolveClient(connectionId);
-    const response = await client.session.create({
+  async createSession(params?: { parentID?: string; title?: string }): Promise<Session> {
+    const response = await this.client.session.create({
       ...(this.currentDirectory ? { directory: this.currentDirectory } : {}),
-      ...sessionParams
+      parentID: params?.parentID,
+      title: params?.title
     });
     if (!response.data) throw new Error('Failed to create session');
     return response.data;
   }
 
-  async getSession(id: string, connectionId?: string): Promise<Session> {
-    const client = this.resolveClient(connectionId);
-    const response = await client.session.get({
+  async getSession(id: string): Promise<Session> {
+    const response = await this.client.session.get({
       sessionID: id,
       ...(this.currentDirectory ? { directory: this.currentDirectory } : {})
     });
@@ -682,9 +392,8 @@ class OpencodeService {
     return response.data;
   }
 
-  async deleteSession(id: string, connectionId?: string): Promise<boolean> {
-    const client = this.resolveClient(connectionId);
-    const response = await client.session.delete({
+  async deleteSession(id: string): Promise<boolean> {
+    const response = await this.client.session.delete({
       sessionID: id,
       ...(this.currentDirectory ? { directory: this.currentDirectory } : {})
     });
@@ -903,7 +612,6 @@ class OpencodeService {
     }>;
     messageId?: string;
     agentMentions?: Array<{ name: string; source?: { value: string; start: number; end: number } }>;
-    connectionId?: string;
     format?: {
       type: 'json_schema';
       schema: Record<string, unknown>;
@@ -985,7 +693,7 @@ class OpencodeService {
     // Use async prompt endpoint so the client doesn't block waiting
     // for model work (SSE will deliver output/status).
     // This avoids 504s from proxy timeouts on long-running turns.
-    const base = this.getBaseUrlForConnection(params.connectionId ?? 'local').replace(/\/+$/, '');
+    const base = this.baseUrl.replace(/\/+$/, '');
     let url: URL;
     try {
       url = new URL(`${base}/session/${encodeURIComponent(params.id)}/prompt_async`);
@@ -1032,6 +740,7 @@ class OpencodeService {
           },
           agent: params.agent,
           variant: params.variant,
+          ...(params.messageId ? { messageID: params.messageId } : {}),
           ...(params.format ? { format: params.format } : {}),
           parts,
         }),
@@ -1489,683 +1198,8 @@ class OpencodeService {
     }
   }
 
-  private parseSseBlock(block: string): { data: unknown; id?: string } | null {
-    if (!block) return null;
-
-    const lines = block.split('\n');
-    const dataLines: string[] = [];
-    let eventId: string | undefined;
-
-    for (const line of lines) {
-      if (line.startsWith('data:')) {
-        dataLines.push(line.slice(5).replace(/^\s/, ''));
-      } else if (line.startsWith('id:')) {
-        const candidate = line.slice(3).trim();
-        if (candidate) {
-          eventId = candidate;
-        }
-      }
-    }
-
-    if (dataLines.length === 0) {
-      return null;
-    }
-
-    const payloadText = dataLines.join('\n').trim();
-    if (!payloadText) {
-      return null;
-    }
-
-    try {
-      const data = JSON.parse(payloadText) as unknown;
-      return { data, id: eventId };
-    } catch {
-      return null;
-    }
-  }
-
-  private normalizeRoutedSsePayload(raw: unknown): RoutedOpencodeEvent | null {
-    if (!raw || typeof raw !== 'object') {
-      return null;
-    }
-
-    const record = raw as Record<string, unknown>;
-
-    const directoryCandidate =
-      typeof record.directory === 'string'
-        ? record.directory
-        : typeof record.properties === 'object' && record.properties !== null
-          ? ((record.properties as Record<string, unknown>).directory as unknown)
-          : null;
-
-    const normalizedDirectory =
-      typeof directoryCandidate === 'string'
-        ? this.normalizeCandidatePath(directoryCandidate) ?? directoryCandidate.trim()
-        : null;
-
-    if (typeof record.type === 'string') {
-      return {
-        directory: normalizedDirectory && normalizedDirectory.length > 0 ? normalizedDirectory : 'global',
-        payload: record as Event,
-      };
-    }
-
-    const nestedPayload = record.payload;
-    if (nestedPayload && typeof nestedPayload === 'object') {
-      const nestedRecord = nestedPayload as Record<string, unknown>;
-      if (typeof nestedRecord.type === 'string') {
-        return {
-          directory: normalizedDirectory && normalizedDirectory.length > 0 ? normalizedDirectory : 'global',
-          payload: nestedRecord as Event,
-        };
-      }
-    }
-
-    return null;
-  }
-
-  private emitGlobalSseEvent(event: RoutedOpencodeEvent) {
-    this.enqueueGlobalSseEvent(event);
-  }
-
-  private notifyGlobalSseOpen() {
-    for (const handler of this.globalSseOpenListeners) {
-      try {
-        handler();
-      } catch (error) {
-        console.warn('[OpencodeClient] Global SSE open handler error:', error);
-      }
-    }
-  }
-
-  private notifyGlobalSseError(error: unknown) {
-    for (const handler of this.globalSseErrorListeners) {
-      try {
-        handler(error);
-      } catch (listenerError) {
-        console.warn('[OpencodeClient] Global SSE error handler failed:', listenerError);
-      }
-    }
-  }
-
-  private ensureGlobalSseStarted() {
-    if (this.globalSseTask) {
-      return;
-    }
-
-    const abortController = new AbortController();
-    this.globalSseAbortController = abortController;
-
-    this.globalSseTask = this.runGlobalSseLoop(abortController)
-      .catch((error) => {
-        if ((error as Error)?.name === 'AbortError' || abortController.signal.aborted) {
-          return;
-        }
-        console.error('[OpencodeClient] Global SSE task failed:', error);
-      })
-      .finally(() => {
-        if (this.globalSseAbortController === abortController) {
-          this.globalSseAbortController = null;
-        }
-        this.globalSseTask = null;
-        this.globalSseIsConnected = false;
-      });
-  }
-
-  private maybeStopGlobalSse() {
-    if (this.globalSseListeners.size > 0) {
-      return;
-    }
-
-    if (this.globalSseAbortController && !this.globalSseAbortController.signal.aborted) {
-      this.globalSseAbortController.abort();
-    }
-    this.globalSseAbortController = null;
-    this.clearGlobalSseQueue();
-  }
-
-  private clearGlobalSseQueue() {
-    if (this.globalSseFlushTimer) {
-      clearTimeout(this.globalSseFlushTimer);
-      this.globalSseFlushTimer = null;
-    }
-    this.globalSseQueue.length = 0;
-    this.globalSseBuffer.length = 0;
-    this.globalSseCoalesced.clear();
-    this.globalSseStaleDeltas.clear();
-  }
-
-  private getGlobalSseDeltaKey(event: RoutedOpencodeEvent): string | null {
-    const payload = event.payload as unknown as Record<string, unknown>;
-    const eventType = typeof payload.type === 'string' ? payload.type : null;
-    if (eventType !== 'message.part.delta') {
-      return null;
-    }
-
-    const properties =
-      typeof payload.properties === 'object' && payload.properties !== null
-        ? (payload.properties as Record<string, unknown>)
-        : null;
-    const messageId = typeof properties?.messageID === 'string'
-      ? properties.messageID
-      : typeof properties?.messageId === 'string'
-        ? properties.messageId
-        : null;
-    const partId = typeof properties?.partID === 'string'
-      ? properties.partID
-      : typeof properties?.partId === 'string'
-        ? properties.partId
-        : null;
-
-    if (!messageId || !partId) {
-      return null;
-    }
-
-    return `${event.directory}:${messageId}:${partId}`;
-  }
-
-  private getGlobalSseUpdatedPartKey(event: RoutedOpencodeEvent): string | null {
-    const payload = event.payload as unknown as Record<string, unknown>;
-    const eventType = typeof payload.type === 'string' ? payload.type : null;
-    if (eventType !== 'message.part.updated') {
-      return null;
-    }
-
-    const properties =
-      typeof payload.properties === 'object' && payload.properties !== null
-        ? (payload.properties as Record<string, unknown>)
-        : null;
-    const part =
-      properties?.part && typeof properties.part === 'object'
-        ? (properties.part as Record<string, unknown>)
-        : null;
-    const messageId = typeof part?.messageID === 'string'
-      ? part.messageID
-      : typeof part?.messageId === 'string'
-        ? part.messageId
-        : null;
-    const partId = typeof part?.id === 'string'
-      ? part.id
-      : typeof part?.partID === 'string'
-        ? part.partID
-        : typeof part?.partId === 'string'
-          ? part.partId
-          : null;
-
-    if (!messageId || !partId) {
-      return null;
-    }
-
-    return `${event.directory}:${messageId}:${partId}`;
-  }
-
-  private getGlobalSseCoalesceKey(event: RoutedOpencodeEvent): string | null {
-    const payload = event.payload as unknown as Record<string, unknown>;
-    const eventType = typeof payload.type === 'string' ? payload.type : null;
-    if (!eventType) {
-      return null;
-    }
-
-    const properties =
-      typeof payload.properties === 'object' && payload.properties !== null
-        ? (payload.properties as Record<string, unknown>)
-        : null;
-
-    if (eventType === 'session.status') {
-      const sessionId = typeof properties?.sessionID === 'string'
-        ? properties.sessionID
-        : typeof properties?.sessionId === 'string'
-          ? properties.sessionId
-          : null;
-      if (!sessionId) {
-        return null;
-      }
-      return `session.status:${event.directory}:${sessionId}`;
-    }
-
-    if (eventType === 'openchamber:session-status') {
-      const sessionId = typeof properties?.sessionId === 'string'
-        ? properties.sessionId
-        : typeof properties?.sessionID === 'string'
-          ? properties.sessionID
-          : null;
-      if (!sessionId) {
-        return null;
-      }
-      return `openchamber:session-status:${sessionId}`;
-    }
-
-    if (eventType === 'message.part.updated') {
-      const partKey = this.getGlobalSseUpdatedPartKey(event);
-      if (!partKey) {
-        return null;
-      }
-      return `message.part.updated:${partKey}`;
-    }
-
-    return null;
-  }
-
-  private flushGlobalSseQueue = () => {
-    if (this.globalSseFlushTimer) {
-      clearTimeout(this.globalSseFlushTimer);
-      this.globalSseFlushTimer = null;
-    }
-
-    if (this.globalSseQueue.length === 0) {
-      return;
-    }
-
-    const events = this.globalSseQueue;
-    const skip = this.globalSseStaleDeltas.size > 0 ? new Set(this.globalSseStaleDeltas) : undefined;
-    this.globalSseQueue = this.globalSseBuffer;
-    this.globalSseBuffer = events;
-    this.globalSseQueue.length = 0;
-    this.globalSseCoalesced.clear();
-    this.globalSseStaleDeltas.clear();
-    this.globalSseLastFlushAt = Date.now();
-
-    for (const event of events) {
-      if (!event) continue;
-      if (skip) {
-        const deltaKey = this.getGlobalSseDeltaKey(event);
-        if (deltaKey && skip.has(deltaKey)) {
-          continue;
-        }
-      }
-      for (const listener of this.globalSseListeners) {
-        try {
-          listener(event);
-        } catch (error) {
-          console.warn('[OpencodeClient] Global SSE listener error:', error);
-        }
-      }
-    }
-
-    this.globalSseBuffer.length = 0;
-  };
-
-  private scheduleGlobalSseFlush() {
-    if (this.globalSseFlushTimer) {
-      return;
-    }
-    const elapsed = Date.now() - this.globalSseLastFlushAt;
-    const delay = Math.max(0, 16 - elapsed);
-    this.globalSseFlushTimer = setTimeout(this.flushGlobalSseQueue, delay);
-  }
-
-  private enqueueGlobalSseEvent(event: RoutedOpencodeEvent) {
-    const key = this.getGlobalSseCoalesceKey(event);
-    if (key) {
-      const existingIndex = this.globalSseCoalesced.get(key);
-      if (existingIndex !== undefined) {
-        this.globalSseQueue[existingIndex] = undefined;
-        const updatedPartKey = this.getGlobalSseUpdatedPartKey(event);
-        if (updatedPartKey) {
-          this.globalSseStaleDeltas.add(updatedPartKey);
-        }
-      }
-      this.globalSseCoalesced.set(key, this.globalSseQueue.length);
-    }
-
-    this.globalSseQueue.push(event);
-    this.scheduleGlobalSseFlush();
-  }
-
-  private async runGlobalSseLoop(abortController: AbortController): Promise<void> {
-    let attempt = 0;
-    const RECONNECT_DELAY_MS = 250;
-    const STREAM_YIELD_MS = 8;
-    const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
-
-    while (!abortController.signal.aborted) {
-      try {
-        const result = await this.client.global.event({
-          signal: abortController.signal,
-          onSseError: (error: unknown) => {
-            if ((error as Error)?.name === 'AbortError' || abortController.signal.aborted) {
-              return;
-            }
-            this.notifyGlobalSseError(error);
-          },
-        });
-
-        attempt = 0;
-        this.globalSseIsConnected = true;
-        if (!abortController.signal.aborted) {
-          this.notifyGlobalSseOpen();
-        }
-
-        let yielded = Date.now();
-
-        for await (const event of result.stream) {
-          if (abortController.signal.aborted) {
-            break;
-          }
-
-          const directory = typeof event.directory === 'string' && event.directory.length > 0
-            ? event.directory
-            : 'global';
-          const routed = this.normalizeRoutedSsePayload({
-            directory,
-            payload: event.payload,
-          });
-          if (!routed) {
-            continue;
-          }
-
-          this.emitGlobalSseEvent(routed);
-          if (Date.now() - yielded >= STREAM_YIELD_MS) {
-            yielded = Date.now();
-            await wait(0);
-          }
-        }
-
-        this.globalSseIsConnected = false;
-      } catch (error: unknown) {
-        this.globalSseIsConnected = false;
-        if ((error as Error)?.name === 'AbortError' || abortController.signal.aborted) {
-          return;
-        }
-        console.error('[OpencodeClient] Global SSE stream error (will retry):', error);
-        this.notifyGlobalSseError(error);
-      }
-
-      if (abortController.signal.aborted) {
-        break;
-      }
-
-      attempt += 1;
-      await wait(Math.min(RECONNECT_DELAY_MS * Math.max(attempt, 1), 2000));
-    }
-
-    this.flushGlobalSseQueue();
-  }
-
-  subscribeToGlobalEvents(
-    onEvent: (event: RoutedOpencodeEvent) => void,
-    onError?: (error: unknown) => void,
-    onOpen?: () => void,
-    options?: { directory?: string | null }
-  ): () => void {
-    const directoryFilter = this.normalizeCandidatePath(options?.directory ?? null);
-    const listener = (event: RoutedOpencodeEvent) => {
-      if (directoryFilter && event.directory !== directoryFilter) {
-        return;
-      }
-      onEvent(event);
-    };
-
-    this.globalSseListeners.add(listener);
-
-    if (onOpen) {
-      this.globalSseOpenListeners.add(onOpen);
-      if (this.globalSseIsConnected) {
-        setTimeout(() => {
-          if (this.globalSseOpenListeners.has(onOpen)) {
-            try {
-              onOpen();
-            } catch (error) {
-              console.warn('[OpencodeClient] Global SSE open handler error:', error);
-            }
-          }
-        }, 0);
-      }
-    }
-
-    if (onError) {
-      this.globalSseErrorListeners.add(onError);
-    }
-
-    this.ensureGlobalSseStarted();
-
-    return () => {
-      this.globalSseListeners.delete(listener);
-      if (onOpen) {
-        this.globalSseOpenListeners.delete(onOpen);
-      }
-      if (onError) {
-        this.globalSseErrorListeners.delete(onError);
-      }
-      this.maybeStopGlobalSse();
-    };
-  }
-
-  // Event Streaming using SDK SSE (Server-Sent Events) with AsyncGenerator
-  subscribeToEvents(
-    onMessage: (event: { type: string; properties?: Record<string, unknown> }) => void,
-    onError?: (error: unknown) => void,
-    onOpen?: () => void,
-    directoryOverride?: string | null,
-    options?: { scope?: 'global' | 'directory'; key?: string }
-  ): () => void {
-    const subscriptionKey = options?.key ?? 'default';
-    const scope = options?.scope ?? 'directory';
-    const existingController = this.sseAbortControllers.get(subscriptionKey);
-    if (existingController) {
-      existingController.abort();
-    }
-
-    // Create new AbortController for this subscription
-    const abortController = new AbortController();
-    this.sseAbortControllers.set(subscriptionKey, abortController);
-
-    let lastEventId: string | undefined;
-
-    if (scope === 'global') {
-      let globalUnsub: (() => void) | null = null;
-
-      const attachDirectory = (event: RoutedOpencodeEvent): Event => {
-        if (event.directory === 'global') {
-          return event.payload;
-        }
-
-        const payloadRecord = event.payload as unknown as Record<string, unknown>;
-        const existingProperties =
-          typeof payloadRecord.properties === 'object' && payloadRecord.properties !== null
-            ? (payloadRecord.properties as Record<string, unknown>)
-            : {};
-
-        if (existingProperties.directory === event.directory) {
-          return event.payload;
-        }
-
-        return {
-          ...payloadRecord,
-          properties: {
-            ...existingProperties,
-            directory: event.directory,
-          },
-        } as Event;
-      };
-
-      const cleanup = () => {
-        if (globalUnsub) {
-          try {
-            globalUnsub();
-          } catch {
-            // ignore
-          }
-          globalUnsub = null;
-        }
-
-        if (this.sseAbortControllers.get(subscriptionKey) === abortController) {
-          this.sseAbortControllers.delete(subscriptionKey);
-        }
-      };
-
-      abortController.signal.addEventListener('abort', cleanup, { once: true });
-
-      globalUnsub = this.subscribeToGlobalEvents(
-        (event) => {
-          if (abortController.signal.aborted) {
-            return;
-          }
-          onMessage(attachDirectory(event));
-        },
-        onError
-          ? (error) => {
-              if (!abortController.signal.aborted) {
-                onError(error);
-              }
-            }
-          : undefined,
-        onOpen
-          ? () => {
-              if (!abortController.signal.aborted) {
-                onOpen();
-              }
-            }
-          : undefined,
-      );
-
-      return () => {
-        cleanup();
-        abortController.abort();
-      };
-    }
-
-    const normalizeEventPayload = (payload: unknown): Event | null => {
-      if (!payload || typeof payload !== 'object') {
-        return null;
-      }
-
-      const record = payload as Record<string, unknown>;
-      if (typeof record.type === 'string') {
-        return record as Event;
-      }
-
-      const nestedPayload = record.payload;
-      if (nestedPayload && typeof nestedPayload === 'object') {
-        const nestedRecord = nestedPayload as Record<string, unknown>;
-        if (typeof nestedRecord.type === 'string') {
-          if (typeof record.directory === 'string' && record.directory.length > 0) {
-            const existingProperties =
-              typeof nestedRecord.properties === 'object' && nestedRecord.properties !== null
-                ? (nestedRecord.properties as Record<string, unknown>)
-                : null;
-            const properties = {
-              ...(existingProperties ?? {}),
-              directory: record.directory,
-            };
-            return { ...nestedRecord, properties } as Event;
-          }
-          return nestedRecord as Event;
-        }
-      }
-
-      return null;
-    };
-
-
-    console.log('[OpencodeClient] Starting SSE subscription...');
-
-    // Start async generator in background with reconnect on failure
-    (async () => {
-      const resolvedDirectory =
-        typeof directoryOverride === 'string' && directoryOverride.trim().length > 0
-          ? directoryOverride.trim()
-          : this.currentDirectory;
-
-      console.log('[OpencodeClient] Connecting to SSE with directory:', resolvedDirectory ?? 'default');
-
-      const connect = async (attempt: number): Promise<void> => {
-        try {
-          const subscribeParameters = resolvedDirectory ? { directory: resolvedDirectory } : undefined;
-          const subscribeOptions: {
-            signal: AbortSignal;
-            sseDefaultRetryDelay: number;
-            sseMaxRetryDelay: number;
-            onSseError?: (error: unknown) => void;
-            onSseEvent: (event: StreamEvent<unknown>) => void;
-            headers?: Record<string, string>;
-          } = {
-            signal: abortController.signal,
-            sseDefaultRetryDelay: 3000,
-            sseMaxRetryDelay: 30000,
-            onSseError: (error: unknown) => {
-              if (error instanceof Error && error.name === 'AbortError') {
-                return;
-              }
-              console.error('[OpencodeClient] SSE error:', error);
-              if (onError && !abortController.signal.aborted) {
-                onError(error);
-              }
-            },
-            onSseEvent: (event: StreamEvent<unknown>) => {
-              if (abortController.signal.aborted) return;
-              if (event.id && typeof event.id === 'string') {
-                lastEventId = event.id;
-              }
-              const payload = event.data;
-              const normalized = normalizeEventPayload(payload);
-              if (normalized) {
-                onMessage(normalized);
-              }
-            },
-          };
-
-          if (lastEventId) {
-            subscribeOptions.headers = { ...(subscribeOptions.headers || {}), 'Last-Event-ID': lastEventId };
-          }
-
-          const result = await this.client.event.subscribe(subscribeParameters, subscribeOptions);
-
-          if (onOpen && !abortController.signal.aborted) {
-            console.log('[OpencodeClient] SSE connection opened');
-            onOpen();
-          }
-
-          for await (const _ of result.stream) {
-            void _;
-            if (abortController.signal.aborted) {
-              console.log('[OpencodeClient] SSE stream aborted');
-              break;
-            }
-          }
-        } catch (error: unknown) {
-          if ((error as Error)?.name === 'AbortError' || abortController.signal.aborted) {
-            console.log('[OpencodeClient] SSE stream aborted normally');
-            return;
-          }
-          console.error('[OpencodeClient] SSE stream error (will retry):', error);
-          if (onError) {
-            onError(error);
-          }
-          const delay = Math.min(3000 * Math.pow(2, attempt), 30000);
-          await new Promise((resolve) => setTimeout(resolve, delay));
-          if (!abortController.signal.aborted) {
-            await connect(attempt + 1);
-          }
-          return;
-        }
-
-        if (!abortController.signal.aborted) {
-          const delay = Math.min(3000 * Math.pow(2, attempt), 30000);
-          await new Promise((resolve) => setTimeout(resolve, delay));
-          await connect(attempt + 1);
-        }
-      };
-
-      try {
-        await connect(0);
-      } finally {
-        console.log('[OpencodeClient] SSE subscription cleanup');
-        if (this.sseAbortControllers.get(subscriptionKey) === abortController) {
-          this.sseAbortControllers.delete(subscriptionKey);
-        }
-      }
-    })();
-
-    // Return cleanup function
-    return () => {
-      if (this.sseAbortControllers.get(subscriptionKey) === abortController) {
-        this.sseAbortControllers.delete(subscriptionKey);
-      }
-      abortController.abort();
-    };
-
-  }
+  // SSE infrastructure removed — EventPipeline in sync/event-pipeline.ts handles
+  // all SSE event ingestion via the SDK's global.event() async iterator.
 
   // File Operations
   async readFile(path: string): Promise<string> {
@@ -2348,56 +1382,7 @@ class OpencodeService {
     return result;
   }
 
-  /**
-   * List directory contents on a remote OpenCode server via the SDK's file.list API.
-   * @param connectionId - The connection ID for the remote server
-   * @param path - The directory path to list
-   * @param options - Optional listing options
-   * @returns Array of filesystem entries
-   */
-  async listRemoteDirectory(connectionId: string, path: string): Promise<FilesystemEntry[]> {
-    const client = this.resolveClient(connectionId);
-
-    try {
-      const response = await client.file.list({
-        path: '.',
-        directory: path || undefined
-      });
-
-      if (!response.data) {
-        return [];
-      }
-
-      return response.data
-        .filter((item: { type?: string; name?: string }) => {
-          if (item.type !== 'directory' && item.type !== 'file') {
-            return false;
-          }
-          if (!item.name) {
-            return false;
-          }
-          return true;
-        })
-        .map((item: { name?: string; absolute?: string; path?: string; type?: string }) => ({
-          name: item.name || '',
-          path: normalizeFsPath(String(item.absolute || item.path || item.name)),
-          isDirectory: item.type === 'directory',
-          isFile: item.type === 'file',
-          isSymbolicLink: false,
-        }))
-        .filter((item) => item.name !== '');
-    } catch (error) {
-      console.error('Failed to list remote directory contents:', error);
-      throw error;
-    }
-  }
-
-  async listLocalDirectory(directoryPath: string | null | undefined, options?: { respectGitignore?: boolean; connectionId?: string }): Promise<FilesystemEntry[]> {
-    // Route to remote when connectionId is provided and not 'local'
-    if (options?.connectionId && options.connectionId !== 'local') {
-      return this.listRemoteDirectory(options.connectionId, directoryPath || '');
-    }
-
+  async listLocalDirectory(directoryPath: string | null | undefined, options?: { respectGitignore?: boolean }): Promise<FilesystemEntry[]> {
     const normalizedDirectoryPath = typeof directoryPath === 'string' ? normalizeFsPath(directoryPath.trim()) : '';
     const cacheKey = `${normalizedDirectoryPath}|${options?.respectGitignore ? '1' : '0'}`;
     const now = Date.now();
@@ -2525,60 +1510,7 @@ class OpencodeService {
     }
   }
 
-  /**
-   * Get the home directory of a remote OpenCode server via the resolved client's path/session info.
-   * @param connectionId - The connection ID for the remote server
-   * @returns The home directory path or null if unavailable
-   */
-  async getRemoteHome(connectionId: string): Promise<string | null> {
-    const client = this.resolveClient(connectionId);
-
-    try {
-      // Use path.get to retrieve the remote server's home directory.
-      // The Path object has both `home` (user home) and `directory` (CWD);
-      // prefer `home` so the directory browser can navigate to any project.
-      const pathResponse = await client.path.get();
-      if (pathResponse.data?.home) {
-        const home = String(pathResponse.data.home);
-        if (home && home.length > 0) {
-          return home;
-        }
-      }
-      // Fall back to CWD if home is not available
-      if (pathResponse.data?.directory) {
-        const directory = String(pathResponse.data.directory);
-        if (directory && directory.length > 0) {
-          return directory;
-        }
-      }
-    } catch (error) {
-      console.debug('Failed to get remote home via path.get:', error);
-    }
-
-    try {
-      // Fall back to session list and derive home from first session
-      const sessionResponse = await client.session.list();
-      const sessions = Array.isArray(sessionResponse.data) ? sessionResponse.data : [];
-      if (sessions.length > 0 && sessions[0].directory) {
-        const directory = String(sessions[0].directory);
-        if (directory && directory.length > 0) {
-          return directory;
-        }
-      }
-    } catch (error) {
-      console.debug('Failed to get remote home via session.list:', error);
-    }
-
-    console.warn('Failed to resolve remote home directory for connection:', connectionId);
-    return null;
-  }
-
-  async getFilesystemHome(connectionId?: string): Promise<string | null> {
-    // Route to remote when connectionId is provided and not 'local'
-    if (connectionId && connectionId !== 'local') {
-      return this.getRemoteHome(connectionId);
-    }
-
+  async getFilesystemHome(): Promise<string | null> {
     // Optimization: Check for desktop runtime first to avoid unnecessary network calls
     // and fix the "SyntaxError" warning when the endpoint is missing
     const desktopHome = await getDesktopHomeDirectory();

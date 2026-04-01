@@ -1,7 +1,8 @@
 import React from 'react';
 import { cn } from '@/lib/utils';
 import { RiCloseLine, RiSearchLine, RiTimeLine, RiUserLine, RiRobotLine, RiErrorWarningLine } from '@remixicon/react';
-import { useSessionStore } from '@/stores/useSessionStore';
+import { useSessionUIStore } from '@/sync/session-ui-store';
+import { getAllSyncSessions } from '@/sync/sync-refs';
 import { GridLoader } from '@/components/ui/grid-loader';
 
 type TranscriptSearchResult = {
@@ -74,12 +75,12 @@ export const TranscriptSearch: React.FC<TranscriptSearchProps> = ({
   const inputRef = React.useRef<HTMLInputElement>(null);
   const abortControllerRef = React.useRef<AbortController | null>(null);
 
-  const sessions = useSessionStore((state) => state.sessions);
-  const setCurrentSession = useSessionStore((state) => state.setCurrentSession);
+  const setCurrentSession = useSessionUIStore((state) => state.setCurrentSession);
 
   const sessionTitleMap = React.useMemo(() => {
+    const sessions = getAllSyncSessions();
     return new Map(sessions.map((s) => [s.id, s.title || s.id]));
-  }, [sessions]);
+  }, []);
 
   // Debounce query
   React.useEffect(() => {

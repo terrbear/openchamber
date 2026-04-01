@@ -28,12 +28,13 @@ const buildPtyWebSocketUrl = (baseUrl: string, ptyId: string): string => {
  * The adapter uses the SDK client for lifecycle operations (create, resize, remove)
  * and a direct WebSocket for terminal I/O (connect, sendInput).
  */
-export const createRemoteTerminalAPI = (connectionId: string): TerminalAPI => {
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- connectionId reserved for future per-connection client selection
+export const createRemoteTerminalAPI = (_connectionId: string): TerminalAPI => {
   // Map of ptyId -> WebSocket for active connections
   const activeWebSockets = new Map<string, WebSocket>();
 
-  const getClient = () => opencodeClient.getClientForConnection(connectionId);
-  const getBaseUrl = () => opencodeClient.getBaseUrlForConnection(connectionId);
+  const getClient = () => opencodeClient.getSdkClient();
+  const getBaseUrl = () => opencodeClient.getBaseUrl();
 
   return {
     async createSession(options: CreateTerminalOptions): Promise<TerminalSession> {

@@ -5,7 +5,6 @@ import type { DesktopSettings } from '@/lib/desktop';
 import { updateDesktopSettings } from '@/lib/persistence';
 import { getSafeStorage } from './utils/safeStorage';
 import { streamDebugEnabled } from '@/stores/utils/streamDebug';
-import { opencodeClient } from '@/lib/opencode/client';
 
 interface ConnectionHealth {
   status: 'connected' | 'disconnected' | 'checking';
@@ -209,9 +208,6 @@ export const useConnectionsStore = create<ConnectionsStore>()(
 
       set({ connections: nextConnections, activeConnectionId: nextActiveId, connectionHealth: nextConnectionHealth });
       persistConnections(nextConnections, nextActiveId);
-
-      // Clean up cached client resources
-      opencodeClient.cleanupConnection(id);
 
       if (streamDebugEnabled()) {
         console.info('[ConnectionsStore] Removed connection', id);

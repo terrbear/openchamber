@@ -201,7 +201,7 @@ export const DirectoryTree: React.FC<DirectoryTreeProps> = ({
 
     const resolveHomeDirectory = async () => {
       try {
-        const fsHome = await opencodeClient.getFilesystemHome(connectionId);
+        const fsHome = await opencodeClient.getFilesystemHome();
         if (!cancelled && applyRootDirectory(fsHome)) {
           return;
         }
@@ -396,7 +396,7 @@ export const DirectoryTree: React.FC<DirectoryTreeProps> = ({
     }
 
     try {
-      const filesystemEntries = await opencodeClient.listLocalDirectory(path, { connectionId });
+      const filesystemEntries = await opencodeClient.listLocalDirectory(path);
       return filesystemEntries
         .filter((entry) => {
           if (!entry.isDirectory) {

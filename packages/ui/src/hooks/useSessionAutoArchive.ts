@@ -1,6 +1,7 @@
 import React from 'react';
 import type { Session } from '@opencode-ai/sdk/v2';
-import { useSessionStore } from '@/stores/useSessionStore';
+import { useSessionUIStore } from '@/sync/session-ui-store';
+import { getAllSyncSessions, getSyncSessionStatus } from '@/sync/sync-refs';
 import { useUIStore } from '@/stores/useUIStore';
 import { archiveSession, isSessionArchived } from '@/lib/archivedSessions';
 
@@ -58,11 +59,9 @@ type ArchiveOptions = {
 export const useSessionAutoArchive = (options?: ArchiveOptions) => {
   const autoRun = options?.autoRun !== false;
 
-  const sessions = useSessionStore((state) => state.sessions);
-  const currentSessionId = useSessionStore((state) => state.currentSessionId);
-  const isLoading = useSessionStore((state) => state.isLoading);
-  const sessionStatus = useSessionStore((state) => state.sessionStatus);
-  const getDirectoryForSession = useSessionStore((state) => state.getDirectoryForSession);
+  const currentSessionId = useSessionUIStore((state) => state.currentSessionId);
+  const isLoading = useSessionUIStore((state) => state.isLoading);
+  const getDirectoryForSession = useSessionUIStore((state) => state.getDirectoryForSession);
 
   const autoArchiveLastRunAt = useUIStore((state) => state.autoArchiveLastRunAt);
   const setAutoArchiveLastRunAt = useUIStore((state) => state.setAutoArchiveLastRunAt);
@@ -70,25 +69,26 @@ export const useSessionAutoArchive = (options?: ArchiveOptions) => {
   const [isRunning, setIsRunning] = React.useState(false);
   const runningRef = React.useRef(false);
 
+  // Build busy session IDs by checking sync status for all known sessions
   const busySessionIds = React.useMemo(() => {
     const ids = new Set<string>();
-    if (sessionStatus) {
-      sessionStatus.forEach((status, sessionId) => {
-        if (status.type === 'busy' || status.type === 'retry') {
-          ids.add(sessionId);
-        }
-      });
+    const allSessions = getAllSyncSessions();
+    for (const session of allSessions) {
+      const status = getSyncSessionStatus(session.id);
+      if (status?.type === 'busy' || status?.type === 'retry') {
+        ids.add(session.id);
+      }
     }
     return ids;
-  }, [sessionStatus]);
+  }, []);
 
   const candidates = React.useMemo(() => {
     return buildAutoArchiveCandidates({
-      sessions,
+      sessions: getAllSyncSessions(),
       currentSessionId,
       busySessionIds,
     });
-  }, [currentSessionId, sessions, busySessionIds]);
+  }, [currentSessionId, busySessionIds]);
 
   const runArchive = React.useCallback(
     async ({ force = false }: { force?: boolean } = {}): Promise<ArchiveResult> => {
@@ -105,12 +105,13 @@ export const useSessionAutoArchive = (options?: ArchiveOptions) => {
         return { archivedIds: [], skippedIds: [], skippedReason: 'cooldown' };
       }
 
-      if (sessions.length === 0) {
+      const allSessions = getAllSyncSessions();
+      if (allSessions.length === 0) {
         return { archivedIds: [], skippedIds: [], skippedReason: 'no-candidates' };
       }
 
       const candidateSessions = buildAutoArchiveCandidates({
-        sessions,
+        sessions: allSessions,
         currentSessionId,
         busySessionIds,
         now,
@@ -157,7 +158,6 @@ export const useSessionAutoArchive = (options?: ArchiveOptions) => {
       currentSessionId,
       getDirectoryForSession,
       isLoading,
-      sessions,
       setAutoArchiveLastRunAt,
     ]
   );
@@ -166,7 +166,7 @@ export const useSessionAutoArchive = (options?: ArchiveOptions) => {
     if (!autoRun) {
       return;
     }
-    if (isLoading || sessions.length === 0) {
+    if (isLoading) {
       return;
     }
     const now = Date.now();
@@ -174,7 +174,7 @@ export const useSessionAutoArchive = (options?: ArchiveOptions) => {
       return;
     }
     void runArchive();
-  }, [autoArchiveLastRunAt, autoRun, isLoading, sessions.length, runArchive]);
+  }, [autoArchiveLastRunAt, autoRun, isLoading, runArchive]);
 
   return {
     candidates,

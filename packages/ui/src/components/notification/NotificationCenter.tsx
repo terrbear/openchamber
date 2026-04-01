@@ -6,7 +6,8 @@ import {
   RiCloseLine,
 } from '@remixicon/react';
 import { useNotificationCenterStore } from '@/stores/useNotificationCenterStore';
-import { useSessionStore } from '@/stores/useSessionStore';
+import { useSessionUIStore } from '@/sync/session-ui-store';
+import { getAllSyncSessions } from '@/sync/sync-refs';
 import { useProjectsStore } from '@/stores/useProjectsStore';
 import { cn } from '@/lib/utils';
 
@@ -49,8 +50,7 @@ export const NotificationCenter: React.FC = () => {
   const dismissNotification = useNotificationCenterStore((state) => state.dismissNotification);
   const dismissAll = useNotificationCenterStore((state) => state.dismissAll);
   
-  const setCurrentSession = useSessionStore((state) => state.setCurrentSession);
-  const sessions = useSessionStore((state) => state.sessions);
+  const setCurrentSession = useSessionUIStore((state) => state.setCurrentSession);
   const setActiveProject = useProjectsStore((state) => state.setActiveProject);
 
   const handleNotificationClick = React.useCallback(
@@ -59,6 +59,7 @@ export const NotificationCenter: React.FC = () => {
       markRead(notificationId);
 
       // Find the session
+      const sessions = getAllSyncSessions();
       const session = sessions.find((s) => s.id === sessionId);
       if (session) {
         // Switch to the project if needed
@@ -67,7 +68,7 @@ export const NotificationCenter: React.FC = () => {
         setCurrentSession(sessionId);
       }
     },
-    [markRead, sessions, setActiveProject, setCurrentSession]
+    [markRead, setActiveProject, setCurrentSession]
   );
 
   const handleDismiss = React.useCallback(

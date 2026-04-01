@@ -136,7 +136,7 @@ export const DirectoryAutocomplete = React.forwardRef<DirectoryAutocompleteHandl
     let cancelled = false;
     setLoading(true);
 
-    opencodeClient.listLocalDirectory(parentDir, { connectionId })
+    opencodeClient.listLocalDirectory(parentDir)
       .then((entries) => {
         if (cancelled) return;
         

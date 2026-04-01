@@ -696,7 +696,7 @@ const MultiFileDiffEntry = React.memo<MultiFileDiffEntryProps>(({
     const [hasBeenVisible, setHasBeenVisible] = React.useState(false);
     // Track whether the section is currently in/near the viewport.
     // Expanded diffs that scroll far off-screen are unmounted to free DOM/memory.
-    const [isNearViewport, setIsNearViewport] = React.useState(true);
+    const setIsNearViewport = React.useState(true)[1];
     const [diffRetryNonce, setDiffRetryNonce] = React.useState(0);
     const [diffLoadError, setDiffLoadError] = React.useState<string | null>(null);
     const [isLoading, setIsLoading] = React.useState(false);
@@ -756,7 +756,7 @@ const MultiFileDiffEntry = React.memo<MultiFileDiffEntryProps>(({
 
         observer.observe(target);
         return () => observer.disconnect();
-    }, [isExpanded, scrollRootRef]);
+    }, [isExpanded, scrollRootRef, setIsNearViewport]);
 
     React.useEffect(() => {
         if (expandRequestNonce <= 0 || expandRequestPath !== file.path) {

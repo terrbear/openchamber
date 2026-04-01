@@ -700,18 +700,13 @@ const FILE_EXTENSIONS = new Set([
 ]);
 
 const looksLikeFilePath = (text: string): boolean => {
-  // Must contain a path separator
   if (!text.includes('/')) return false;
-  // Must not be a URL
   if (text.includes('://')) return false;
-  // Must not start with a protocol-like prefix
   if (/^[a-z]+:\/\//i.test(text)) return false;
-  // Must have a file extension
   const lastSegment = text.split('/').pop() ?? '';
   const dotIndex = lastSegment.lastIndexOf('.');
   if (dotIndex <= 0) return false;
   const ext = lastSegment.slice(dotIndex + 1).toLowerCase();
-  // Strip trailing :lineNumber if present (e.g. "src/foo.ts:42")
   const cleanExt = ext.replace(/:\d+$/, '');
   return FILE_EXTENSIONS.has(cleanExt);
 };
@@ -725,12 +720,10 @@ type FilePathCodeProps = React.HTMLAttributes<HTMLElement> & {
 const FilePathCode: React.FC<FilePathCodeProps> = ({ children, className, node, ...props }) => {
   const currentDirectory = useEffectiveDirectory() ?? '';
 
-  // Code blocks have a language className (e.g. "language-ts") — don't intercept those
   if (className) {
     return <code className={className} {...props}>{children}</code>;
   }
 
-  // Extract text from children
   const text = typeof children === 'string'
     ? children
     : (Array.isArray(children) && children.length === 1 && typeof children[0] === 'string')
@@ -741,7 +734,6 @@ const FilePathCode: React.FC<FilePathCodeProps> = ({ children, className, node, 
     return <code {...props}>{children}</code>;
   }
 
-  // Strip trailing :lineNumber for path resolution
   const cleanPath = text.replace(/:\d+$/, '');
   const absolutePath = cleanPath.startsWith('/')
     ? cleanPath
@@ -769,7 +761,14 @@ const FilePathCode: React.FC<FilePathCodeProps> = ({ children, className, node, 
   );
 };
 
+const PlainLink: React.FC<React.AnchorHTMLAttributes<HTMLAnchorElement> & { node?: unknown }> = ({
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- node is stripped from props before spread
+  node: _node,
+  ...props
+}) => <a {...props} />;
+
 const streamdownComponents = {
+  a: PlainLink,
   pre: CodeBlockWrapper,
   table: TableWrapper,
   code: FilePathCode,
@@ -1405,8 +1404,6 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
           components={streamdownComponents}
           animated={disableStreamAnimation ? undefined : streamdownAnimated}
           isAnimating={disableStreamAnimation ? false : isStreaming}
-          // @ts-expect-error Streamdown type missing linkSafety in older minor
-          linkSafety={{ enabled: false }}
          >
         {content}
       </Streamdown>
@@ -1437,7 +1434,6 @@ export const SimpleMarkdownRenderer: React.FC<{
   content,
   className,
   variant = 'assistant',
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- linkSafety is hardcoded off on Streamdown
   disableLinkSafety,
   stripFrontmatter = false,
   onShowPopup,
@@ -1485,8 +1481,6 @@ export const SimpleMarkdownRenderer: React.FC<{
         controls={streamdownControls}
         plugins={streamdownPlugins}
         components={streamdownComponents}
-        // @ts-expect-error Streamdown type missing linkSafety in older minor
-        linkSafety={{ enabled: false }}
       >
         {renderedContent}
       </Streamdown>
